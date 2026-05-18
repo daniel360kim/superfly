@@ -1,0 +1,3 @@
+[submodule "mapnav"]
+	path = mapnav
+	url = git@github.com:JamesEmi/mapnav.git
