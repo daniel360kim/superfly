@@ -10,6 +10,7 @@ the offboard policy process to consume (see depth_transport.py).
 Run this AFTER PX4 SITL is up; then run diffdrone_offboard.py --depth.
 """
 
+import argparse
 import math
 import carb
 from isaacsim import SimulationApp
@@ -22,6 +23,8 @@ import matplotlib
 matplotlib.use("Agg")  # headless PNG backend, no GUI needed
 import matplotlib.pyplot as plt
 from omni.isaac.core.world import World
+from isaacsim.core.api.objects import FixedCuboid, FixedSphere
+import isaacsim.core.utils.prims as prim_utils
 from scipy.spatial.transform import Rotation
 
 from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
@@ -33,6 +36,7 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 import sys
 sys.path.insert(0, "/home/dtc-system/superfly/starling-deployment")
 from depth_transport import DepthPublisher, RENDER_H, RENDER_W
+from obstacle_field import generate as generate_field
 
 # --- DiffPhysDrone single_agent camera params ---
 FOV_X_HALF_TAN = 0.82
@@ -42,13 +46,21 @@ FOV_X_DEG = 2.0 * math.degrees(math.atan(FOV_X_HALF_TAN))  # ~78.6 deg horizonta
 
 class PegasusApp:
 
-    def __init__(self):
+    SPAWN_YAW_DEG = 0.0  # EKF heading is mag-locked (~+Y); we rotate the field instead
+
+    def __init__(self, seed: int = 0, scale: float = 5.0, spawn_yaw_deg: float = 0.0):
+        self.SPAWN_YAW_DEG = spawn_yaw_deg
         self.timeline = omni.timeline.get_timeline_interface()
         self.pg = PegasusInterface()
         self.pg._world = World(**self.pg._world_settings)
         self.world = self.pg.world
 
         self.pg.load_environment(SIMULATION_ENVIRONMENTS["Box Room"])
+
+        # Spawn the training-distribution obstacle field (analytic primitives).
+        self.field = generate_field(seed=seed, scale=scale)
+        print("[obstacle_field]", self.field.summary())
+        self._spawn_obstacles(self.field)
 
         config_multirotor = MultirotorConfig()
         mavlink_config = PX4MavlinkBackendConfig({
@@ -64,7 +76,9 @@ class PegasusApp:
         self._camera = MonocularCamera("depth_cam", config={
             "depth": True,
             "position": np.array([0.10, 0.0, 0.0]),
-            "orientation": np.array([0.0, CAM_ANGLE_DEG, 180.0]),
+            # NOTE: with the 180° yaw, a positive Y-pitch tilts the view UP, so we
+            # negate CAM_ANGLE_DEG to pitch the camera DOWN (matching training).
+            "orientation": np.array([0.0, -CAM_ANGLE_DEG, 180.0]),
             "resolution": (RENDER_W, RENDER_H),   # (width, height) = (64, 48)
             "frequency": 30,
             "intrinsics": None,  # falls back to fov-based; we override fov below
@@ -81,12 +95,18 @@ class PegasusApp:
             [0.0, 0.0, 1.0]])
         config_multirotor.graphical_sensors = [self._camera]
 
+        # Spawn the drone on the ground at the field's start XY (it climbs from here).
+        # SPAWN_YAW_DEG cancels the sim's EKF heading offset: with spawn yaw 0 the
+        # mag-driven EKF reported ENU yaw=90° (facing +Y), but the obstacle corridor
+        # runs +X. Spawn rotated by -90° so the reconstructed heading reads ~0 (faces
+        # +X, down the corridor). Flip sign if the log still shows yaw≈±90.
+        spawn_xy = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
         Multirotor(
             "/World/quadrotor",
             ROBOTS['Iris'],
             0,
-            [0.0, 0.0, 0.1],
-            Rotation.from_euler("XYZ", [0.0, 0.0, 0.0], degrees=True).as_quat(),
+            spawn_xy,
+            Rotation.from_euler("XYZ", [0.0, 0.0, self.SPAWN_YAW_DEG], degrees=True).as_quat(),
             config=config_multirotor,
         )
 
@@ -95,6 +115,52 @@ class PegasusApp:
         self._dbg_n = 0           # frame counter for throttled debug dumps
         self._dbg_every = 30      # save a debug PNG every N published frames
         self.stop_sim = False
+
+    def _spawn_obstacles(self, fld):
+        """Spawn the analytic obstacle field as static Isaac prims (ENU, z up)."""
+        # Spheres
+        for i, (cx, cy, cz, r) in enumerate(fld.spheres):
+            FixedSphere(
+                prim_path=f"/World/obstacles/sphere_{i}",
+                position=np.array([cx, cy, cz]),
+                radius=float(r),
+                color=np.array([0.8, 0.3, 0.3]),
+            )
+        # Boxes (voxels): half-extents -> full-size scale
+        for i, (cx, cy, cz, hx, hy, hz) in enumerate(fld.boxes):
+            FixedCuboid(
+                prim_path=f"/World/obstacles/box_{i}",
+                position=np.array([cx, cy, cz]),
+                scale=np.array([2 * hx, 2 * hy, 2 * hz]),
+                color=np.array([0.3, 0.5, 0.8]),
+            )
+        # Vertical cylinders (axis = world Z), tall enough to span the flight band.
+        CYL_HEIGHT = 12.0
+        for i, (cx, cy, r) in enumerate(fld.cyl_v):
+            self._spawn_cylinder(f"/World/obstacles/cylv_{i}",
+                                 pos=(cx, cy, CYL_HEIGHT / 2 - 1.0),
+                                 radius=float(r), height=CYL_HEIGHT, axis="Z")
+        # Horizontal cylinders (2 minor ground obstacles). Stored (cx,cy,cz,r)
+        # after the field rotation; spawn lying along world X.
+        CYLH_LEN = 6.0
+        for i, (cx, cy, cz, r) in enumerate(fld.cyl_h):
+            self._spawn_cylinder(f"/World/obstacles/cylh_{i}",
+                                 pos=(cx, cy, cz),
+                                 radius=float(r), height=CYLH_LEN, axis="X")
+
+    def _spawn_cylinder(self, path, pos, radius, height, axis="Z"):
+        """Create a static USD Cylinder prim. UsdGeom.Cylinder is Z-axis by default;
+        for a world-X horizontal cylinder, rotate 90° about Y."""
+        orientation = None
+        if axis == "X":
+            q = Rotation.from_euler("XYZ", [0.0, 90.0, 0.0], degrees=True).as_quat()  # [x,y,z,w]
+            orientation = np.array([q[3], q[0], q[1], q[2]])  # create_prim wants [w,x,y,z]
+        prim_utils.create_prim(
+            path, "Cylinder",
+            position=np.array([float(pos[0]), float(pos[1]), float(pos[2])]),
+            orientation=orientation,
+            attributes={"radius": float(radius), "height": float(height), "axis": "Z"},
+        )
 
     def _publish_depth(self):
         """Grab the camera's planar Z-depth, resize to 48x64, publish over UDP."""
@@ -127,26 +193,47 @@ class PegasusApp:
         self._dump_depth_debug(depth)
 
     def _dump_depth_debug(self, depth):
-        """Save the EXACT published array to depth_debug.png + .npy every N frames,
-        so the published orientation can be checked against the native convention
-        (row 0 = up, col 0 = left). Never let a viz error kill the sim loop."""
+        """Save the EXACT published depth array + the drone's RGB view to
+        camera_debug.png (+ depth .npy) every N frames. RGB comes from the SAME
+        camera/render product as the depth, so it is the literal drone viewpoint.
+        Check orientation vs native convention (row 0 = up, col 0 = left).
+        Never let a viz error kill the sim loop."""
         self._dbg_n += 1
         if self._dbg_n % self._dbg_every != 0:
             return
         try:
             np.save("depth_debug.npy", depth)
-            fig, ax = plt.subplots(figsize=(6, 4.5))
+
+            # RGB from the same camera (annotator auto-attached on initialize()).
+            rgb = None
+            cam = getattr(self._camera, "_camera", None)
+            if cam is not None:
+                try:
+                    rgb = cam.get_rgb()
+                except Exception:
+                    rgb = None
+
+            ncols = 2 if rgb is not None else 1
+            fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4.5), squeeze=False)
+
+            ax = axes[0][0]
             im = ax.imshow(depth, origin="upper", cmap="turbo", vmin=0.3, vmax=24.0)
             fig.colorbar(im, ax=ax, label="depth [m]")
-            ax.set_title(f"published depth  frame={self._dbg_n}  "
+            ax.set_title(f"depth  frame={self._dbg_n}  "
                          f"min={depth.min():.2f} max={depth.max():.2f} m")
-            ax.set_xlabel("col  (0 = left)")
-            ax.set_ylabel("row  (0 = up)")
+            ax.set_xlabel("col (0 = left)"); ax.set_ylabel("row (0 = up)")
+
+            if rgb is not None:
+                axrgb = axes[0][1]
+                axrgb.imshow(np.asarray(rgb), origin="upper")
+                axrgb.set_title("drone RGB view (same camera)")
+                axrgb.set_xlabel("col (0 = left)"); axrgb.set_ylabel("row (0 = up)")
+
             fig.tight_layout()
-            fig.savefig("depth_debug.png", dpi=90)
+            fig.savefig("camera_debug.png", dpi=90)
             plt.close(fig)
         except Exception as e:
-            carb.log_warn(f"depth debug dump failed: {e}")
+            carb.log_warn(f"camera debug dump failed: {e}")
 
     def run(self):
         self.timeline.play()
@@ -159,7 +246,17 @@ class PegasusApp:
 
 
 def main():
-    pg_app = PegasusApp()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Obstacle-field RNG seed (eval suite: 0, 1, 2)")
+    parser.add_argument("--scale", type=float, default=5.0,
+                        help="World scale (corridor depth ~= 8*scale m)")
+    parser.add_argument("--spawn-yaw", type=float, default=0.0,
+                        help="Spawn yaw [deg]. EKF heading is mag-locked in sim, so this "
+                             "mainly affects the initial facing; the field is rotated instead.")
+    # parse_known_args so Isaac Sim's own argv flags don't trip argparse
+    args, _ = parser.parse_known_args()
+    pg_app = PegasusApp(seed=args.seed, scale=args.scale, spawn_yaw_deg=args.spawn_yaw)
     pg_app.run()
 
 

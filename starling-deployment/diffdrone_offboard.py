@@ -235,13 +235,16 @@ class DiffDronePolicy:
     @torch.no_grad()
     def step(self, position_enu: np.ndarray, velocity_enu: np.ndarray,
              R_enu: np.ndarray, target_velocity_enu: np.ndarray,
-             margin: float = 10.0, depth_m: np.ndarray = None) -> np.ndarray:
+             margin: float = 0.2, max_speed: float = 1.0,
+             depth_m: np.ndarray = None) -> np.ndarray:
         """
         Run one policy step. Returns act_world [m/s²] in ENU frame.
 
         position_enu, velocity_enu, R_enu: current drone state (ENU/FLU)
         target_velocity_enu: desired velocity vector in ENU [m/s]
-        margin: distance to nearest obstacle [m] (use large value if unknown)
+        margin: the drone's collision radius [m], NOT clearance distance. In training
+                this is sampled in ~[0.1, 0.3] (env_cuda.py:250). Feeding a large value
+                is out-of-distribution and REVERSES the policy output — keep it ~0.1-0.3.
         depth_m: (48,64) metric depth frame; if None, uses blank (no obstacles)
         """
         R = torch.tensor(R_enu, dtype=torch.float32, device=self.device)  # (3,3)
@@ -253,10 +256,12 @@ class DiffDronePolicy:
         up = torch.tensor([0.0, 0.0, 1.0], device=self.device)
         R_yaw = torch.stack([fwd, torch.cross(up, fwd), up], dim=1)  # (3,3)
 
-        # Target velocity in yaw-aligned body frame, clamped to max_speed
+        # Target velocity in yaw-aligned body frame, clamped to max_speed.
+        # max_speed is the desired cruise speed / upper bound the policy tracks
+        # (training used ~[3,13] m/s with speed_mtp=4; default here is conservative).
         tv = torch.tensor(target_velocity_enu, dtype=torch.float32, device=self.device)
         tv_norm = tv.norm()
-        max_speed = torch.tensor(1.0, device=self.device)
+        max_speed = torch.tensor(float(max_speed), device=self.device)
         if tv_norm > 1e-4:
             tv_clamped = (tv / tv_norm) * torch.minimum(tv_norm, max_speed)
         else:
@@ -421,6 +426,10 @@ def main():
     parser.add_argument("--target-vx", type=float, default=0.0, help="Target velocity x (ENU) m/s")
     parser.add_argument("--target-vy", type=float, default=0.0, help="Target velocity y (ENU) m/s")
     parser.add_argument("--target-vz", type=float, default=0.0, help="Target velocity z (ENU) m/s")
+    parser.add_argument("--goal", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                        help="Goal position (ENU). If set, target velocity = goal - pos each "
+                             "step (matches training's target_v_raw = p_target - p), overriding "
+                             "--target-v*. Use the obstacle field's p_target.")
     parser.add_argument("--depth", action="store_true",
                         help="Subscribe to live depth frames over UDP (from the sim/camera)")
     parser.add_argument("--climb-alt", type=float, default=10.0,
@@ -429,9 +438,17 @@ def main():
                         help="Altitude tolerance [m] to consider target reached")
     parser.add_argument("--settle-speed", type=float, default=0.2,
                         help="Speed [m/s] below which the drone is considered settled")
+    parser.add_argument("--margin", type=float, default=0.2,
+                        help="Drone collision radius [m] fed to the policy. Trained range "
+                             "~[0.1, 0.3]; larger = more cautious avoidance. Values far "
+                             "outside this range are OOD and degrade/reverse the policy.")
+    parser.add_argument("--max-speed", type=float, default=1.0,
+                        help="Desired cruise speed / upper bound [m/s] the policy tracks "
+                             "toward the goal. Training used ~[3,13]; start low and raise.")
     args = parser.parse_args()
 
     target_vel = np.array([args.target_vx, args.target_vy, args.target_vz])
+    goal_enu = np.array(args.goal) if args.goal is not None else None
 
     # Optional live depth input
     depth_sub = None
@@ -524,11 +541,19 @@ def main():
                 # Keep the GRU warm during the climb so it has context at handoff.
                 depth_m = depth_sub.latest() if depth_sub else None
 
+                # Goal-seeking target velocity (matches training target_v_raw = p_target - p);
+                # the policy normalizes/clamps internally. Falls back to fixed --target-v*.
+                if goal_enu is not None:
+                    cur_target = goal_enu - pos
+                else:
+                    cur_target = target_vel
+
                 if phase == "CLIMB":
                     # Stream position setpoint (straight up to climb_alt).
                     send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_ned)
                     # Run policy but DISCARD output — warms the hidden state.
-                    policy.step(pos, vel, R_enu, target_vel, depth_m=depth_m)
+                    policy.step(pos, vel, R_enu, cur_target, margin=args.margin,
+                                max_speed=args.max_speed, depth_m=depth_m)
 
                     alt = pos[2]            # ENU z = altitude [m]
                     speed = np.linalg.norm(vel)
@@ -543,15 +568,19 @@ def main():
                               f"speed={speed:.2f}  offboard={state.offboard} armed={state.armed}")
 
                 else:  # POLICY
-                    act_world = policy.step(pos, vel, R_enu, target_vel, depth_m=depth_m)
+                    act_world = policy.step(pos, vel, R_enu, cur_target, margin=args.margin,
+                                            max_speed=args.max_speed, depth_m=depth_m)
                     q_des, thrust_norm = act_world_to_attitude_target(act_world, yaw, verbose=verbose)
                     send_attitude_target(mav, q_des, thrust_norm)
                     if verbose:
                         print(
-                            f"[POLICY t={elapsed:.2f}s step={step_count}] "
-                            f"pos={pos.round(2)}  vel={vel.round(2)}\n"
-                            f"  cur_att RPY(ENU) = roll={cur_rpy[0]:.1f}° pitch={cur_rpy[1]:.1f}° yaw={cur_rpy[2]:.1f}°\n"
-                            f"  state.armed={state.armed}  state.offboard={state.offboard}\n"
+                            f"[POLICY t={elapsed:.2f}s step={step_count}]\n"
+                            f"  pos(ENU)        = {pos.round(2)}\n"
+                            f"  vel(ENU)        = {vel.round(2)}\n"
+                            f"  cur_target(ENU) = {np.round(cur_target, 2)}  (goal - pos)\n"
+                            f"  act_world(ENU)  = {np.round(act_world, 2)}  (policy net accel)\n"
+                            f"  cur_att RPY(ENU)= roll={cur_rpy[0]:.1f}° pitch={cur_rpy[1]:.1f}° yaw={cur_rpy[2]:.1f}°\n"
+                            f"  armed={state.armed}  offboard={state.offboard}\n"
                             "---"
                         )
 
