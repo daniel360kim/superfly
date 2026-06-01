@@ -27,7 +27,7 @@ import torch
 from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, "DiffPhysDrone")
+sys.path.insert(0, "/home/dtc-system/superfly/DiffPhysDrone")
 from model import Model
 
 # ---------------------------------------------------------------------------
@@ -82,8 +82,14 @@ def act_world_to_attitude_target(act_world: np.ndarray, current_yaw: float, verb
     act_world: [m/s²] in ENU world frame (output of policy decode formula)
     current_yaw: current drone yaw in radians (ENU convention, CCW from East)
     """
+    # act_world (= a_pred - v_pred) is the NET acceleration after thrust cancels gravity
+    # (this is the DiffPhysDrone convention: the CUDA kernel adds +9.80665 to act[2]
+    # everywhere it computes thrust — see dynamics_kernel.cu:113-121). So the actual
+    # thrust acceleration the rotors must produce is act_world + [0,0,g].
+    thrust_accel = act_world + np.array([0.0, 0.0, 9.80665])
+
     # Desired force in world frame [N]
-    F_des = MASS_KG * act_world
+    F_des = MASS_KG * thrust_accel
 
     F_norm = np.linalg.norm(F_des)
     if F_norm < 1e-3:
@@ -211,16 +217,32 @@ class DiffDronePolicy:
     def reset(self):
         self.h = None
 
+    def normalize_depth(self, depth_m: np.ndarray) -> torch.Tensor:
+        """Apply the EXACT training depth transform (main_cuda.py:156-157):
+            x = 3 / depth.clamp(0.3, 24) - 0.6      # noise omitted at inference
+            x = F.max_pool2d(x[:, None], 4, 4)
+        Input:  (48, 64) float32 metric depth (planar/optical-axis Z-depth).
+        Output: (1, 1, 12, 16) tensor ready for the model.
+        Note max_pool of 3/d == min_pool of distance → keeps nearest obstacle
+        per 4x4 block, matching training.
+        """
+        d = torch.as_tensor(depth_m, dtype=torch.float32, device=self.device)
+        d = d.clamp(0.3, 24.0)
+        x = 3.0 / d - 0.6
+        x = torch.nn.functional.max_pool2d(x[None, None], 4, 4)  # (1,1,12,16)
+        return x
+
     @torch.no_grad()
     def step(self, position_enu: np.ndarray, velocity_enu: np.ndarray,
              R_enu: np.ndarray, target_velocity_enu: np.ndarray,
-             margin: float = 10.0) -> np.ndarray:
+             margin: float = 10.0, depth_m: np.ndarray = None) -> np.ndarray:
         """
         Run one policy step. Returns act_world [m/s²] in ENU frame.
 
         position_enu, velocity_enu, R_enu: current drone state (ENU/FLU)
         target_velocity_enu: desired velocity vector in ENU [m/s]
         margin: distance to nearest obstacle [m] (use large value if unknown)
+        depth_m: (48,64) metric depth frame; if None, uses blank (no obstacles)
         """
         R = torch.tensor(R_enu, dtype=torch.float32, device=self.device)  # (3,3)
 
@@ -255,8 +277,11 @@ class DiffDronePolicy:
         else:
             state = torch.cat([local_v, target_v_body, body_up, margin_t.squeeze(0)]).unsqueeze(0)  # (1,10)
 
-        # Depth image: (1, 1, H, W) — blank = no obstacles
-        depth = self._blank_depth
+        # Depth image: (1, 1, 12, 16). Use real frame if provided, else blank.
+        if depth_m is not None:
+            depth = self.normalize_depth(depth_m)
+        else:
+            depth = self._blank_depth
 
         act_raw, _, self.h = self.model(depth, state, self.h)  # (1, 6)
 
@@ -319,6 +344,33 @@ def send_attitude_target(mav, q_wxyz: np.ndarray, thrust: float):
     )
 
 
+def send_position_target_ned(mav, x_n: float, y_e: float, z_d: float, yaw: float = 0.0):
+    """Send SET_POSITION_TARGET_LOCAL_NED (msg id 84), position-only.
+
+    Coordinates are NED (z DOWN, so 10 m altitude => z_d = -10). type_mask
+    ignores velocity, accel, and yaw_rate — we command position + yaw.
+    """
+    # type_mask bits (SET => IGNORE that field):
+    #   x=1,y=2,z=4, vx=8,vy=16,vz=32, ax=64,ay=128,az=256, force=512,
+    #   yaw=1024, yaw_rate=2048.
+    # Keep position (x,y,z) + yaw ACTIVE; ignore velocity, accel, yaw_rate.
+    IGNORE_VEL = 8 | 16 | 32
+    IGNORE_ACC = 64 | 128 | 256
+    IGNORE_YAW_RATE = 2048
+    type_mask = IGNORE_VEL | IGNORE_ACC | IGNORE_YAW_RATE  # = 2552
+    mav.mav.set_position_target_local_ned_send(
+        int(time.time() * 1000) & 0xFFFFFFFF,  # time_boot_ms
+        mav.target_system,
+        mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        type_mask,
+        float(x_n), float(y_e), float(z_d),
+        0.0, 0.0, 0.0,   # velocity (ignored)
+        0.0, 0.0, 0.0,   # accel (ignored)
+        float(yaw), 0.0,  # yaw, yaw_rate (yaw_rate ignored)
+    )
+
+
 def send_heartbeat(mav):
     mav.mav.heartbeat_send(
         mavutil.mavlink.MAV_TYPE_GCS,
@@ -369,9 +421,24 @@ def main():
     parser.add_argument("--target-vx", type=float, default=0.0, help="Target velocity x (ENU) m/s")
     parser.add_argument("--target-vy", type=float, default=0.0, help="Target velocity y (ENU) m/s")
     parser.add_argument("--target-vz", type=float, default=0.0, help="Target velocity z (ENU) m/s")
+    parser.add_argument("--depth", action="store_true",
+                        help="Subscribe to live depth frames over UDP (from the sim/camera)")
+    parser.add_argument("--climb-alt", type=float, default=10.0,
+                        help="Climb to this altitude [m] via position control before policy takes over")
+    parser.add_argument("--arrive-tol", type=float, default=0.3,
+                        help="Altitude tolerance [m] to consider target reached")
+    parser.add_argument("--settle-speed", type=float, default=0.2,
+                        help="Speed [m/s] below which the drone is considered settled")
     args = parser.parse_args()
 
     target_vel = np.array([args.target_vx, args.target_vy, args.target_vz])
+
+    # Optional live depth input
+    depth_sub = None
+    if args.depth:
+        from depth_transport import DepthSubscriber
+        depth_sub = DepthSubscriber()
+        print("Depth subscriber listening for frames over UDP.")
 
     # Connect
     print(f"Connecting to {args.connect} ...")
@@ -388,7 +455,6 @@ def main():
     print(f"Loading policy from {args.checkpoint} ...")
     policy = DiffDronePolicy(args.checkpoint, no_odom=args.no_odom)
 
-    hover_q = np.array([1.0, 0.0, 0.0, 0.0])  # level attitude in NED/FRD
     hover_thrust = float(np.clip(MASS_KG * 9.80665 / (MASS_KG * MAX_ACCEL), 0.0, 1.0))
 
     # Tell PX4 what hover throttle to expect so its internal throttle curve
@@ -397,10 +463,23 @@ def main():
     set_param_float(mav, "MPC_THR_HOVER", hover_thrust)
     time.sleep(0.2)
 
-    # Send a few attitude targets before arming so PX4 accepts OFFBOARD mode
-    print("Pre-arming: sending attitude setpoints to satisfy PX4 OFFBOARD pre-condition...")
+    # Pre-arm: stream POSITION setpoints (hold current spot) so PX4 accepts OFFBOARD.
+    # Staying on position setpoints the whole way through the climb means there is
+    # never a >0.5s setpoint gap and no mode switch — OFFBOARD is held continuously.
+    pos0, _, _, yaw0 = state.get()
+    # ENU->NED position (inverse of the receiver's [msg.y, msg.x, -msg.z]):
+    #   North = ENU.y,  East = ENU.x,  Down = -ENU.z
+    # Hold the takeoff XY, climb straight up to climb_alt.
+    hold_x_n = pos0[1]
+    hold_y_e = pos0[0]
+    hold_z_d = -args.climb_alt
+    # NED yaw is measured CW from North; PX4 holds heading, exact value is not
+    # critical for a vertical climb. 0 = facing North.
+    yaw_ned = 0.0
+
+    print("Pre-arming: streaming position setpoints to satisfy PX4 OFFBOARD pre-condition...")
     for _ in range(30):
-        send_attitude_target(mav, hover_q, hover_thrust)
+        send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_ned)
         send_heartbeat(mav)
         time.sleep(0.05)
 
@@ -412,18 +491,7 @@ def main():
     arm(mav)
     time.sleep(1.0)
 
-    # Warm up the GRU by running the policy for 1 second while holding a safe
-    # hover command. This prevents the cold-start garbage output from reaching
-    # the motors immediately after arming.
-    WARMUP_SECS = 1.0
-    print(f"Warming up GRU for {WARMUP_SECS}s (holding hover, not sending policy output)...")
     policy.reset()
-    pos, vel, R_enu, yaw = state.get()
-    for _ in range(int(WARMUP_SECS * CONTROL_HZ)):
-        policy.step(pos, vel, R_enu, target_vel)  # run but discard output
-        time.sleep(1.0 / CONTROL_HZ)
-
-    print("Starting policy loop at 15 Hz. Ctrl+C to stop.")
 
     control_dt = 1.0 / CONTROL_HZ
     heartbeat_dt = 1.0 / HEARTBEAT_HZ
@@ -431,6 +499,11 @@ def main():
     start_time = time.time()
     next_step = time.time()
     step_count = 0
+
+    # State machine: "CLIMB" -> position control to altitude; "POLICY" -> attitude
+    # control from the DiffPhysDrone policy. Hand off once at altitude AND settled.
+    phase = "CLIMB"
+    print(f"CLIMB: position-holding to {args.climb_alt:.1f} m ...")
 
     try:
         while True:
@@ -445,25 +518,42 @@ def main():
             # Control step
             if now >= next_step:
                 pos, vel, R_enu, yaw = state.get()
-
-                # Current attitude as RPY for logging
                 cur_rpy = Rotation.from_matrix(R_enu).as_euler("xyz", degrees=True)
-
-                act_world = policy.step(pos, vel, R_enu, target_vel)
-
-                # Verbose every step for first 5 seconds, then at 1 Hz
                 verbose = elapsed < 5.0 or (int(now) != int(now - control_dt))
-                q_des, thrust_norm = act_world_to_attitude_target(act_world, yaw, verbose=verbose)
-                send_attitude_target(mav, q_des, thrust_norm)
 
-                if verbose:
-                    print(
-                        f"[t={elapsed:.2f}s step={step_count}] "
-                        f"pos={pos.round(2)}  vel={vel.round(2)}\n"
-                        f"  cur_att RPY(ENU) = roll={cur_rpy[0]:.1f}° pitch={cur_rpy[1]:.1f}° yaw={cur_rpy[2]:.1f}°\n"
-                        f"  state.armed={state.armed}  state.offboard={state.offboard}\n"
-                        "---"
-                    )
+                # Keep the GRU warm during the climb so it has context at handoff.
+                depth_m = depth_sub.latest() if depth_sub else None
+
+                if phase == "CLIMB":
+                    # Stream position setpoint (straight up to climb_alt).
+                    send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_ned)
+                    # Run policy but DISCARD output — warms the hidden state.
+                    policy.step(pos, vel, R_enu, target_vel, depth_m=depth_m)
+
+                    alt = pos[2]            # ENU z = altitude [m]
+                    speed = np.linalg.norm(vel)
+                    arrived = abs(alt - args.climb_alt) < args.arrive_tol
+                    settled = speed < args.settle_speed
+                    if arrived and settled and state.offboard:
+                        phase = "POLICY"
+                        print(f"\n>>> HANDOFF to policy at alt={alt:.2f} m, "
+                              f"speed={speed:.2f} m/s <<<\n")
+                    if verbose:
+                        print(f"[CLIMB t={elapsed:.2f}s] alt={alt:.2f}/{args.climb_alt:.1f} "
+                              f"speed={speed:.2f}  offboard={state.offboard} armed={state.armed}")
+
+                else:  # POLICY
+                    act_world = policy.step(pos, vel, R_enu, target_vel, depth_m=depth_m)
+                    q_des, thrust_norm = act_world_to_attitude_target(act_world, yaw, verbose=verbose)
+                    send_attitude_target(mav, q_des, thrust_norm)
+                    if verbose:
+                        print(
+                            f"[POLICY t={elapsed:.2f}s step={step_count}] "
+                            f"pos={pos.round(2)}  vel={vel.round(2)}\n"
+                            f"  cur_att RPY(ENU) = roll={cur_rpy[0]:.1f}° pitch={cur_rpy[1]:.1f}° yaw={cur_rpy[2]:.1f}°\n"
+                            f"  state.armed={state.armed}  state.offboard={state.offboard}\n"
+                            "---"
+                        )
 
                 step_count += 1
                 next_step += control_dt
