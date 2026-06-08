@@ -36,7 +36,7 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 import sys
 sys.path.insert(0, "/home/dtc-system/superfly/starling-deployment")
 from depth_transport import DepthPublisher, RENDER_H, RENDER_W
-from obstacle_field import generate as generate_field
+from obstacle_field import generate as generate_field, generate_diffaero
 
 # --- DiffPhysDrone single_agent camera params ---
 FOV_X_HALF_TAN = 0.82
@@ -68,7 +68,10 @@ class PegasusApp:
         self.pg.load_environment(SIMULATION_ENVIRONMENTS["Box Room"])
 
         # Spawn the training-distribution obstacle field (analytic primitives).
-        self.field = generate_field(seed=seed, scale=scale)
+        if self.obstacles == "diffaero":
+            self.field = generate_diffaero(seed=seed, scale=scale)
+        else:
+            self.field = generate_field(seed=seed, scale=scale)
         print("[obstacle_field]", self.field.summary())
         self._spawn_obstacles(self.field)
 
@@ -80,9 +83,9 @@ class PegasusApp:
         config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
         if self.policy == "diffaero":
-            self._setup_camera_diffaero_intrinsics()
+            self._setup_camera_diffaero()
         else:
-            self._setup_camera_diffphys_intrinsics()
+            self._setup_camera_diffphys()
         
         config_multirotor.graphical_sensors = [self._camera]
 
@@ -136,15 +139,20 @@ class PegasusApp:
             [0.0, 0.0, 1.0]])
 
     def _setup_camera_diffaero(self):
+        """Forward-facing depth camera for DiffAero: 86° HFOV, no downward pitch,
+        rendered at 36x64 (4x the 9x16 policy grid) so a 4x4 min-pool preserves
+        thin pillars."""
         self._camera = MonocularCamera("depth_cam", config={
             "depth": True,
-            "position": np.array([0.20, 0.0, 0.05]),
-            "orientation": np.array([0.0, -DA_CAM_ANGLE_DEG, 180.0]),
-            "resolution": (DA_RENDER_W, DA_RENDER_H),
+            "position": np.array([0.20, 0.0, 0.05]),     # body-frame mount offset (m)
+            "orientation": np.array([0.0, -DA_CAM_ANGLE_DEG, 180.0]),  # 180° yaw = look forward
+            "resolution": (DA_RENDER_W, DA_RENDER_H),     # (width, height) = (64, 36)
             "frequency": 30,
-            "intrinsics": None,  # falls back to fov-based; we override fov below
+            "intrinsics": None,                           # fall back to FOV; we override below
         })
 
+        # Pinhole intrinsics from the FOVs. fy != fx because the 16:9 grid is wide,
+        # but the pixels are square, so the vertical FOV is derived, not independent.
         self._camera.fov = DA_FOV_X_DEG
         self._camera.fx = 0.5 * DA_RENDER_W / math.tan(0.5 * math.radians(DA_FOV_X_DEG))
         self._camera.fy = 0.5 * DA_RENDER_H / math.tan(0.5 * math.radians(DA_FOV_Y_DEG))
@@ -153,10 +161,16 @@ class PegasusApp:
         self._camera._intrinsics = np.array([
             [self._camera.fx, 0.0, self._camera.cx],
             [0.0, self._camera.fy, self._camera.cy],
-            [0.0, 0.0, 1.0]]
+            [0.0, 0.0, 1.0],
         ])
 
+        # --- Precompute the planar-Z → Euclidean-range scale table (once) ---
         u = np.arange(DA_RENDER_W, dtype=np.float32)
+        v = np.arange(DA_RENDER_H, dtype=np.float32)
+        uu, vv = np.meshgrid(u, v)                        # uu,vv shape (36, 64); row=v, col=u
+        xn = (uu - self._camera.cx) / self._camera.fx     # normalized image-plane x per pixel
+        yn = (vv - self._camera.cy) / self._camera.fy     # normalized image-plane y per pixel
+        self._da_euclid_scale = np.sqrt(1.0 + xn*xn + yn*yn).astype(np.float32)
 
 
     def _spawn_obstacles(self, fld):
@@ -169,12 +183,20 @@ class PegasusApp:
                 radius=float(r),
                 color=np.array([0.8, 0.3, 0.3]),
             )
-        # Boxes (voxels): half-extents -> full-size scale
-        for i, (cx, cy, cz, hx, hy, hz) in enumerate(fld.boxes):
+        # Boxes: DiffPhys gives 6-tuples (cx,cy,cz,hx,hy,hz); DiffAero gives 9-tuples
+        # with an extra (roll,pitch,yaw) in radians for tilted pillars.
+        for i, box in enumerate(fld.boxes):
+            cx, cy, cz, hx, hy, hz = box[:6]
+            orientation = None
+            if len(box) >= 9:
+                roll, pitch, yaw = box[6], box[7], box[8]
+                q = Rotation.from_euler("XYZ", [roll, pitch, yaw]).as_quat()  # [x,y,z,w]
+                orientation = np.array([q[3], q[0], q[1], q[2]])              # FixedCuboid wants [w,x,y,z]
             FixedCuboid(
                 prim_path=f"/World/obstacles/box_{i}",
                 position=np.array([cx, cy, cz]),
                 scale=np.array([2 * hx, 2 * hy, 2 * hz]),
+                orientation=orientation,
                 color=np.array([0.3, 0.5, 0.8]),
             )
         # Vertical cylinders (axis = world Z), tall enough to span the flight band.
@@ -204,8 +226,45 @@ class PegasusApp:
             orientation=orientation,
             attributes={"radius": float(radius), "height": float(height), "axis": "Z"},
         )
-
+        
     def _publish_depth(self):
+        """Dispatch to the per-policy depth publisher (called every render tick)."""
+        if self.policy == "diffaero":
+            self._publish_depth_diffaero()
+        else:
+            self._publish_depth_diffphys()
+
+    def _publish_depth_diffaero(self):
+        """Render → Euclidean range → 9x16 → publish over UDP for the DiffAero policy."""
+        cam = getattr(self._camera, "_camera", None)
+        if cam is None or not getattr(self._camera, "_camera_full_set", False):
+            return                                  # camera not initialized yet this frame
+        depth = cam.get_depth()                     # planar Z-depth, ~(36, 64)
+        if depth is None:
+            return
+
+        # 1) Sanitize: sky / no-return pixels come back as inf/nan. Map them to a big
+        #    "far" value so they encode as perception ≈ 0 (nothing there), not garbage.
+        far = 1e3
+        depth = np.nan_to_num(np.asarray(depth, np.float32), nan=far, posinf=far, neginf=far)
+
+        # 2) Defensive resize to the exact render grid (Isaac usually already gives this).
+        if depth.shape != (DA_RENDER_H, DA_RENDER_W):
+            yi = np.linspace(0, depth.shape[0] - 1, DA_RENDER_H).astype(np.int64)
+            xi = np.linspace(0, depth.shape[1] - 1, DA_RENDER_W).astype(np.int64)
+            depth = depth[yi][:, xi]
+
+        # 3) Planar Z-depth → Euclidean range, using the precomputed per-pixel table.
+        euclid = depth * self._da_euclid_scale          # (36, 64)
+
+        # 4) Min-pool 4x4 down to the 9x16 policy grid (keep the NEAREST surface per cell).
+        euclid = euclid.reshape(DA_OUT_H, DA_POOL, DA_OUT_W, DA_POOL).min(axis=(1, 3))  # (9,16)
+
+        self._depth_pub.send(np.ascontiguousarray(euclid, np.float32))
+        self._dump_depth_debug(euclid)
+            
+
+    def _publish_depth_diffphys(self):
         """Grab the camera's planar Z-depth, resize to 48x64, publish over UDP."""
         cam = getattr(self._camera, "_camera", None)
         if cam is None or not getattr(self._camera, "_camera_full_set", False):
@@ -260,7 +319,8 @@ class PegasusApp:
             fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4.5), squeeze=False)
 
             ax = axes[0][0]
-            im = ax.imshow(depth, origin="upper", cmap="turbo", vmin=0.3, vmax=24.0)
+            vmax = DA_MAX_DIST if self.policy == "diffaero" else 24.0
+            im = ax.imshow(depth, origin="upper", cmap="turbo", vmin=0.3, vmax=vmax)
             fig.colorbar(im, ax=ax, label="depth [m]")
             ax.set_title(f"depth  frame={self._dbg_n}  "
                          f"min={depth.min():.2f} max={depth.max():.2f} m")
