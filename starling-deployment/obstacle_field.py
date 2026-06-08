@@ -39,8 +39,10 @@ CYLH_W = np.array([8., 6., 0.1]);                 CYLH_B = np.array([0., 0., 0.0
 
 @dataclass
 class ObstacleField:
+    # DiffPhysDrone boxes are 6-tuples (cx,cy,cz, hx,hy,hz); DiffAero boxes are
+    # 9-tuples (cx,cy,cz, hx,hy,hz, roll,pitch,yaw) with rpy in radians (XYZ euler).
     spheres: List[tuple] = field(default_factory=list)   # (cx,cy,cz, r)
-    boxes: List[tuple] = field(default_factory=list)      # (cx,cy,cz, hx,hy,hz)
+    boxes: List[tuple] = field(default_factory=list)      # (cx,cy,cz, hx,hy,hz[, r,p,y])
     cyl_v: List[tuple] = field(default_factory=list)      # (cx,cy, r)  vertical (axis=Z), full height
     cyl_h: List[tuple] = field(default_factory=list)      # (cx,cz, r)  horizontal (axis=X)
     p_init: np.ndarray = None      # drone start (ENU)
@@ -52,6 +54,43 @@ class ObstacleField:
                 f"{len(self.spheres)} spheres, {len(self.boxes)} boxes, "
                 f"{len(self.cyl_v)} vert-cyl, {len(self.cyl_h)} horiz-cyl | "
                 f"start={np.round(self.p_init,2)} target={np.round(self.p_target,2)}")
+
+
+# --- DiffAero outdoor obstacle distribution (diffaero/cfg/env/obstacles/outdoor.yaml
+#     + diffaero/utils/assets.py ObstacleManager) ---
+DA_N_OBSTACLES = 30
+DA_SPHERE_PCT = 0.33                       # n_spheres = int(30*0.33) = 9, n_cubes = 21
+DA_SPHERE_R = (0.6, 2.0, 0.4)              # arange(min, max, step) -> [0.6,1.0,1.4,1.8]
+DA_CUBE_LW = (0.6, 1.4, 0.2)              # -> [0.6,0.8,1.0,1.2]
+DA_CUBE_H = (10.0, 15.0, 1.0)            # -> [10,11,12,13,14]
+DA_CUBE_RP_DEG = 15.0                      # cube roll/pitch range (deg); yaw uniform +-pi
+DA_RANDPOS_STD = (6.0, 7.0)               # (min, max) perpendicular std along the path
+DA_SAFETY_RANGE = 1.7
+DA_HEIGHT_SCALE = 0.25                     # vertical std = std * height_scale
+DA_GROUND_Z = 0.0                          # Isaac Box Room ground plane (ENU z up)
+
+
+def _euler_xyz_matrix(roll, pitch, yaw):
+    """Rotation matrix for intrinsic XYZ euler angles (radians)."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    return rx @ ry @ rz
+
+
+def _grounded_box_cz(hx, hy, hz, roll, pitch, yaw, ground_z=DA_GROUND_Z):
+    """Center z so the lowest vertex of the rotated box rests on ground_z."""
+    rot = _euler_xyz_matrix(roll, pitch, yaw)
+    min_local_z = float("inf")
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                corner = rot @ np.array([sx * hx, sy * hy, sz * hz])
+                min_local_z = min(min_local_z, corner[2])
+    return ground_z - min_local_z
 
 
 def generate(seed: int = 0, scale: float = 5.0, heading_deg: float = 90.0) -> ObstacleField:
@@ -121,6 +160,107 @@ def generate(seed: int = 0, scale: float = 5.0, heading_deg: float = 90.0) -> Ob
     return fld
 
 
+def generate_diffaero(seed: int = 0, scale: float = 5.0, heading_deg: float = 90.0) -> ObstacleField:
+    """Build a DiffAero training-distribution obstacle field.
+
+    Replicates diffaero's `outdoor` ObstacleManager (diffaero/utils/assets.py):
+    30 obstacles, 33% spheres (9) + 67% cubes (21), with sizes drawn from the
+    configured ranges and rotated cubes (tall pillars). Obstacles are scattered
+    around the straight line from the drone start to the goal in XY, with a
+    perpendicular Gaussian spread (std 6-7 m) and pushed outside a safety radius
+    of the start/goal, exactly as in `randomize_obstacles_positions`.
+
+    All obstacles are grounded on the Isaac ground plane (z=0): spheres sit on
+    the floor, tall cubes rise from it (including roll/pitch tilt). The drone
+    start/goal XY mirror the DiffPhysDrone corridor; metadata z matches diffphys
+    (1 m) while the offboard script cruises at `flight_alt`.
+    """
+    rng = np.random.default_rng(seed)
+
+    cs, sn = math.cos(math.radians(heading_deg)), math.sin(math.radians(heading_deg))
+
+    def rot_xy(x, y):
+        return cs * x - sn * y, sn * x + cs * y
+
+    # Same start/goal XY as the DiffPhysDrone field.
+    pix, piy = rot_xy(-1.5 * scale, -3.0)
+    ptx, pty = rot_xy(8.0 * scale, 3.0)
+    p_init = np.array([pix, piy, 1.0], dtype=np.float64)
+    p_target = np.array([ptx, pty, 1.0], dtype=np.float64)
+
+    n_spheres = int(DA_N_OBSTACLES * DA_SPHERE_PCT)   # 9
+    n_cubes = DA_N_OBSTACLES - n_spheres               # 21
+
+    # --- sizes ---
+    sphere_choices = np.arange(*DA_SPHERE_R)
+    r_spheres = rng.choice(sphere_choices, size=n_spheres)
+    lw_choices = np.arange(*DA_CUBE_LW)
+    h_choices = np.arange(*DA_CUBE_H)
+    cube_l = rng.choice(lw_choices, size=n_cubes)
+    cube_w = rng.choice(lw_choices, size=n_cubes)
+    cube_h = rng.choice(h_choices, size=n_cubes)
+    lwh = np.stack([cube_l, cube_w, cube_h], axis=-1)               # (n_cubes, 3)
+    r_cubes = np.linalg.norm(lwh / 2.0, axis=-1)                    # bounding radius
+    r_obstacles = np.concatenate([r_spheres, r_cubes])             # (30,)
+
+    # --- cube poses (rpy, radians; XYZ euler) ---
+    rp = math.radians(DA_CUBE_RP_DEG)
+    roll = rng.uniform(-rp, rp, size=n_cubes)
+    pitch = rng.uniform(-rp, rp, size=n_cubes)
+    yaw = rng.uniform(-math.pi, math.pi, size=n_cubes)
+    rpy = np.stack([roll, pitch, yaw], axis=-1)                     # (n_cubes, 3)
+
+    # --- positions, scattered around the start->goal line in XY only ---
+    p_init_xy = p_init[:2]
+    p_target_xy = p_target[:2]
+    rel_pos_xy = p_target_xy - p_init_xy
+    rel_len = np.linalg.norm(rel_pos_xy)
+    target_axis_xy = rel_pos_xy / rel_len
+    horizontal_axis_xy = np.array([-target_axis_xy[1], target_axis_xy[0]])
+
+    n = DA_N_OBSTACLES
+    minstd, maxstd = DA_RANDPOS_STD
+    target_axis_ratio = rng.random((n, 1))
+    target_axis_pos_xy = target_axis_ratio * rel_pos_xy                   # (n,2)
+    std = np.abs(target_axis_ratio - 0.5) * 2 * (maxstd - minstd) + minstd  # (n,1)
+    h_ratio = rng.standard_normal((n, 1)) * std
+    relpos2target_axis_xy = h_ratio * horizontal_axis_xy                  # (n,2)
+    relpos2drone_xy = target_axis_pos_xy + relpos2target_axis_xy          # (n,2)
+
+    # push obstacles outside a safety radius of the start and goal (XY)
+    relpos2target_xy = relpos2drone_xy - rel_pos_xy
+    dist2drone = np.linalg.norm(relpos2drone_xy, axis=-1)
+    dist2target = np.linalg.norm(relpos2target_xy, axis=-1)
+    safety = r_obstacles + DA_SAFETY_RANGE
+    tooclose = (dist2drone < safety) | (dist2target < safety)
+    if np.any(tooclose):
+        perp = relpos2target_axis_xy[tooclose]
+        perp_n = perp / np.clip(np.linalg.norm(perp, axis=-1, keepdims=True), 1e-6, None)
+        relpos2drone_xy[tooclose] += perp_n * DA_SAFETY_RANGE
+
+    obstacle_xy = p_init_xy + relpos2drone_xy                           # (n,2)
+
+    fld = ObstacleField(scale=scale)
+    for i in range(n_spheres):
+        cx, cy = obstacle_xy[i]
+        r = float(r_spheres[i])
+        fld.spheres.append((float(cx), float(cy), r + DA_GROUND_Z, r))
+    for j in range(n_cubes):
+        cx, cy = obstacle_xy[n_spheres + j]
+        hx, hy, hz = lwh[j] / 2.0
+        rr, pp, yy = rpy[j]
+        cz = _grounded_box_cz(float(hx), float(hy), float(hz), float(rr), float(pp), float(yy))
+        fld.boxes.append((float(cx), float(cy), cz, float(hx), float(hy), float(hz),
+                          float(rr), float(pp), float(yy)))
+    fld.p_init = p_init
+    fld.p_target = p_target
+    return fld
+
+
 if __name__ == "__main__":
+    print("=== DiffPhysDrone distribution ===")
     for s in (0, 1, 2):
         print(generate(seed=s, scale=5.0).summary())
+    print("=== DiffAero distribution ===")
+    for s in (0, 1, 2):
+        print(generate_diffaero(seed=s, scale=5.0).summary())

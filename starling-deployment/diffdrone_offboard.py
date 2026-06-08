@@ -26,8 +26,10 @@ import numpy as np
 import torch
 from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
+from pathlib import Path
 
-sys.path.insert(0, "/home/dtc-system/superfly/DiffPhysDrone")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "DiffPhysDrone"))
 from model import Model
 
 # ---------------------------------------------------------------------------
