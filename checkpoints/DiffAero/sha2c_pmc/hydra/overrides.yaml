@@ -1,0 +1,5 @@
+- env=oa
+- algo=sha2c
+- dynamics=pmc
+- headless=True
+- device=0

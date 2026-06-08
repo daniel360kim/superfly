@@ -43,13 +43,23 @@ FOV_X_HALF_TAN = 0.82
 CAM_ANGLE_DEG = 20.0
 FOV_X_DEG = 2.0 * math.degrees(math.atan(FOV_X_HALF_TAN))  # ~78.6 deg horizontal
 
+DA_OUT_W, DA_OUT_H = 16, 9          # policy grid: cols × rows
+DA_POOL = 4                         # render 4× denser, min-pool down
+DA_RENDER_W = DA_OUT_W * DA_POOL    # 64
+DA_RENDER_H = DA_OUT_H * DA_POOL    # 36
+DA_FOV_X_DEG = 86.0
+DA_FOV_Y_DEG = DA_FOV_X_DEG * DA_OUT_H / DA_OUT_W   # 48.375° (DiffAero definition)
+DA_CAM_ANGLE_DEG = 0.0              # no downward pitch
+DA_MAX_DIST = 5.0
 
 class PegasusApp:
 
     SPAWN_YAW_DEG = 0.0  # EKF heading is mag-locked (~+Y); we rotate the field instead
 
-    def __init__(self, seed: int = 0, scale: float = 5.0, spawn_yaw_deg: float = 0.0):
+    def __init__(self, seed: int = 0, scale: float = 5.0, spawn_yaw_deg: float = 0.0, policy: str = "diffphys", obstacles: str = "diffphys"):
         self.SPAWN_YAW_DEG = spawn_yaw_deg
+        self.policy = policy
+        self.obstacles = obstacles
         self.timeline = omni.timeline.get_timeline_interface()
         self.pg = PegasusInterface()
         self.pg._world = World(**self.pg._world_settings)
@@ -69,30 +79,11 @@ class PegasusApp:
         })
         config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
-        # Forward-facing depth camera, pitched CAM_ANGLE_DEG down.
-        # Pegasus MonocularCamera 'orientation' is Euler ZYX (deg) relative to the
-        # body frame; default [0,0,180] points the camera forward (+X body). A
-        # positive pitch about the camera's lateral axis tilts the view downward.
-        self._camera = MonocularCamera("depth_cam", config={
-            "depth": True,
-            "position": np.array([0.10, 0.0, 0.0]),
-            # NOTE: with the 180° yaw, a positive Y-pitch tilts the view UP, so we
-            # negate CAM_ANGLE_DEG to pitch the camera DOWN (matching training).
-            "orientation": np.array([0.0, -CAM_ANGLE_DEG, 180.0]),
-            "resolution": (RENDER_W, RENDER_H),   # (width, height) = (64, 48)
-            "frequency": 30,
-            "intrinsics": None,  # falls back to fov-based; we override fov below
-        })
-        # Force the horizontal FOV to match training exactly.
-        self._camera.fov = FOV_X_DEG
-        self._camera.fx = 0.5 * RENDER_W / math.tan(0.5 * math.radians(FOV_X_DEG))
-        self._camera.fy = self._camera.fx
-        self._camera.cx = 0.5 * RENDER_W
-        self._camera.cy = 0.5 * RENDER_H
-        self._camera._intrinsics = np.array([
-            [self._camera.fx, 0.0, self._camera.cx],
-            [0.0, self._camera.fy, self._camera.cy],
-            [0.0, 0.0, 1.0]])
+        if self.policy == "diffaero":
+            self._setup_camera_diffaero_intrinsics()
+        else:
+            self._setup_camera_diffphys_intrinsics()
+        
         config_multirotor.graphical_sensors = [self._camera]
 
         # Spawn the drone on the ground at the field's start XY (it climbs from here).
@@ -115,6 +106,58 @@ class PegasusApp:
         self._dbg_n = 0           # frame counter for throttled debug dumps
         self._dbg_every = 30      # save a debug PNG every N published frames
         self.stop_sim = False
+    
+    def _setup_camera_diffphys(self):
+        """Forward-facing depth camera pitched CAM_ANGLE_DEG down (DiffPhysDrone).
+
+        Pegasus MonocularCamera 'orientation' is Euler ZYX (deg) relative to the
+        body frame; default [0,0,180] points the camera forward (+X body). A
+        positive pitch about the camera's lateral axis tilts the view downward.
+        """
+        self._camera = MonocularCamera("depth_cam", config={
+            "depth": True,
+            "position": np.array([0.10, 0.0, 0.0]),
+            # NOTE: with the 180° yaw, a positive Y-pitch tilts the view UP, so we
+            # negate CAM_ANGLE_DEG to pitch the camera DOWN (matching training).
+            "orientation": np.array([0.0, -CAM_ANGLE_DEG, 180.0]),
+            "resolution": (RENDER_W, RENDER_H),   # (width, height) = (64, 48)
+            "frequency": 30,
+            "intrinsics": None,  # falls back to fov-based; we override fov below
+        })
+        # Force the horizontal FOV to match training exactly.
+        self._camera.fov = FOV_X_DEG
+        self._camera.fx = 0.5 * RENDER_W / math.tan(0.5 * math.radians(FOV_X_DEG))
+        self._camera.fy = self._camera.fx
+        self._camera.cx = 0.5 * RENDER_W
+        self._camera.cy = 0.5 * RENDER_H
+        self._camera._intrinsics = np.array([
+            [self._camera.fx, 0.0, self._camera.cx],
+            [0.0, self._camera.fy, self._camera.cy],
+            [0.0, 0.0, 1.0]])
+
+    def _setup_camera_diffaero(self):
+        self._camera = MonocularCamera("depth_cam", config={
+            "depth": True,
+            "position": np.array([0.20, 0.0, 0.05]),
+            "orientation": np.array([0.0, -DA_CAM_ANGLE_DEG, 180.0]),
+            "resolution": (DA_RENDER_W, DA_RENDER_H),
+            "frequency": 30,
+            "intrinsics": None,  # falls back to fov-based; we override fov below
+        })
+
+        self._camera.fov = DA_FOV_X_DEG
+        self._camera.fx = 0.5 * DA_RENDER_W / math.tan(0.5 * math.radians(DA_FOV_X_DEG))
+        self._camera.fy = 0.5 * DA_RENDER_H / math.tan(0.5 * math.radians(DA_FOV_Y_DEG))
+        self._camera.cx = 0.5 * DA_RENDER_W
+        self._camera.cy = 0.5 * DA_RENDER_H
+        self._camera._intrinsics = np.array([
+            [self._camera.fx, 0.0, self._camera.cx],
+            [0.0, self._camera.fy, self._camera.cy],
+            [0.0, 0.0, 1.0]]
+        ])
+
+        u = np.arange(DA_RENDER_W, dtype=np.float32)
+
 
     def _spawn_obstacles(self, fld):
         """Spawn the analytic obstacle field as static Isaac prims (ENU, z up)."""
@@ -254,9 +297,11 @@ def main():
     parser.add_argument("--spawn-yaw", type=float, default=0.0,
                         help="Spawn yaw [deg]. EKF heading is mag-locked in sim, so this "
                              "mainly affects the initial facing; the field is rotated instead.")
+    parser.add_argument("--policy", choices=["diffphys", "diffaero"], default="diffphys")
+    parser.add_argument("--obstacles", choices=["diffphys", "diffaero"], default="diffphys")
     # parse_known_args so Isaac Sim's own argv flags don't trip argparse
     args, _ = parser.parse_known_args()
-    pg_app = PegasusApp(seed=args.seed, scale=args.scale, spawn_yaw_deg=args.spawn_yaw)
+    pg_app = PegasusApp(seed=args.seed, scale=args.scale, spawn_yaw_deg=args.spawn_yaw, policy=args.policy, obstacles=args.obstacles)
     pg_app.run()
 
 

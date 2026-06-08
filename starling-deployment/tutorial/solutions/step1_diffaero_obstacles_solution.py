@@ -192,7 +192,7 @@ def generate_diffaero(seed: int = 0, scale: float = 5.0, heading_deg: float = 90
     n_cubes = DA_N_OBSTACLES - n_spheres               # 21
 
     # --- sizes ---
-    sphere_choices = np.arange(*DA_SPHERE_R) # Available sphere dimaneters
+    sphere_choices = np.arange(*DA_SPHERE_R)
     r_spheres = rng.choice(sphere_choices, size=n_spheres)
     lw_choices = np.arange(*DA_CUBE_LW)
     h_choices = np.arange(*DA_CUBE_H)
