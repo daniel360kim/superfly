@@ -34,7 +34,7 @@ from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorCo
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 
 import sys
-sys.path.insert(0, "/home/danielkim/superfly/starling-deployment")
+sys.path.insert(0, "/home/ubuntu/superfly/starling-deployment")
 from depth_transport import DepthPublisher, RENDER_H, RENDER_W
 from obstacle_field import generate as generate_field
 

@@ -235,6 +235,7 @@ class DiffAeroPolicy:
         R = torch.tensor(R_enu, dtype=torch.float32, device=self.device)  # (3,3)
         v_world = torch.tensor(velocity_enu, dtype=torch.float32, device=self.device)
 
+        # Build yaw only frame
         # Yaw-only (local) frame: columns are [fwd, left, up] in world, matching
         # diffaero axis_rotmat("Z", yaw).
         fwd = R[:, 0].clone()
@@ -244,16 +245,23 @@ class DiffAeroPolicy:
         Rz = torch.stack([fwd, left, self._up], dim=1)  # (3,3)
         uz = R[:, 2]  # body up axis in world
 
+        # Compute desired velocity toward goal
         # target_vel_world = (target_pos - p) / max(dist/max_vel, 1)
+        
+        # Vector from drone to the goal
         relpos = (torch.tensor(target_pos_enu, dtype=torch.float32, device=self.device)
                   - torch.tensor(position_enu, dtype=torch.float32, device=self.device))
         dist = relpos.norm()
         mv = torch.tensor(float(max_vel), device=self.device)
+        # Time to goal at max_vel, but at least 1 second
         denom = torch.maximum(dist / mv, torch.ones((), device=self.device))
+        # SLow down near goal, stop at goal
         target_vel_world = relpos / denom
 
-        target_vel_local = Rz.t() @ target_vel_world
-        v_local = Rz.t() @ v_world
+        # Assemble 9D state vector: target velocity, body up, local velocity
+        # What DiffAero policy sees during training
+        target_vel_local = Rz.t() @ target_vel_world # to yaw frame
+        v_local = Rz.t() @ v_world # to yaw frame
         state9 = torch.cat([target_vel_local, uz, v_local]).unsqueeze(0)  # (1,9)
 
         # Velocity EMA -> commanded yaw (matches align_yaw_with_vel_ema).
