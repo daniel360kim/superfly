@@ -46,6 +46,17 @@ import torch
 from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
 
+
+from wrapper.diffaero_core import DiffAeroPolicy, DiffAeroObs, DiffAeroCmd
+from wrapper.perception_builder import Intrinsics
+
+DA_INTRINSICS = Intrinsics(
+    fx=0.5 * 64 / math.tan(0.5 * math.radians(86.0)),
+    fy=0.5 * 36 / math.tan(0.5 * math.radians(48.375)),
+    cx=32.0, cy=18.0,
+    H=36, W=64,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -82,37 +93,6 @@ def quat_ENU_FLU_to_NED_FRD(R_enu_flu: np.ndarray) -> np.ndarray:
     rot = _rot_ENU_to_NED * Rotation.from_matrix(R_enu_flu) * _rot_FLU_to_FRD
     q = rot.as_quat()  # [x, y, z, w] scipy convention
     return np.array([q[3], q[0], q[1], q[2]])  # -> [w, x, y, z] MAVLink convention
-
-
-def diffaero_quat_to_attitude_target(quat_xyzw_enu_flu: np.ndarray, acc_norm: float,
-                                     max_accel: float, verbose: bool = False):
-    """
-    Convert the DiffAero attitude command (ENU/FLU quaternion, xyzw) and thrust
-    acceleration magnitude into (q_des_ned_frd [w,x,y,z], thrust_norm [0-1]) for
-    SET_ATTITUDE_TARGET.
-
-    The DiffAero world frame is ENU/FLU (z up, body x forward, body z along the
-    thrust direction), matching the converter above. acc_norm is |acc_cmd|, the
-    thrust-acceleration magnitude the rotors must produce; thrust is normalized
-    by `max_accel` so that hover (~g) maps to MPC_THR_HOVER = g / max_accel.
-    """
-    R_des_enu = Rotation.from_quat(
-        [quat_xyzw_enu_flu[0], quat_xyzw_enu_flu[1],
-         quat_xyzw_enu_flu[2], quat_xyzw_enu_flu[3]]
-    ).as_matrix()
-    q_des = quat_ENU_FLU_to_NED_FRD(R_des_enu)
-    thrust_norm = float(np.clip(acc_norm / max_accel, 0.0, 1.0))
-
-    if verbose:
-        des_rpy = Rotation.from_matrix(R_des_enu).as_euler("xyz", degrees=True)
-        print(
-            f"  acc_norm        = {acc_norm:.3f} m/s^2\n"
-            f"  R_des_enu RPY   = roll={des_rpy[0]:.1f} pitch={des_rpy[1]:.1f} yaw={des_rpy[2]:.1f}\n"
-            f"  q_des(NED/FRD)  = w={q_des[0]:.3f} x={q_des[1]:.3f} y={q_des[2]:.3f} z={q_des[3]:.3f}\n"
-            f"  thrust_norm     = {thrust_norm:.3f}"
-        )
-    return q_des, thrust_norm
-
 
 # ---------------------------------------------------------------------------
 # State container (updated by MAVLink receive thread)
@@ -160,130 +140,7 @@ class DroneState:
                 self.yaw,
             )
 
-
-# ---------------------------------------------------------------------------
-# Policy wrapper
-# ---------------------------------------------------------------------------
-
-class DiffAeroPolicy:
-    """Loads and runs the exported DiffAero actor (TorchScript) for inference.
-
-    The exported actor forward signature (MLP + perception):
-        ((state[1,9], perception[1,H,W]), orientation[1,3], Rz[1,3,3],
-         min_action[1,3], max_action[1,3])
-        -> (acc_cmd[1,3], quat_xyzw_cmd[1,4], acc_norm[1])
-    where acc_cmd is the world-frame thrust acceleration and quat_xyzw_cmd is the
-    ENU/FLU attitude (xyzw) with yaw aligned to the velocity EMA.
-    """
-
-    def __init__(self, checkpoint_path: str, vel_ema_factor: float = 0.1,
-                 max_acc_xy: float = MAX_ACC_XY, max_acc_z: float = MAX_ACC_Z):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        pt2_path = self._resolve_pt2(checkpoint_path)
-        print(f"Loading DiffAero TorchScript actor from {pt2_path} ...")
-        self.module = torch.jit.load(str(pt2_path), map_location=self.device)
-        self.module.eval()
-
-        self.min_action = torch.tensor(
-            [[-max_acc_xy, -max_acc_xy, 0.0]], dtype=torch.float32, device=self.device)
-        self.max_action = torch.tensor(
-            [[max_acc_xy, max_acc_xy, max_acc_z]], dtype=torch.float32, device=self.device)
-
-        self.vel_ema_factor = float(vel_ema_factor)
-        self.vel_ema = None  # world-frame velocity EMA (drives commanded yaw)
-        self._up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
-
-    @staticmethod
-    def _resolve_pt2(checkpoint_path: str) -> Path:
-        p = Path(checkpoint_path)
-        if p.is_file():
-            return p
-        candidates = [
-            p / "checkpoints" / "exported_actor.pt2",
-            p / "exported_actor.pt2",
-        ]
-        for c in candidates:
-            if c.exists():
-                return c
-        raise FileNotFoundError(
-            f"Could not find exported_actor.pt2 under {checkpoint_path}. "
-            f"Tried: {[str(c) for c in candidates]}")
-
-    def reset(self):
-        self.vel_ema = None
-
-    def normalize_depth(self, range_m: np.ndarray) -> torch.Tensor:
-        """Convert metric Euclidean range (H,W) to the trained perception encoding:
-            depth = 1 - clamp(range, 0, max_dist) / max_dist
-        Far / no-return -> 0; very close -> ~1. Output (1, H, W).
-        """
-        d = torch.as_tensor(range_m, dtype=torch.float32, device=self.device)
-        d = d.clamp(0.0, CAM_MAX_DIST)
-        perception = 1.0 - d / CAM_MAX_DIST
-        return perception.reshape(1, DEPTH_H, DEPTH_W)
-
-    @torch.no_grad()
-    def step(self, position_enu: np.ndarray, velocity_enu: np.ndarray,
-             R_enu: np.ndarray, target_pos_enu: np.ndarray,
-             max_vel: float = 5.0, depth_range: np.ndarray = None):
-        """Run one policy step.
-
-        Returns (acc_cmd_world[3], quat_xyzw_enu_flu[4], acc_norm) where acc_cmd
-        is the world-frame thrust acceleration (debug) and quat/acc_norm form the
-        attitude+thrust setpoint.
-        """
-        R = torch.tensor(R_enu, dtype=torch.float32, device=self.device)  # (3,3)
-        v_world = torch.tensor(velocity_enu, dtype=torch.float32, device=self.device)
-
-        # Yaw-only (local) frame: columns are [fwd, left, up] in world, matching
-        # diffaero axis_rotmat("Z", yaw).
-        fwd = R[:, 0].clone()
-        fwd[2] = 0.0
-        fwd = torch.nn.functional.normalize(fwd, dim=0)
-        left = torch.cross(self._up, fwd, dim=0)
-        Rz = torch.stack([fwd, left, self._up], dim=1)  # (3,3)
-        uz = R[:, 2]  # body up axis in world
-
-        # target_vel_world = (target_pos - p) / max(dist/max_vel, 1)
-        relpos = (torch.tensor(target_pos_enu, dtype=torch.float32, device=self.device)
-                  - torch.tensor(position_enu, dtype=torch.float32, device=self.device))
-        dist = relpos.norm()
-        mv = torch.tensor(float(max_vel), device=self.device)
-        denom = torch.maximum(dist / mv, torch.ones((), device=self.device))
-        target_vel_world = relpos / denom
-
-        target_vel_local = Rz.t() @ target_vel_world
-        v_local = Rz.t() @ v_world
-        state9 = torch.cat([target_vel_local, uz, v_local]).unsqueeze(0)  # (1,9)
-
-        # Velocity EMA -> commanded yaw (matches align_yaw_with_vel_ema).
-        if self.vel_ema is None:
-            self.vel_ema = v_world.clone()
-        else:
-            self.vel_ema = torch.lerp(self.vel_ema, v_world, self.vel_ema_factor)
-        orientation = self.vel_ema.unsqueeze(0)
-        if orientation.norm() < 1e-3:
-            # Yaw undefined when near-stationary; fall back to current heading.
-            orientation = fwd.unsqueeze(0)
-
-        if depth_range is not None:
-            perception = self.normalize_depth(depth_range)
-        else:
-            perception = torch.zeros(1, DEPTH_H, DEPTH_W, device=self.device)
-
-        acc_cmd, quat_cmd, acc_norm = self.module(
-            (state9, perception), orientation, Rz.unsqueeze(0),
-            self.min_action, self.max_action)
-
-        return (acc_cmd.squeeze(0).cpu().numpy(),
-                quat_cmd.squeeze(0).cpu().numpy(),
-                float(acc_norm.reshape(-1)[0].cpu()))
-
-
-# ---------------------------------------------------------------------------
-# MAVLink helpers
-# ---------------------------------------------------------------------------
-
+## MAVLINK helpers
 def wait_for_heartbeat(mav, timeout=30):
     print("Waiting for heartbeat...")
     mav.wait_heartbeat(timeout=timeout)
@@ -432,7 +289,12 @@ def main():
     recv_thread = threading.Thread(target=receive_loop, args=(mav, state, stop_event), daemon=True)
     recv_thread.start()
 
-    policy = DiffAeroPolicy(args.checkpoint)
+    policy = DiffAeroPolicy(
+        intrinsics=DA_INTRINSICS, 
+        checkpoint_path=args.checkpoint,
+        max_vel=args.max_vel,
+        max_accel=args.max_accel,
+    )
 
     # Thrust normalization: hover (~g) -> MPC_THR_HOVER = g / max_accel.
     hover_thrust = float(np.clip(G / args.max_accel, 0.0, 1.0))
@@ -510,12 +372,17 @@ def main():
                         print(f"[CLIMB t={elapsed:.2f}s] alt={alt:.2f}/{args.climb_alt:.1f} "
                               f"speed={speed:.2f}  offboard={state.offboard} armed={state.armed}")
                 elif phase == "POLICY":
-                    acc_cmd, quat_cmd, acc_norm = policy.step(
-                        pos, vel, R_enu, goal_enu,
-                        max_vel=args.max_vel, depth_range=depth_range)
-                    q_des, thrust_norm = diffaero_quat_to_attitude_target(
-                        quat_cmd, acc_norm, args.max_accel, verbose=verbose)
-                    send_attitude_target(mav, q_des, thrust_norm)
+                    pos, vel, R_enu, yaw = state.get()
+                    obs = DiffAeroObs(
+                        position_enu=pos,
+                        velocity_enu=vel,
+                        R_enu=R_enu,
+                        goal_enu=goal_enu,
+                        depth_planar=depth_range,
+                        
+                    )
+                    cmd = policy.compute(obs)
+                    send_attitude_target(mav, cmd.attitude_ned_frd_wxyz, cmd.thrust_norm)
                     if np.linalg.norm(goal_enu - pos) < 3.0:
                         phase = "LANDING"
                         print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
@@ -525,7 +392,7 @@ def main():
                             f"  pos(ENU)        = {pos.round(2)}\n"
                             f"  vel(ENU)        = {vel.round(2)}\n"
                             f"  goal(ENU)       = {np.round(goal_enu, 2)}\n"
-                            f"  acc_cmd(ENU)    = {np.round(acc_cmd, 2)}  |acc|={acc_norm:.2f}\n"
+                            f"  acc_cmd(ENU)    = {np.round(cmd.acc_cmd_enu, 2)}  |acc|={cmd.acc_norm:.2f}\n"
                             f"  cur_att RPY(ENU)= roll={cur_rpy[0]:.1f} pitch={cur_rpy[1]:.1f} yaw={cur_rpy[2]:.1f}\n"
                             f"  armed={state.armed}  offboard={state.offboard}\n"
                             "---"

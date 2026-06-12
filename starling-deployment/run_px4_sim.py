@@ -173,15 +173,7 @@ class PegasusApp:
             [0.0, self._camera.fy, self._camera.cy],
             [0.0, 0.0, 1.0]])
 
-        # Precompute the per-pixel planar->Euclidean scale map for the render grid:
-        #   euclid = planar * sqrt(1 + ((u-cx)/fx)^2 + ((v-cy)/fy)^2)
-        u = np.arange(DA_RENDER_W, dtype=np.float32)
-        v = np.arange(DA_RENDER_H, dtype=np.float32)
-        uu, vv = np.meshgrid(u, v)  # (H, W)
-        xn = (uu - self._camera.cx) / self._camera.fx
-        yn = (vv - self._camera.cy) / self._camera.fy
-        self._da_euclid_scale = np.sqrt(1.0 + xn * xn + yn * yn).astype(np.float32)
-
+    
     def _spawn_obstacles(self, fld):
         """Spawn the analytic obstacle field as static Isaac prims (ENU, z up)."""
         # Spheres
@@ -290,23 +282,9 @@ class PegasusApp:
         depth = np.asarray(depth, dtype=np.float32)
         if depth.size == 0:
             return
-        # No-return / non-finite -> large range so it becomes "empty" after clamp.
-        far = 1e3
-        depth = np.nan_to_num(depth, nan=far, posinf=far, neginf=far)
-        if depth.shape != (DA_RENDER_H, DA_RENDER_W):
-            yi = (np.linspace(0, depth.shape[0] - 1, DA_RENDER_H)).astype(np.int64)
-            xi = (np.linspace(0, depth.shape[1] - 1, DA_RENDER_W)).astype(np.int64)
-            depth = depth[yi][:, xi]
-
-        # Planar Z-depth -> Euclidean range.
-        euclid = depth * self._da_euclid_scale
-
-        # Min-pool DA_POOL x DA_POOL -> (DA_OUT_H, DA_OUT_W): keep nearest surface.
-        euclid = euclid.reshape(DA_OUT_H, DA_POOL, DA_OUT_W, DA_POOL).min(axis=(1, 3))
-        euclid = np.ascontiguousarray(euclid, dtype=np.float32)
-
-        self._depth_pub.send(euclid)
-        self._dump_depth_debug(euclid)
+        depth = np.nan_to_num(depth, nan=DA_MAX_DIST, posinf=DA_MAX_DIST, neginf=DA_MAX_DIST)
+        self._depth_pub.send(depth)
+        self._dump_depth_debug(depth)
 
     def _dump_depth_debug(self, depth):
         """Save the EXACT published depth array + the drone's RGB view to
