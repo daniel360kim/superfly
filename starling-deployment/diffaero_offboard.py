@@ -337,6 +337,17 @@ def send_position_target_ned(mav, x_n: float, y_e: float, z_d: float, yaw: float
     )
 
 
+def send_land_command(mav):
+    """Command PX4 to land at current XY position via MAV_CMD_NAV_LAND."""
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,
+        0, 0, 0, float("nan"),  # abort_alt, precision_mode, empty, yaw (nan=keep)
+        0.0, 0.0, 0.0,           # lat, lon, alt (0 = current position)
+    )
+
+
 def send_heartbeat(mav):
     mav.mav.heartbeat_send(
         mavutil.mavlink.MAV_TYPE_GCS,
@@ -460,6 +471,7 @@ def main():
     step_count = 0
 
     phase = "CLIMB"
+    landing_sent = False
     print(f"CLIMB: position-holding to {args.climb_alt:.1f} m ...")
 
     try:
@@ -497,13 +509,16 @@ def main():
                     if verbose:
                         print(f"[CLIMB t={elapsed:.2f}s] alt={alt:.2f}/{args.climb_alt:.1f} "
                               f"speed={speed:.2f}  offboard={state.offboard} armed={state.armed}")
-                else:  # POLICY
+                elif phase == "POLICY":
                     acc_cmd, quat_cmd, acc_norm = policy.step(
                         pos, vel, R_enu, goal_enu,
                         max_vel=args.max_vel, depth_range=depth_range)
                     q_des, thrust_norm = diffaero_quat_to_attitude_target(
                         quat_cmd, acc_norm, args.max_accel, verbose=verbose)
                     send_attitude_target(mav, q_des, thrust_norm)
+                    if np.linalg.norm(goal_enu - pos) < 3.0:
+                        phase = "LANDING"
+                        print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
                     if verbose:
                         print(
                             f"[POLICY t={elapsed:.2f}s step={step_count}]\n"
@@ -515,6 +530,15 @@ def main():
                             f"  armed={state.armed}  offboard={state.offboard}\n"
                             "---"
                         )
+                elif phase == "LANDING":
+                    if not landing_sent:
+                        send_land_command(mav)
+                        landing_sent = True
+                    if not state.armed:
+                        print("\n>>> Landed and disarmed. Exiting.")
+                        break
+                    if verbose:
+                        print(f"[LANDING t={elapsed:.2f}s] alt={pos[2]:.2f} m  armed={state.armed}")
 
                 step_count += 1
                 next_step += control_dt
