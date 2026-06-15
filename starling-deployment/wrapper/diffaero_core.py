@@ -4,7 +4,7 @@ from scipy.spatial.transform import Rotation
 from pathlib import Path
 import torch
 
-from wrapper.perception_builder import PerceptionBuilder, Intrinsics
+from wrapper.perception_builder import PerceptionBuilder, Intrinsics, PerceptionGrid
 
 @dataclass
 class DiffAeroObs:
@@ -17,11 +17,10 @@ class DiffAeroObs:
 @dataclass
 class DiffAeroCmd:
     attitude_ned_frd_wxyz: np.ndarray  # PX4-ready
-    attitude_enu_flu_xyzw: np.ndarray  # debug / sim
-    thrust_norm: float                 # [0,1], anchored to hover_thrust
-    acc_cmd_enu: np.ndarray            # debug
+    attitude_enu_flu_xyzw: np.ndarray  # debug
+    thrust_norm: float # [0,1], anchored to hover_thrust
+    acc_cmd_enu: np.ndarray # debug
     acc_norm: float
-   
 
 class DiffAeroPolicy:
     # Fixed frame-conversion rotations (constructed once at class definition).
@@ -29,21 +28,31 @@ class DiffAeroPolicy:
     _rot_ENU_to_NED = Rotation.from_quat([0.70711, 0.70711, 0.0, 0.0])
     # FLU body → FRD body (+π around X).
     _rot_FLU_to_FRD = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])
-
+    
     def __init__(
         self,
         intrinsics: Intrinsics,
         checkpoint_path: str,
+        grid: PerceptionGrid = PerceptionGrid(),
         vel_ema_factor: float = 0.1,
         max_acc_xy: float = 20.0,
         max_acc_z: float = 40.0,
-        max_vel: float = 5.0,
         max_accel: float = 30.0,
-        cam_max_dist: float = 5.0,
-        depth_h: int = 9,
-        depth_w: int = 16,
-        
+        max_vel: float = 5.0,
     ):
+        """
+        Initialize the class
+        
+        Args:
+            intrinsics: intrinsics of the camera of the simulator
+            grid: camera settings used during training (static across diff sims)
+            vel_ema_factor: velocity exp. moving average factor
+            max_acc_xy: maximum acceleration in m/s/s in xy direction of policy output
+            max_acc_z: maximum acceleration in m/s/s in z direction of policy output
+            max_accel: maximum acceleration of full throttle on the specific vehicle
+            max_vel: maximum velocity of the vehicle in m/s
+        """
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         pt2_path = self._resolve_pt2(checkpoint_path)
@@ -60,11 +69,10 @@ class DiffAeroPolicy:
 
         self.vel_ema_factor = vel_ema_factor
         self.vel_ema: torch.Tensor | None = None
-        self.max_vel = max_vel
+        self.max_vel_t = torch.tensor(max_vel, dtype=torch.float32, device=self.device)
         self.max_accel = max_accel
 
-        self.cam_max_dist = cam_max_dist
-        self.perception_builder = PerceptionBuilder(intrinsics, out_h=depth_h, out_w=depth_w, target_fov_deg=86.0, max_dist=cam_max_dist)
+        self.perception_builder = PerceptionBuilder(intrinsics, grid=grid)
         self._up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
 
     def reset(self) -> None:
@@ -91,7 +99,7 @@ class DiffAeroPolicy:
         v_local = Rz.t() @ v_world                     # (3,)
         state9 = torch.cat([target_vel_local, uz, v_local]).unsqueeze(0)  # (1, 9)
 
-        # Update velocity EMA; used by the actor to derive commanded yaw.
+        # Update velocity EMA: used by the actor to derive commanded yaw.
         if self.vel_ema is None:
             self.vel_ema = v_world.clone()
         else:
@@ -111,6 +119,7 @@ class DiffAeroPolicy:
                 dtype=torch.float32, device=self.device,
             )
 
+        # Get policy outputs
         acc_cmd, quat_cmd, acc_norm = self.module(
             (state9, perception_t),
             orientation,
@@ -118,10 +127,12 @@ class DiffAeroPolicy:
             self.min_action,
             self.max_action,
         )
-
+        
+        acc_norm = float(acc_norm.reshape(-1)[0].cpu())
+        # Convert to PX4 commands (frame conversion to NED/FRD)
         q_des, thrust_norm = self._to_attitude_setpoint(
             quat_cmd.squeeze(0).cpu().numpy(),
-            float(acc_norm.reshape(-1)[0].cpu()),
+            acc_norm,
         )
         
         return DiffAeroCmd(
@@ -129,12 +140,9 @@ class DiffAeroPolicy:
             attitude_enu_flu_xyzw=quat_cmd.squeeze(0).cpu().numpy(),
             thrust_norm=thrust_norm,
             acc_cmd_enu=acc_cmd.squeeze(0).cpu().numpy(),
-            acc_norm=float(acc_norm.reshape(-1)[0].cpu()),
+            acc_norm=acc_norm,
         )
             
-        
-
-
     def _build_yaw_frame(self, R: torch.Tensor) -> torch.Tensor:
         """Build the yaw-only rotation matrix Rz from the full attitude R.
 
@@ -178,8 +186,7 @@ class DiffAeroPolicy:
             - torch.tensor(position, dtype=torch.float32, device=self.device)
         )
         dist = rel.norm()
-        mv = torch.tensor(float(self.max_vel), device=self.device)
-        denom = torch.maximum(dist / mv, torch.ones((), device=self.device))
+        denom = torch.maximum(dist / self.max_vel_t, torch.ones((), device=self.device))
         return rel / denom
 
     def _to_attitude_setpoint(
@@ -187,23 +194,13 @@ class DiffAeroPolicy:
     ) -> tuple[np.ndarray, float]:
         """Convert DiffAero actor output to PX4 attitude + thrust.
 
-        Performs two conversions:
-        1. **Frame**: ENU/FLU quaternion (xyzw, scipy convention) →
-           NED/FRD quaternion (wxyz, MAVLink convention) via the fixed
-           ENU→NED and FLU→FRD rotations.
-        2. **Thrust**: ``acc_norm`` [m/s²] → normalized throttle [0, 1]
-           by dividing by ``max_accel``, so hover (≈ g) maps to
-           ``MPC_THR_HOVER = g / max_accel``.
-
+        Performs two conversions: ENU/FLU to NED/FRD and finds normalized throttle
         Args:
-            quat_xyzw_enu_flu: Desired attitude quaternion in ENU/FLU,
-                               xyzw order (scipy convention), shape (4,).
+            quat_xyzw_enu_flu: Desired attitude quaternion in ENU/FLU
             acc_norm:          Thrust-acceleration magnitude [m/s²] the
-                               rotors must produce (gravity not included;
-                               point-mass model handles gravity separately).
-
+                               rotors must produce (gravity not included).
         Returns:
-            q_des:       Desired quaternion in NED/FRD, wxyz order, shape (4,).
+            q_des: Desired quaternion in NED/FRD, wxyz order.
             thrust_norm: Normalized thrust in [0, 1].
         """
         R_des_enu = Rotation.from_quat(quat_xyzw_enu_flu).as_matrix()
@@ -214,16 +211,11 @@ class DiffAeroPolicy:
     @staticmethod
     def _quat_ENU_FLU_to_NED_FRD(R_enu_flu: np.ndarray) -> np.ndarray:
         """Convert an ENU/FLU rotation matrix to a NED/FRD quaternion.
-
-        Applies the fixed frame change:
-        ``R_ned_frd = R_ENU_to_NED @ R_enu_flu @ R_FLU_to_FRD``
-        and returns the result in MAVLink wxyz order.
-
         Args:
-            R_enu_flu: Rotation matrix in ENU/FLU convention, shape (3, 3).
+            R_enu_flu: Rotation matrix in ENU/FLU convention.
 
         Returns:
-            Quaternion [w, x, y, z] in NED/FRD convention, shape (4,).
+            Quaternion [w, x, y, z] in NED/FRD convention.
         """
         rot = (
             DiffAeroPolicy._rot_ENU_to_NED

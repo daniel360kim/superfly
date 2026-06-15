@@ -1,16 +1,25 @@
 from dataclasses import dataclass
 import numpy as np
 
+
 @dataclass
 class Intrinsics:
+    """Intrinsices of the sim/real camera (resolution that produces raw depth image)"""
     fx: float
     fy: float
     cx: float
     cy: float
-    H: int
-    W: int
+    H: int # native render height
+    W: int # native render width
 
-
+@dataclass
+class PerceptionGrid:
+    """DiffAero's fixed grid set by the camera (static across different sims)"""
+    H: int = 9
+    W: int = 16
+    max_dist: float = 5.0
+    fov_deg: float = 86.0
+    
 class PerceptionBuilder:
     """
     Converts a native-resolution planar depth image into the 9x16 encoded
@@ -24,33 +33,28 @@ class PerceptionBuilder:
     def __init__(
         self,
         intrinsics: Intrinsics,
-        out_h: int = 9,
-        out_w: int = 16,
-        target_fov_deg: float = 86.0,
-        max_dist: float = 5.0,
+        grid: PerceptionGrid = PerceptionGrid(),
         flip_lr: bool = False,
         flip_ud: bool = False,
     ):
-        self.out_h = out_h
-        self.out_w = out_w
-        self.max_dist = max_dist
+        self.grid = grid
         self.flip_lr = flip_lr
         self.flip_ud = flip_ud
 
-        self._crop = _compute_crop(intrinsics, target_fov_deg) # Used later to crop to DiffAero's training FOV
+        self._crop = _compute_crop(intrinsics, self.grid.fov_deg) # Used later to crop to DiffAero's training FOV
         self._euclid_scale = _compute_euclid_scale(intrinsics, self._crop) # Used later to convert planar depth to Euclidean distance
         # Used later to compute the min-pool edges (resizing to 9x16 DiffAero perception grid)
         self._row_edges, self._col_edges = _compute_pool_edges(
-            crop=self._crop, out_h=out_h, out_w=out_w
+            crop=self._crop, out_h=self.grid.H, out_w=self.grid.W
         )
 
     def __call__(self, planar_native: np.ndarray) -> np.ndarray:
-        planar = _clean(planar_native, self.max_dist) # Replace NaN, inf, and zero-or-negative pixels with max_dist (= no obstacle)
+        planar = _clean(planar_native, self.grid.max_dist) # Replace NaN, inf, and zero-or-negative pixels with max_dist (= no obstacle)
         planar = _apply_crop(planar, self._crop) # Slice the native image to the training FOV region
         euclid = _planar_to_euclidean(planar, self._euclid_scale) # Element-wise: true_range = planar_Z * ray_scale
-        pooled = _min_pool(euclid, self._row_edges, self._col_edges, self.out_h, self.out_w) # Reduce (crop_H, crop_W) -> (out_h, out_w) by taking the minimum range in each angular bin. Min = nearest obstacle surface per cell.
+        pooled = _min_pool(euclid, self._row_edges, self._col_edges, self.grid.H, self.grid.W) # Reduce (crop_H, crop_W) -> (out_h, out_w) by taking the minimum range in each angular bin. Min = nearest obstacle surface per cell.
         pooled = _maybe_flip(pooled, self.flip_lr, self.flip_ud) # Flip the pooled image left-right and up-down if desired (for different simulation conventions)
-        return _encode(pooled, self.max_dist) # 1 = surface at lens, 0 = nothing within max_dist
+        return _encode(pooled, self.grid.max_dist) # 1 = surface at lens, 0 = nothing within max_dist
 
 def _compute_crop(intr: Intrinsics, fov_deg: float) -> tuple[int, int, int, int]:
     """
