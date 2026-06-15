@@ -8,6 +8,26 @@ The 48x64 metric (planar Z) depth is published over UDP each control tick for
 the offboard policy process to consume (see depth_transport.py).
 
 Run this AFTER PX4 SITL is up; then run diffdrone_offboard.py --depth.
+
+Procedural obstacle field (default):
+    python run_px4_sim.py --seed 0 --obstacles diffphys
+
+Warehouse background, no procedural obstacles (scene geometry only):
+    python run_px4_sim.py --environment Warehouse --obstacles none --spawn 0 0 1.0 --policy diffaero
+    python diffaero_offboard.py --checkpoint <dir> --depth --goal 15 0 --climb-alt 2.0
+
+    python run_px4_sim.py --environment Warehouse --obstacles none --spawn 0 0 1.0 --policy diffphys
+    python diffdrone_offboard.py --checkpoint <pt> --depth --goal 15 0 2.0 --climb-alt 2.0
+
+Warehouse with Shelves (more rack rows; small ~40 m building, aisles along -X):
+    # Spawn in the main aisle (~Y=1 m); fly toward the open end at X≈-3 m.
+    python run_px4_sim.py --environment "Warehouse with Shelves" --obstacles none \
+        --spawn -12 1 0.1 --policy diffaero
+    python diffaero_offboard.py --checkpoint <dir> --depth --goal -3 1 --climb-alt 1.5 --max-vel 3.0
+
+    python run_px4_sim.py --environment "Warehouse with Shelves" --obstacles none \
+        --spawn -12 1 0.1 --policy diffphys
+    python diffdrone_offboard.py --checkpoint <pt> --depth --goal -3 1 1.5 --climb-alt 1.5 --max-speed 3.0
 """
 
 import argparse
@@ -62,7 +82,8 @@ class PegasusApp:
     SPAWN_YAW_DEG = 0.0  # EKF heading is mag-locked (~+Y); we rotate the field instead
 
     def __init__(self, seed: int = 0, scale: float = 5.0, spawn_yaw_deg: float = 0.0,
-                 policy: str = "diffphys", obstacles: str = "diffphys"):
+                 policy: str = "diffphys", obstacles: str = "diffphys",
+                 environment: str = "Box Room", spawn_xyz: tuple = (0.0, 0.0, 1.0)):
         self.SPAWN_YAW_DEG = spawn_yaw_deg
         self.policy = policy
         self.timeline = omni.timeline.get_timeline_interface()
@@ -70,19 +91,25 @@ class PegasusApp:
         self.pg._world = World(**self.pg._world_settings)
         self.world = self.pg.world
 
-        self.pg.load_environment(SIMULATION_ENVIRONMENTS["Box Room"])
+        self.pg.load_environment(SIMULATION_ENVIRONMENTS[environment])
 
         # Spawn the obstacle field (analytic primitives). The DiffPhysDrone-
         # distribution field is the default; --obstacles diffaero regenerates the
         # field to match DiffAero's training distribution (around the start->goal
-        # line). Either way both policies can fly whichever course is selected.
-        if obstacles == "diffaero":
+        # line). --obstacles none skips procedural obstacles (use scene geometry only).
+        if obstacles == "none":
+            spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]), float(spawn_xyz[2])]
+        elif obstacles == "diffaero":
             from obstacle_field import generate_diffaero
             self.field = generate_diffaero(seed=seed, scale=scale)
+            print("[obstacle_field]", self.field.summary())
+            self._spawn_obstacles(self.field)
+            spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
         else:
             self.field = generate_field(seed=seed, scale=scale)
-        print("[obstacle_field]", self.field.summary())
-        self._spawn_obstacles(self.field)
+            print("[obstacle_field]", self.field.summary())
+            self._spawn_obstacles(self.field)
+            spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
 
         config_multirotor = MultirotorConfig()
         mavlink_config = PX4MavlinkBackendConfig({
@@ -97,17 +124,16 @@ class PegasusApp:
             self._setup_camera_diffphys()
         config_multirotor.graphical_sensors = [self._camera]
 
-        # Spawn the drone on the ground at the field's start XY (it climbs from here).
+        # Spawn the drone at the field start (procedural mode) or --spawn (scene-only).
         # SPAWN_YAW_DEG cancels the sim's EKF heading offset: with spawn yaw 0 the
         # mag-driven EKF reported ENU yaw=90° (facing +Y), but the obstacle corridor
         # runs +X. Spawn rotated by -90° so the reconstructed heading reads ~0 (faces
         # +X, down the corridor). Flip sign if the log still shows yaw≈±90.
-        spawn_xy = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
         Multirotor(
             "/World/quadrotor",
             ROBOTS['Iris'],
             0,
-            spawn_xy,
+            spawn_pos,
             Rotation.from_euler("XYZ", [0.0, 0.0, self.SPAWN_YAW_DEG], degrees=True).as_quat(),
             config=config_multirotor,
         )
@@ -342,10 +368,16 @@ class PegasusApp:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--environment", type=str, default="Box Room",
+                        help="Pegasus/Isaac Sim background scene (key in SIMULATION_ENVIRONMENTS). "
+                             "Examples: 'Box Room', 'Warehouse', 'Hospital'.")
     parser.add_argument("--seed", type=int, default=0,
                         help="Obstacle-field RNG seed (eval suite: 0, 1, 2)")
     parser.add_argument("--scale", type=float, default=5.0,
                         help="World scale (corridor depth ~= 8*scale m)")
+    parser.add_argument("--spawn", type=float, nargs=3, default=(0.0, 0.0, 1.0),
+                        metavar=("X", "Y", "Z"),
+                        help="Drone spawn position (ENU metres) when --obstacles none.")
     parser.add_argument("--spawn-yaw", type=float, default=0.0,
                         help="Spawn yaw [deg]. EKF heading is mag-locked in sim, so this "
                              "mainly affects the initial facing; the field is rotated instead.")
@@ -353,13 +385,25 @@ def main():
                         help="Which policy's camera/depth pipeline to configure: "
                              "diffphys (12x16, 78.6 deg, 24 m, planar, pitched 20 deg down) "
                              "or diffaero (9x16, 86 deg, 5 m, Euclidean, forward).")
-    parser.add_argument("--obstacles", choices=["diffphys", "diffaero"], default="diffphys",
-                        help="Obstacle-field distribution: diffphys (existing field) or "
-                             "diffaero (DiffAero training distribution around start->goal).")
+    parser.add_argument("--obstacles", choices=["diffphys", "diffaero", "none"], default="diffphys",
+                        help="Obstacle-field distribution: diffphys, diffaero, or none "
+                             "(scene geometry only, no procedural primitives).")
     # parse_known_args so Isaac Sim's own argv flags don't trip argparse
     args, _ = parser.parse_known_args()
-    pg_app = PegasusApp(seed=args.seed, scale=args.scale, spawn_yaw_deg=args.spawn_yaw,
-                        policy=args.policy, obstacles=args.obstacles)
+
+    if args.environment not in SIMULATION_ENVIRONMENTS:
+        available = ", ".join(sorted(SIMULATION_ENVIRONMENTS))
+        parser.error(f"unknown environment {args.environment!r}; available: {available}")
+
+    pg_app = PegasusApp(
+        seed=args.seed,
+        scale=args.scale,
+        spawn_yaw_deg=args.spawn_yaw,
+        policy=args.policy,
+        obstacles=args.obstacles,
+        environment=args.environment,
+        spawn_xyz=tuple(args.spawn),
+    )
     pg_app.run()
 
 

@@ -383,7 +383,7 @@ def main():
                     )
                     cmd = policy.compute(obs)
                     send_attitude_target(mav, cmd.attitude_ned_frd_wxyz, cmd.thrust_norm)
-                    if np.linalg.norm(goal_enu - pos) < 3.0:
+                    if np.linalg.norm(goal_enu - pos) < 0.5:
                         phase = "LANDING"
                         print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
                     if verbose:

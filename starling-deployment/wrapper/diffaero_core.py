@@ -39,6 +39,8 @@ class DiffAeroPolicy:
         max_acc_z: float = 40.0,
         max_accel: float = 30.0,
         max_vel: float = 5.0,
+        flip_lr: bool = False,
+        flip_ud: bool = False,
     ):
         """
         Initialize the class
@@ -51,6 +53,8 @@ class DiffAeroPolicy:
             max_acc_z: maximum acceleration in m/s/s in z direction of policy output
             max_accel: maximum acceleration of full throttle on the specific vehicle
             max_vel: maximum velocity of the vehicle in m/s
+            flip_lr: flip the left/right of the perception (needed to map to SAFE)
+            flip_ud: flip the up/down of the perception (needed to map to SAFE)
         """
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -72,7 +76,7 @@ class DiffAeroPolicy:
         self.max_vel_t = torch.tensor(max_vel, dtype=torch.float32, device=self.device)
         self.max_accel = max_accel
 
-        self.perception_builder = PerceptionBuilder(intrinsics, grid=grid)
+        self.perception_builder = PerceptionBuilder(intrinsics, grid=grid, flip_lr=flip_lr, flip_ud=flip_ud)
         self._up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
 
     def reset(self) -> None:
