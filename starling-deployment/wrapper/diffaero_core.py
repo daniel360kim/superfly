@@ -37,7 +37,7 @@ class DiffAeroPolicy:
         vel_ema_factor: float = 0.1,
         max_acc_xy: float = 20.0,
         max_acc_z: float = 40.0,
-        max_accel: float = 30.0,
+        max_accel: float = 20.0,
         max_vel: float = 5.0,
         flip_lr: bool = False,
         flip_ud: bool = False,
@@ -119,7 +119,7 @@ class DiffAeroPolicy:
             perception_t = torch.tensor(perception, dtype=torch.float32, device=self.device).unsqueeze(0)
         else:
             perception_t = torch.zeros(
-                1, self.perception_builder.out_h, self.perception_builder.out_w,
+                1, self.perception_builder.grid.H, self.perception_builder.grid.W,
                 dtype=torch.float32, device=self.device,
             )
 

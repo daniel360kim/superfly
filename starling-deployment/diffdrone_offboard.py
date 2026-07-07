@@ -42,6 +42,27 @@ MASS_KG = 1.5
 MAX_ACCEL = 20.0  # m/s², used to normalize thrust to [0, 1]
 G = np.array([0.0, 0.0, -9.80665])
 
+# Sentinel file this script touches on exit (any reason) so run_px4_sim.py
+# --auto-stop can detect "the offboard process ended" and exit its own loop
+# normally, instead of relying on a manual Ctrl-C.
+OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
+
+# Phase sentinel for compare/run_comparison.py: "start <ts>" is written the
+# moment control hands off to the POLICY phase, so the harness's --timeout can
+# budget the policy flight only (not arming/climb). Harness deletes it before
+# each trial.
+POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+
+
+def _mark_policy_phase(event: str):
+    """Append '<event> <ts>' to POLICY_PHASE_FILE; never let it kill the loop."""
+    try:
+        with open(POLICY_PHASE_FILE, "a") as f:
+            f.write(f"{event} {time.time()}\n")
+    except Exception:
+        pass
+
+
 # PX4 custom mode for OFFBOARD
 PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
 
@@ -309,7 +330,7 @@ class DiffDronePolicy:
 # MAVLink helpers
 # ---------------------------------------------------------------------------
 
-def wait_for_heartbeat(mav, timeout=30):
+def wait_for_heartbeat(mav, timeout=120):
     print("Waiting for heartbeat...")
     mav.wait_heartbeat(timeout=timeout)
     print(f"Heartbeat received from system {mav.target_system} component {mav.target_component}")
@@ -335,6 +356,28 @@ def arm(mav):
         0,
         1, 0, 0, 0, 0, 0, 0,
     )
+
+
+def retry_offboard_arm(mav, state, last_try_t, interval=2.0):
+    """Re-request OFFBOARD mode + arming until PX4 accepts both.
+
+    The one-shot mode/arm commands at startup are silently rejected if the EKF
+    hasn't converged yet (PX4 denies the command and only prints 'Ready for
+    takeoff!' seconds later) -- observed on big USD stages, where Isaac loads
+    long past the harness warmup and PX4's EKF settles well after the first
+    heartbeat, leaving the offboard streaming CLIMB setpoints disarmed forever.
+    Call every control tick during CLIMB: while not armed+offboard, the
+    commands are re-sent every `interval` seconds. Returns updated last_try_t."""
+    now = time.time()
+    if (state.armed and state.offboard) or now - last_try_t < interval:
+        return last_try_t
+    if not state.offboard:
+        set_offboard_mode(mav)
+    if not state.armed:
+        arm(mav)
+    print(f"[CLIMB] re-requesting OFFBOARD/arm "
+          f"(offboard={state.offboard} armed={state.armed}) ...")
+    return now
 
 
 def send_attitude_target(mav, q_wxyz: np.ndarray, thrust: float):
@@ -440,6 +483,8 @@ def main():
                         help="Altitude tolerance [m] to consider target reached")
     parser.add_argument("--settle-speed", type=float, default=0.2,
                         help="Speed [m/s] below which the drone is considered settled")
+    parser.add_argument("--yaw-tol-deg", type=float, default=5.0,
+                        help="Yaw tolerance [deg] to consider the goal-facing turn complete")
     parser.add_argument("--margin", type=float, default=0.2,
                         help="Drone collision radius [m] fed to the policy. Trained range "
                              "~[0.1, 0.3]; larger = more cautious avoidance. Values far "
@@ -492,13 +537,24 @@ def main():
     hold_x_n = pos0[1]
     hold_y_e = pos0[0]
     hold_z_d = -args.climb_alt
-    # NED yaw is measured CW from North; PX4 holds heading, exact value is not
-    # critical for a vertical climb. 0 = facing North.
-    yaw_ned = 0.0
+    # NED yaw is measured CW from North. Rotating while still on the ground can
+    # dig a skid/leg in and trip a sim collision, so we hold the current heading
+    # through the ground/climb phases and only turn to face the goal once at
+    # climb_alt, before handing off to the policy.
+    # `yaw0` (from state) is ENU math-convention (atan2(North, East));
+    # convert to the NED compass heading used by send_position_target_ned:
+    # ned = pi/2 - enu.
+    yaw_ground = math.atan2(math.sin(math.pi / 2 - yaw0), math.cos(math.pi / 2 - yaw0))
+    if goal_enu is not None:
+        d_north = goal_enu[1] - hold_x_n
+        d_east = goal_enu[0] - hold_y_e
+        yaw_goal = math.atan2(d_east, d_north)
+    else:
+        yaw_goal = yaw_ground
 
     print("Pre-arming: streaming position setpoints to satisfy PX4 OFFBOARD pre-condition...")
     for _ in range(30):
-        send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_ned)
+        send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_ground)
         send_heartbeat(mav)
         time.sleep(0.05)
 
@@ -517,6 +573,7 @@ def main():
     last_heartbeat = time.time()
     start_time = time.time()
     next_step = time.time()
+    last_arm_try = time.time()
     step_count = 0
 
     # State machine: "CLIMB" -> position control to altitude; "POLICY" -> attitude
@@ -551,8 +608,13 @@ def main():
                     cur_target = target_vel
 
                 if phase == "CLIMB":
-                    # Stream position setpoint (straight up to climb_alt).
-                    send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_ned)
+                    # Stream position setpoint (straight up to climb_alt), holding
+                    # the heading the drone had on the ground.
+                    send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_ground)
+                    # Re-request OFFBOARD/arm until PX4 accepts: on big USD stages
+                    # Isaac loads past the warmup and the EKF settles after the
+                    # one-shot arm, which PX4 silently rejects (drone sits disarmed).
+                    last_arm_try = retry_offboard_arm(mav, state, last_arm_try)
                     # Run policy but DISCARD output — warms the hidden state.
                     policy.step(pos, vel, R_enu, cur_target, margin=args.margin,
                                 max_speed=args.max_speed, depth_m=depth_m)
@@ -562,12 +624,31 @@ def main():
                     arrived = abs(alt - args.climb_alt) < args.arrive_tol
                     settled = speed < args.settle_speed
                     if arrived and settled and state.offboard:
-                        phase = "POLICY"
-                        print(f"\n>>> HANDOFF to policy at alt={alt:.2f} m, "
-                              f"speed={speed:.2f} m/s <<<\n")
+                        phase = "YAW"
+                        print(f"\n>>> Climbed to alt={alt:.2f} m, speed={speed:.2f} m/s -- "
+                              f"turning to face goal <<<\n")
                     if verbose:
                         print(f"[CLIMB t={elapsed:.2f}s] alt={alt:.2f}/{args.climb_alt:.1f} "
                               f"speed={speed:.2f}  offboard={state.offboard} armed={state.armed}")
+
+                elif phase == "YAW":
+                    send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_goal)
+                    # Keep warming the hidden state while turning in place.
+                    policy.step(pos, vel, R_enu, cur_target, margin=args.margin,
+                                max_speed=args.max_speed, depth_m=depth_m)
+
+                    # `yaw` (from state) is ENU math-convention; yaw_goal is a NED
+                    # compass heading = pi/2 - yaw_enu. Convert before diffing.
+                    yaw_cur_ned = math.atan2(math.sin(math.pi / 2 - yaw), math.cos(math.pi / 2 - yaw))
+                    yaw_err = math.atan2(math.sin(yaw_goal - yaw_cur_ned), math.cos(yaw_goal - yaw_cur_ned))
+                    if abs(math.degrees(yaw_err)) < args.yaw_tol_deg and state.offboard:
+                        phase = "POLICY"
+                        _mark_policy_phase("start")
+                        print(f"\n>>> HANDOFF to policy facing goal, "
+                              f"yaw={math.degrees(yaw_cur_ned):.1f} deg <<<\n")
+                    if verbose:
+                        print(f"[YAW t={elapsed:.2f}s] yaw={math.degrees(yaw_cur_ned):.1f} "
+                              f"target={math.degrees(yaw_goal):.1f} err={math.degrees(yaw_err):.1f}")
 
                 else:  # POLICY
                     act_world = policy.step(pos, vel, R_enu, cur_target, margin=args.margin,
@@ -603,6 +684,14 @@ def main():
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 0, 0, 0, 0, 0, 0, 0,
         )
+        # Tell run_px4_sim.py (if running with --auto-stop) that this offboard
+        # process is done -- however it ended (landed, Ctrl-C, crash) -- so it
+        # can exit through its normal loop instead of needing a manual Ctrl-C
+        # (which races Isaac's own SIGINT teardown; see run_px4_sim.py).
+        try:
+            Path(OFFBOARD_DONE_FILE).write_text(str(time.time()))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -1,0 +1,43 @@
+[
+  {
+    "name": "diffaero_field",
+    "obstacles": "diffaero",
+    "seed": 0,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_field",
+    "obstacles": "diffphys",
+    "seed": 0,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  
+  {
+    "name": "construction",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConstructionSite/ConstructionSite.stage.usd",
+    "env_scale": 0.01,
+    "start": [-24.237, -1.405, 1.258],
+    "goal": [52.006, -11.739, 2.00],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "english_college",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/EnglishCollege/EnglishCollege.stage.usd",
+    "env_scale": 0.01,
+    "start": [46.912, 127.707, 68.6],
+    "goal": [-43.27, 145.86, 71.0],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  }
+]
+
+

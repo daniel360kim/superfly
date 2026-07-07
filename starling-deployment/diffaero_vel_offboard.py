@@ -1,0 +1,485 @@
+#!/usr/bin/env python
+"""
+DiffAero velocity-command offboard controller for PX4.
+
+Connects to PX4 via MAVLink, arms the drone, enters OFFBOARD mode, then runs a
+velocity-command DiffAero policy at 30 Hz (training dt=0.0333) sending
+SET_POSITION_TARGET_LOCAL_NED with velocity + yaw.
+
+Unlike diffaero_offboard.py (accel → SET_ATTITUDE_TARGET), this script feeds
+the policy's world-frame velocity setpoint straight to PX4's velocity loop.
+
+  * Observation (obs_frame=local, velocity point-mass): state =
+    [target_vel_local(3), v_local(3)]. The sha2c_vel_cmd checkpoint was trained
+    with env=pc (no depth); env=oa checkpoints also consume 9x16 perception.
+  * Action (action_frame=local): world-frame velocity setpoint
+    vel_cmd = Rz @ scaled_action, sent to PX4 as NED (vx, vy, vz).
+  * Yaw: derived from velocity EMA (align_yaw_with_vel_ema), published via the
+    yaw field of SET_POSITION_TARGET_LOCAL_NED.
+
+Usage:
+    # Against PX4 SITL (after running run_px4_sim.py --policy diffaero):
+    python run_px4_sim.py ... --no-debug-frames   # skip camera_debug.png writes in sim
+    python diffaero_vel_offboard.py \\
+        --checkpoint /home/ubuntu/superfly/checkpoints/DiffAero/sha2c_vel_cmd \\
+        --goal 15 0 --climb-alt 2.0 --quiet
+
+    # Against real VOXL2 over UDP:
+    python diffaero_vel_offboard.py --checkpoint <dir> --connect udp:192.168.1.x:14550
+"""
+
+import argparse
+import math
+import time
+import threading
+from pathlib import Path
+
+import numpy as np
+from pymavlink import mavutil
+from scipy.spatial.transform import Rotation
+
+from wrapper.diffaero_core import DiffAeroObs
+from wrapper.perception_builder import Intrinsics
+
+DA_INTRINSICS = Intrinsics(
+    fx=0.5 * 64 / math.tan(0.5 * math.radians(86.0)),
+    fy=0.5 * 36 / math.tan(0.5 * math.radians(48.375)),
+    cx=32.0, cy=18.0,
+    H=36, W=64,
+)
+
+CONTROL_HZ = 30.0
+HEARTBEAT_HZ = 2.0
+OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
+PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
+
+_rot_ENU_to_NED = Rotation.from_quat([0.70711, 0.70711, 0.0, 0.0])
+_rot_FLU_to_FRD = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])
+
+
+class DroneState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.position_enu = np.zeros(3)
+        self.velocity_enu = np.zeros(3)
+        self.R_enu = np.eye(3)
+        self.yaw = 0.0
+        self.armed = False
+        self.offboard = False
+        self.position_valid = False
+        self.last_update = 0.0
+
+    def update_from_attitude(self, msg):
+        q_ned_frd = Rotation.from_quat([msg.q2, msg.q3, msg.q4, msg.q1])
+        rot_enu_flu = _rot_ENU_to_NED.inv() * q_ned_frd * _rot_FLU_to_FRD.inv()
+        with self._lock:
+            self.R_enu = rot_enu_flu.as_matrix()
+            fwd_enu = self.R_enu[:, 0]
+            self.yaw = math.atan2(fwd_enu[1], fwd_enu[0])
+        self.last_update = time.time()
+
+    def update_from_local_position(self, msg):
+        with self._lock:
+            self.position_enu = np.array([msg.y, msg.x, -msg.z])
+            self.velocity_enu = np.array([msg.vy, msg.vx, -msg.vz])
+            self.position_valid = True
+        self.last_update = time.time()
+
+    def update_from_heartbeat(self, msg):
+        with self._lock:
+            self.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            custom_main = (msg.custom_mode >> 16) & 0xFF
+            self.offboard = (custom_main == PX4_CUSTOM_MAIN_MODE_OFFBOARD)
+
+    def get(self):
+        with self._lock:
+            return (
+                self.position_enu.copy(),
+                self.velocity_enu.copy(),
+                self.R_enu.copy(),
+                self.yaw,
+            )
+
+
+def wait_for_heartbeat(mav, timeout=30):
+    print("Waiting for heartbeat...")
+    mav.wait_heartbeat(timeout=timeout)
+    print(f"Heartbeat received from system {mav.target_system} component {mav.target_component}")
+
+
+def wait_for_position(state: DroneState, timeout=30.0):
+    """Block until LOCAL_POSITION_NED has updated at least once."""
+    print("Waiting for LOCAL_POSITION_NED...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if state.position_valid:
+            pos, _, _, _ = state.get()
+            print(f"Position estimate ready: ENU pos={pos.round(2)}")
+            return
+        time.sleep(0.05)
+    raise TimeoutError("Timed out waiting for LOCAL_POSITION_NED")
+
+
+def stream_setpoints_loop(mav, send_fn, send_args, stop_event: threading.Event):
+    """Background setpoint stream; keeps PX4 OFFBOARD preconditions satisfied."""
+    last_hb = time.time()
+    while not stop_event.is_set():
+        send_fn(mav, *send_args)
+        now = time.time()
+        if now - last_hb >= 0.5:
+            send_heartbeat(mav)
+            last_hb = now
+        time.sleep(1.0 / CONTROL_HZ)
+
+
+def stream_setpoints(mav, send_fn, send_args, duration: float):
+    """Keep OFFBOARD alive by streaming setpoints (no gaps after arming)."""
+    end = time.time() + duration
+    last_hb = time.time()
+    while time.time() < end:
+        send_fn(mav, *send_args)
+        now = time.time()
+        if now - last_hb >= 0.5:
+            send_heartbeat(mav)
+            last_hb = now
+        time.sleep(1.0 / CONTROL_HZ)
+
+
+def set_offboard_mode(mav):
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        PX4_CUSTOM_MAIN_MODE_OFFBOARD, 0, 0, 0, 0, 0,
+    )
+
+
+def arm(mav):
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+        1, 0, 0, 0, 0, 0, 0,
+    )
+
+
+def send_position_target_ned(mav, x_n: float, y_e: float, z_d: float, yaw: float = 0.0):
+    """Position + yaw only (CLIMB / YAW phases)."""
+    IGNORE_VEL = 8 | 16 | 32
+    IGNORE_ACC = 64 | 128 | 256
+    IGNORE_YAW_RATE = 2048
+    type_mask = IGNORE_VEL | IGNORE_ACC | IGNORE_YAW_RATE
+    mav.mav.set_position_target_local_ned_send(
+        int(time.time() * 1000) & 0xFFFFFFFF,
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        type_mask,
+        float(x_n), float(y_e), float(z_d),
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+        float(yaw), 0.0,
+    )
+
+
+def send_velocity_target_ned(
+    mav, vx_n: float, vy_e: float, vz_d: float, yaw: float,
+):
+    """Velocity + yaw setpoint for the POLICY phase."""
+    IGNORE_POS = 1 | 2 | 4
+    IGNORE_ACC = 64 | 128 | 256
+    IGNORE_YAW_RATE = 2048
+    type_mask = IGNORE_POS | IGNORE_ACC | IGNORE_YAW_RATE
+    mav.mav.set_position_target_local_ned_send(
+        int(time.time() * 1000) & 0xFFFFFFFF,
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        type_mask,
+        0.0, 0.0, 0.0,
+        float(vx_n), float(vy_e), float(vz_d),
+        0.0, 0.0, 0.0,
+        float(yaw), 0.0,
+    )
+
+
+def enu_vel_to_ned(vel_enu: np.ndarray) -> tuple[float, float, float]:
+    """Convert ENU velocity to NED (vx=North, vy=East, vz=Down)."""
+    return float(vel_enu[1]), float(vel_enu[0]), float(-vel_enu[2])
+
+
+def send_land_command(mav):
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,
+        0, 0, 0, float("nan"),
+        0.0, 0.0, 0.0,
+    )
+
+
+def send_heartbeat(mav):
+    mav.mav.heartbeat_send(
+        mavutil.mavlink.MAV_TYPE_GCS,
+        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+        0, 0, 0,
+    )
+
+
+def set_param_float(mav, param_id: str, value: float):
+    mav.mav.param_set_send(
+        mav.target_system, mav.target_component,
+        param_id.encode("utf-8"), value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+    )
+    print(f"Set param {param_id} = {value}")
+
+
+def receive_loop(mav, state: DroneState, stop_event: threading.Event):
+    while not stop_event.is_set():
+        msg = mav.recv_match(blocking=True, timeout=0.1)
+        if msg is None:
+            continue
+        msg_type = msg.get_type()
+        if msg_type == "ATTITUDE_QUATERNION":
+            state.update_from_attitude(msg)
+        elif msg_type == "LOCAL_POSITION_NED":
+            state.update_from_local_position(msg)
+        elif msg_type == "HEARTBEAT" and msg.get_srcSystem() != 255:
+            state.update_from_heartbeat(msg)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True,
+                        help="Path to velocity-command checkpoint dir or .pt2 file")
+    parser.add_argument("--connect", default="udp:localhost:14550",
+                        help="MAVLink connection string")
+    parser.add_argument("--goal", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                        help="Goal XY (ENU). Z = --climb-alt. Omit to hover.")
+    parser.add_argument("--depth", action="store_true",
+                        help="Subscribe to depth UDP (only used for env=oa checkpoints)")
+    parser.add_argument("--climb-alt", type=float, default=10.0,
+                        help="Climb altitude [m] before policy handoff")
+    parser.add_argument("--climb-rate", type=float, default=1.0,
+                        help="Vertical climb rate during CLIMB phase [m/s]")
+    parser.add_argument("--arrive-tol", type=float, default=0.3,
+                        help="Altitude tolerance [m] for climb handoff")
+    parser.add_argument("--settle-speed", type=float, default=0.2,
+                        help="Speed [m/s] below which climb is considered settled")
+    parser.add_argument("--yaw-tol-deg", type=float, default=5.0,
+                        help="Yaw tolerance [deg] for goal-facing turn")
+    parser.add_argument("--max-vel", type=float, default=None,
+                        help="Target cruise speed [m/s] for goal heuristic "
+                             "(default: from checkpoint config)")
+    parser.add_argument("--max-vel-xy", type=float, default=None,
+                        help="PX4 MPC_XY_VEL_MAX and action XY limit override [m/s]")
+    parser.add_argument("--max-vel-z", type=float, default=None,
+                        help="PX4 MPC_Z_VEL_MAX_UP/DN and action Z limit override [m/s]")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress per-phase status prints (phase handoffs still print)")
+    args = parser.parse_args()
+
+    goal_xy = np.array(args.goal) if args.goal is not None else None
+
+    depth_sub = None
+    if args.depth:
+        from depth_transport import DepthSubscriber
+        depth_sub = DepthSubscriber()
+        print("Depth subscriber listening for frames over UDP.")
+
+    print(f"Connecting to {args.connect} ...")
+    mav = mavutil.mavlink_connection(args.connect)
+    wait_for_heartbeat(mav)
+
+    state = DroneState()
+    stop_event = threading.Event()
+    recv_thread = threading.Thread(
+        target=receive_loop, args=(mav, state, stop_event), daemon=True
+    )
+    recv_thread.start()
+    wait_for_position(state)
+
+    policy_kwargs = {"intrinsics": DA_INTRINSICS, "checkpoint_path": args.checkpoint}
+    if args.max_vel is not None:
+        policy_kwargs["max_vel"] = args.max_vel
+    if args.max_vel_xy is not None:
+        policy_kwargs["max_vel_xy"] = args.max_vel_xy
+    if args.max_vel_z is not None:
+        policy_kwargs["max_vel_z"] = args.max_vel_z
+
+    pos0, _, _, yaw0 = state.get()
+    hold_x_n = pos0[1]
+    hold_y_e = pos0[0]
+    hold_z_d = -args.climb_alt
+
+    yaw_ground = math.atan2(math.sin(math.pi / 2 - yaw0), math.cos(math.pi / 2 - yaw0))
+    if goal_xy is not None:
+        d_north = goal_xy[1] - hold_x_n
+        d_east = goal_xy[0] - hold_y_e
+        yaw_goal = math.atan2(d_east, d_north)
+    else:
+        yaw_goal = yaw_ground
+    yaw_ned = yaw_ground
+
+    stream_stop = threading.Event()
+    stream_thread = threading.Thread(
+        target=stream_setpoints_loop,
+        args=(mav, send_position_target_ned, (hold_x_n, hold_y_e, hold_z_d, yaw_ned), stream_stop),
+        daemon=True,
+    )
+    stream_thread.start()
+
+    print("Loading policy (setpoints streaming in background) ...")
+    from wrapper.diffaero_vel_core import DiffAeroVelPolicy
+    policy = DiffAeroVelPolicy(**policy_kwargs)
+    max_vel_xy = float(policy.max_action[0, 0].cpu())
+    max_vel_z = float(policy.max_action[0, 2].cpu())
+
+    print("Setting OFFBOARD mode...")
+    set_offboard_mode(mav)
+    time.sleep(0.5)
+
+    print("Arming...")
+    arm(mav)
+    time.sleep(0.5)
+
+    print(f"Setting PX4 MPC_XY_VEL_MAX = {max_vel_xy:.1f} ...")
+    set_param_float(mav, "MPC_XY_VEL_MAX", max_vel_xy)
+    print(f"Setting PX4 MPC_Z_VEL_MAX_UP = {max_vel_z:.1f} ...")
+    set_param_float(mav, "MPC_Z_VEL_MAX_UP", max_vel_z)
+    print(f"Setting PX4 MPC_Z_VEL_MAX_DN = {max_vel_z:.1f} ...")
+    set_param_float(mav, "MPC_Z_VEL_MAX_DN", max_vel_z)
+
+    stream_stop.set()
+    stream_thread.join(timeout=1.0)
+
+    policy.reset()
+
+    control_dt = 1.0 / CONTROL_HZ
+    heartbeat_dt = 1.0 / HEARTBEAT_HZ
+    last_heartbeat = time.time()
+    start_time = time.time()
+    next_step = time.time()
+    step_count = 0
+
+    phase = "CLIMB"
+    landing_sent = False
+    print(f"CLIMB: velocity climb to {args.climb_alt:.1f} m at {args.climb_rate:.1f} m/s ...")
+
+    try:
+        while True:
+            now = time.time()
+            elapsed = now - start_time
+
+            if now - last_heartbeat >= heartbeat_dt:
+                send_heartbeat(mav)
+                last_heartbeat = now
+
+            if now >= next_step:
+                pos, vel, R_enu, yaw = state.get()
+                verbose = (
+                    not args.quiet
+                    and (elapsed < 5.0 or int(now) != int(now - control_dt))
+                )
+                depth_range = depth_sub.latest() if depth_sub else None
+
+                if goal_xy is not None:
+                    goal_enu = np.array([goal_xy[0], goal_xy[1], args.climb_alt])
+                else:
+                    goal_enu = pos
+
+                if phase == "CLIMB":
+                    alt = pos[2]
+                    speed = np.linalg.norm(vel)
+                    if not state.offboard:
+                        set_offboard_mode(mav)
+                    if alt < args.climb_alt - args.arrive_tol:
+                        # NED vz < 0 commands upward motion.
+                        send_velocity_target_ned(
+                            mav, 0.0, 0.0, -args.climb_rate, yaw_ground,
+                        )
+                    else:
+                        send_velocity_target_ned(mav, 0.0, 0.0, 0.0, yaw_ground)
+                    arrived = alt >= args.climb_alt - args.arrive_tol
+                    settled = speed < args.settle_speed
+                    if arrived and settled and state.offboard:
+                        phase = "YAW"
+                        print(f"\n>>> Climbed to alt={alt:.2f} m, speed={speed:.2f} m/s -- "
+                              f"turning to face goal <<<\n")
+                    if verbose:
+                        print(f"[CLIMB t={elapsed:.2f}s] alt={alt:.2f}/{args.climb_alt:.1f} "
+                              f"speed={speed:.2f}  offboard={state.offboard} "
+                              f"armed={state.armed}")
+                elif phase == "YAW":
+                    send_position_target_ned(mav, hold_x_n, hold_y_e, hold_z_d, yaw_goal)
+                    yaw_cur_ned = math.atan2(
+                        math.sin(math.pi / 2 - yaw), math.cos(math.pi / 2 - yaw)
+                    )
+                    yaw_err = math.atan2(
+                        math.sin(yaw_goal - yaw_cur_ned), math.cos(yaw_goal - yaw_cur_ned)
+                    )
+                    if abs(math.degrees(yaw_err)) < args.yaw_tol_deg and state.offboard:
+                        phase = "POLICY"
+                        print(f"\n>>> HANDOFF to velocity policy, "
+                              f"yaw={math.degrees(yaw_cur_ned):.1f} deg <<<\n")
+                    if verbose:
+                        print(f"[YAW t={elapsed:.2f}s] yaw={math.degrees(yaw_cur_ned):.1f} "
+                              f"target={math.degrees(yaw_goal):.1f} err={math.degrees(yaw_err):.1f}")
+                elif phase == "POLICY":
+                    obs = DiffAeroObs(
+                        position_enu=pos,
+                        velocity_enu=vel,
+                        R_enu=R_enu,
+                        goal_enu=goal_enu,
+                        depth_planar=depth_range,
+                    )
+                    cmd = policy.compute(obs)
+                    vx_n, vy_e, vz_d = enu_vel_to_ned(cmd.vel_cmd_enu)
+                    send_velocity_target_ned(mav, vx_n, vy_e, vz_d, cmd.yaw_ned)
+                    if np.linalg.norm(goal_enu - pos) < 0.5:
+                        phase = "LANDING"
+                        print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
+                    if verbose:
+                        print(
+                            f"[POLICY t={elapsed:.2f}s step={step_count}]\n"
+                            f"  pos(ENU)     = {pos.round(2)}\n"
+                            f"  vel(ENU)     = {vel.round(2)}\n"
+                            f"  goal(ENU)    = {np.round(goal_enu, 2)}\n"
+                            f"  vel_cmd(ENU) = {np.round(cmd.vel_cmd_enu, 2)}  "
+                            f"|v|={cmd.vel_norm:.2f}\n"
+                            f"  yaw_ned(deg) = {math.degrees(cmd.yaw_ned):.1f}\n"
+                            f"  offboard={state.offboard}  armed={state.armed}\n"
+                            "---"
+                        )
+                elif phase == "LANDING":
+                    if not landing_sent:
+                        send_land_command(mav)
+                        landing_sent = True
+                    if not state.armed:
+                        print("\n>>> Landed and disarmed. Exiting.")
+                        break
+                    if verbose:
+                        print(f"[LANDING t={elapsed:.2f}s] alt={pos[2]:.2f} m")
+
+                step_count += 1
+                next_step += control_dt
+                if next_step < time.time():
+                    next_step = time.time()
+            else:
+                time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        print("\nStopping.")
+    finally:
+        stop_event.set()
+        mav.mav.command_long_send(
+            mav.target_system, mav.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        )
+        try:
+            Path(OFFBOARD_DONE_FILE).write_text(str(time.time()))
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

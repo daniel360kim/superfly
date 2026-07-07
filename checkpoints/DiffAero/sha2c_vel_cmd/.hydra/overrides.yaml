@@ -1,0 +1,4 @@
+- algo=sha2c
+- dynamics=pmv
+- env=pc
+- env.render.headless=true

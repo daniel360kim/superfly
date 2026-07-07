@@ -1,0 +1,284 @@
+Timer unit: 0.001 s
+
+Total time: 12.7279 s
+File: /home/ubuntu/superfly/diffaero/env/position_control.py
+Function: PositionControl.get_observations at line 47
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    47                                               @timeit
+    48                                               def get_observations(self, with_grad=False):
+    49     32001         26.1      0.0      0.2          if self.obs_frame == "local":
+    50     32001       8389.0      0.3     65.9              target_vel = self.dynamics.world2local(self.target_vel)
+    51     32001       3813.0      0.1     30.0              _v = self.dynamics.world2local(self._v)
+    52                                                   elif self.obs_frame == "world":
+    53                                                       target_vel = self.target_vel
+    54                                                       _v = self._v
+    55                                                   
+    56     32001         12.1      0.0      0.1          if self.dynamic_type == "pointmass":
+    57     32001          6.0      0.0      0.0              if self.action_is_velocity:
+    58                                                           # PX4 owns attitude in velocity mode: obs = [target_vel, v]
+    59     32001        392.6      0.0      3.1                  obs = torch.cat([target_vel, _v], dim=-1)
+    60                                                       else:
+    61                                                           obs = torch.cat([
+    62                                                               target_vel,
+    63                                                               self.dynamics.uz if self.obs_frame == "local" else self.q,
+    64                                                               _v,
+    65                                                           ], dim=-1)
+    66                                                   else:
+    67                                                       obs = torch.cat([target_vel, self._q, _v], dim=-1)
+    68     32001         14.4      0.0      0.1          if self.last_action_in_obs:
+    69                                                       obs = torch.cat([obs, self.last_action], dim=-1)
+    70     32001         74.7      0.0      0.6          return obs if with_grad else obs.detach()
+
+Total time: 3.70148 s
+File: /home/ubuntu/superfly/diffaero/env/position_control.py
+Function: PositionControl.get_state at line 37
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    37                                               @timeit
+    38                                               def get_state(self, with_grad=False):
+    39    192000       1374.2      0.0     37.1          state = torch.cat([
+    40     64000       1640.1      0.0     44.3              self.target_pos - self.p,
+    41     64000        229.0      0.0      6.2              self.q,
+    42     64000        280.0      0.0      7.6              self._v,
+    43     64000        104.8      0.0      2.8              self._a if self.dynamic_type == "pointmass" else self._w,
+    44     64000          4.8      0.0      0.1          ], dim=-1)
+    45     64000         68.6      0.0      1.9          return state if with_grad else state.detach()
+
+Total time: 457.793 s
+File: /home/ubuntu/superfly/diffaero/utils/runner.py
+Function: TrainRunner.run at line 119
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   119                                               def run(self):
+   120                                                   """Start training."""
+   121                                                   # make progress bars to display on different rows in multirun mode
+   122         1        105.6    105.6      0.0          obs = self.env.reset()
+   123         1          0.1      0.1      0.0          on_step_cb = display_image if self.cfg.display_image else None
+   124         1          0.0      0.0      0.0          if self.torch_profiler is not None:
+   125                                                       self.torch_profiler.start()
+   126      1001        247.5      0.2      0.1          for i in self.logger.pbar:
+   127      1000          0.3      0.0      0.0              if self.torch_profiler is not None:
+   128                                                           self.torch_profiler.step()
+   129      1000          0.5      0.0      0.0              t1 = self.logger.pbar._time()
+   130      1000         50.2      0.1      0.0              self.env.detach()
+   131      1000     455784.7    455.8     99.6              obs, policy_info, env_info, losses, grad_norms = self.agent.step(self.cfg, self.env, self.logger, obs, on_step_cb=on_step_cb)
+   132      1000          2.9      0.0      0.0              l_episode = env_info["stats"].get("l_episode", 0.)
+   133      1000          0.5      0.0      0.0              success_rate = env_info["stats"].get("success_rate", 0.)
+   134      1000          0.5      0.0      0.0              survive_rate = env_info["stats"].get("survive_rate", 0.)
+   135      2000        358.6      0.2      0.1              self.logger.pbar.set_postfix({
+   136      1000          8.7      0.0      0.0                  "loss": f"{env_info['loss_components']['total_loss']:6.3f}",
+   137      1000          1.2      0.0      0.0                  "l_episode": f"{l_episode:4.1f}",
+   138      1000          1.7      0.0      0.0                  "success_rate": f"{success_rate:.2f}",
+   139      1000          0.4      0.0      0.0                  "survive_rate": f"{survive_rate:.2f}",
+   140      1000       1097.8      1.1      0.2                  "fps": f"{int(self.cfg.l_rollout*self.cfg.n_envs/(self.logger.pbar._time()-t1)):,d}"})
+   141      1000         25.4      0.0      0.0              if i % self.cfg.log_freq == 0:
+   142       100          0.2      0.0      0.0                  log_info = {
+   143       100          0.0      0.0      0.0                      "env_loss": env_info["loss_components"],
+   144       100          0.0      0.0      0.0                      "agent_loss": losses,
+   145       100          0.0      0.0      0.0                      "agent_grad_norm": grad_norms,
+   146       100          0.0      0.0      0.0                      "metrics": env_info["stats"]
+   147                                                           }
+   148       100          0.1      0.0      0.0                  if "WorldModel/state_total_loss" in policy_info.keys():
+   149                                                               log_info.update({k: v for k, v in policy_info.items() if k.startswith("WorldModel")})
+   150       100         60.4      0.6      0.0                  self.logger.log_scalars(log_info)
+   151                                                       
+   152      1000          0.4      0.0      0.0              if success_rate >= self.max_success_rate:
+   153      1000          0.3      0.0      0.0                  self.max_success_rate = success_rate
+   154      1000         18.7      0.0      0.0                  if i > 0 and i % self.cfg.save_freq == 0:
+   155         9         26.2      2.9      0.0                      self.agent.save(os.path.join(self.logger.logdir, "best"))
+
+Total time: 43.0235 s
+File: /home/ubuntu/superfly/diffaero/env/position_control.py
+Function: PositionControl.reset_idx at line 188
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   188                                               @timeit
+   189                                               def reset_idx(self, env_idx):
+   190     30746      14475.2      0.5     33.6          self.randomizer.refresh(env_idx)
+   191     30746       5642.9      0.2     13.1          self.imu.reset_idx(env_idx)
+   192     30746        279.5      0.0      0.6          n_resets = len(env_idx)
+   193     30746        216.0      0.0      0.5          state_mask = torch.zeros_like(self.dynamics._state, dtype=torch.bool)
+   194     30746       3058.7      0.1      7.1          state_mask[env_idx] = True
+   195                                                   
+   196     30746        156.9      0.0      0.4          L = self.L.unsqueeze(-1) # [n_envs, 1]
+   197     30746        680.7      0.0      1.6          p_min, p_max = -L+0.5, L-0.5
+   198     30746       1169.2      0.0      2.7          p_new = torch.rand((self.n_envs, 3), device=self.device) * (p_max - p_min) + p_min
+   199     30746        498.0      0.0      1.2          self.init_pos[env_idx] = p_new[env_idx]
+   200     30746        761.2      0.0      1.8          new_state = torch.cat([p_new, torch.zeros(self.n_envs, self.dynamics.state_dim-3, device=self.device)], dim=-1)
+   201     30746         14.0      0.0      0.0          if self.dynamic_type == "pointmass" and not self.action_is_velocity:
+   202                                                       new_state[:, 8] = 9.8 # hover thrust acceleration (no accel slot in the velocity model)
+   203     30746          8.4      0.0      0.0          elif self.dynamic_type == "quadrotor":
+   204                                                       new_state[:, 6] = 1 # real part of the quaternion
+   205     30746        360.7      0.0      0.8          self.dynamics._state = torch.where(state_mask, new_state, self.dynamics._state)
+   206     30746       5483.4      0.2     12.7          self.dynamics.reset_idx(env_idx)
+   207     30746        205.0      0.0      0.5          self.target_pos.fill_(0.)
+   208     30746       3393.2      0.1      7.9          self.progress[env_idx] = 0
+   209     30746       2927.6      0.1      6.8          self.arrive_time[env_idx] = 0
+   210     30746       2604.0      0.1      6.1          self.last_action[env_idx] = 0.
+   211    122984       1055.4      0.0      2.5          self.max_vel[env_idx] = torch.rand(
+   212     92238         33.6      0.0      0.1              n_resets, device=self.device) * (self.max_target_vel - self.min_target_vel) + self.min_target_vel
+
+Total time: 453.743 s
+File: /home/ubuntu/superfly/diffaero/algo/SHAC.py
+Function: SHA2C.step at line 328
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   328                                               @timeit
+   329                                               def step(self, cfg, env, logger, obs, on_step_cb=None):
+   330      1000          2.8      0.0      0.0          self.buffer.clear()
+   331      1000          0.5      0.0      0.0          if self.agent.is_rnn_based:
+   332                                                       self.rnn_state_buffer.clear()
+   333      1000       1410.6      1.4      0.3          self.clear_loss()
+   334     33000         14.7      0.0      0.0          for t in range(self.l_rollout):
+   335     32000      45581.5      1.4     10.0              action, policy_info = self.act(obs)
+   336     32000       2379.9      0.1      0.5              state = env.get_state()
+   337     64000        410.0      0.0      0.1              with torch.no_grad():
+   338     32000       6581.9      0.2      1.5                  value = self.agent.get_value(state)
+   339     32000     245449.3      7.7     54.1              next_obs, (loss, reward), terminated, env_info = env.step(env.rescale_action(action), next_state_before_reset=True)
+   340     32000      55246.6      1.7     12.2              next_value = self.record_loss(loss, policy_info, env_info, last_step=(t==cfg.l_rollout-1))
+   341     64000       3412.5      0.1      0.8              self.buffer.add(
+   342     32000          3.2      0.0      0.0                  obs=state,
+   343     32000          8.8      0.0      0.0                  sample=policy_info["sample"],
+   344     32000          4.4      0.0      0.0                  logprob=policy_info["logprob"],
+   345     32000          2.4      0.0      0.0                  loss=reward,
+   346     32000          4.7      0.0      0.0                  value=value,
+   347     32000         13.4      0.0      0.0                  next_done=env_info["reset"],
+   348     32000          2.2      0.0      0.0                  next_terminated=terminated,
+   349     32000          2.0      0.0      0.0                  next_value=next_value)
+   350     32000         66.2      0.0      0.0              self.reset(env_info["reset"])
+   351     32000         16.2      0.0      0.0              obs = next_obs
+   352     32000         17.4      0.0      0.0              if on_step_cb is not None:
+   353                                                           on_step_cb(
+   354                                                               obs=obs,
+   355                                                               action=action,
+   356                                                               policy_info=policy_info,
+   357                                                               env_info=env_info)
+   358      1000       2052.7      2.1      0.5          _, target_values = self.bootstrap_gae()
+   359      1000      77349.2     77.3     17.0          actor_losses, actor_grad_norms = self.update_actor()
+   360      1000      12910.8     12.9      2.8          critic_losses, critic_grad_norms = self.update_critic(target_values)
+   361      1000          3.0      0.0      0.0          self.detach()
+   362      1000        794.3      0.8      0.2          logger.log_scalar("value", value.mean().item())
+   363      1000          1.1      0.0      0.0          losses = {**actor_losses, **critic_losses}
+   364      1000          0.5      0.0      0.0          grad_norms = {**actor_grad_norms, **critic_grad_norms}
+   365      1000          0.5      0.0      0.0          return obs, policy_info, env_info, losses, grad_norms
+
+Total time: 221.665 s
+File: /home/ubuntu/superfly/diffaero/env/position_control.py
+Function: PositionControl.step at line 72
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    72                                               @timeit
+    73                                               def step(self, action, next_obs_before_reset=False, next_state_before_reset=False):
+    74                                                   # type: (Tensor, bool, bool) -> Tuple[Tensor, Tuple[Tensor, Tensor], Tensor, Dict[str, Union[Dict[str, Tensor], Dict[str, float], Tensor]]]
+    75     32000      70373.5      2.2     31.7          terminated, truncated, success, avg_vel = super()._step(action)
+    76     32000        212.7      0.0      0.1          reset = terminated | truncated
+    77     32000       8023.9      0.3      3.6          reset_indices = reset.nonzero().view(-1)
+    78     32000      71688.2      2.2     32.3          loss, reward, loss_components = self.loss_and_reward(action)
+    79     32000         27.6      0.0      0.0          extra = {
+    80     32000          3.4      0.0      0.0              "truncated": truncated,
+    81     32000        459.6      0.0      0.2              "l": self.progress.clone(),
+    82     32000          3.4      0.0      0.0              "reset": reset,
+    83     32000          2.7      0.0      0.0              "reset_indices": reset_indices,
+    84     32000          3.1      0.0      0.0              "success": success,
+    85     32000        203.4      0.0      0.1              "arrive_time": self.arrive_time.clone(),
+    86     32000          2.7      0.0      0.0              "loss_components": loss_components,
+    87                                                       # Ddata dictionary that contains all the statistical metrics
+    88                                                       # need to be calculated and logged in a sliding-window manner
+    89                                                       # Note: all items in dictionary "stats_raw" should have ndim=1
+    90     32000         33.2      0.0      0.0              "stats_raw": {
+    91     32000       3509.0      0.1      1.6                  "success_rate": success[reset],
+    92     32000       1749.1      0.1      0.8                  "survive_rate": truncated[reset],
+    93     32000       2780.8      0.1      1.3                  "l_episode": ((self.progress.clone() - 1) * self.dt)[reset],
+    94     32000       1846.9      0.1      0.8                  "avg_vel": avg_vel[success],
+    95     32000       2319.8      0.1      1.0                  "arrive_time": self.arrive_time.clone()[success]
+    96                                                       },
+    97                                                   }
+    98     32000          4.3      0.0      0.0          if next_obs_before_reset:
+    99                                                       extra["next_obs_before_reset"] = self.get_observations(with_grad=True)
+   100     32000          4.1      0.0      0.0          if next_state_before_reset:
+   101     32000       1943.8      0.1      0.9              extra["next_state_before_reset"] = self.get_state(with_grad=True)
+   102     32000         46.1      0.0      0.0          if reset_indices.numel() > 0:
+   103     30745      43255.9      1.4     19.5              self.reset_idx(reset_indices)
+   104     32000      13167.7      0.4      5.9          return self.get_observations(), (loss, reward), terminated, extra
+
+Total time: 71.1961 s
+File: /home/ubuntu/superfly/diffaero/env/position_control.py
+Function: PositionControl.loss_and_reward at line 120
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   120                                               @timeit
+   121                                               def loss_and_reward(self, action):
+   122                                                   # type: (Tensor) -> Tuple[Tensor, Tensor, Dict[str, float]]
+   123     32000         21.0      0.0      0.0          if self.dynamic_type == "pointmass":
+   124     32000       2959.1      0.1      4.2              vel_diff = (self.dynamics._vel_ema - self.target_vel).norm(dim=-1)
+   125     32000       1418.3      0.0      2.0              vel_loss = F.smooth_l1_loss(vel_diff, torch.zeros_like(vel_diff), reduction="none")
+   126     32000       1770.0      0.1      2.5              pos_loss = 1 - (-(self._p-self.target_pos).norm(dim=-1)).exp()
+   127     32000         11.6      0.0      0.0              if self.dynamics.action_frame == "local":
+   128     32000       4983.5      0.2      7.0                  action = self.dynamics.local2world(action)
+   129     32000          8.6      0.0      0.0              if self.action_is_velocity:
+   130                                                           # control-effort / smoothness: commanded velocity vs current velocity
+   131                                                           # (proportional to the implied acceleration), since the action is a
+   132                                                           # velocity setpoint rather than a thrust-acceleration command
+   133     32000       1781.4      0.1      2.5                  jerk_loss = F.mse_loss(action, self._v, reduction="none").sum(dim=-1)
+   134                                                       else:
+   135                                                           jerk_loss = F.mse_loss(self.dynamics.a_thrust, action, reduction="none").sum(dim=-1)
+   136     32000          3.1      0.0      0.0              total_loss = (
+   137     96000       3805.7      0.0      5.3                  self.loss_weights.pointmass.vel * vel_loss +
+   138     32000       1542.1      0.0      2.2                  self.loss_weights.pointmass.jerk * jerk_loss +
+   139     32000       1525.8      0.0      2.1                  self.loss_weights.pointmass.pos * pos_loss
+   140                                                       )
+   141     32000          2.7      0.0      0.0              total_reward = (
+   142    128000       1514.6      0.0      2.1                  self.reward_weights.constant - 
+   143     32000       1425.7      0.0      2.0                  self.reward_weights.pointmass.vel * vel_loss -
+   144     32000       1403.8      0.0      2.0                  self.reward_weights.pointmass.jerk * jerk_loss -
+   145     32000       1369.4      0.0      1.9                  self.reward_weights.pointmass.pos * pos_loss
+   146     32000        183.3      0.0      0.3              ).detach()
+   147                                                       
+   148     32000         31.8      0.0      0.0              loss_components = {
+   149     32000       8326.9      0.3     11.7                  "vel_loss": vel_loss.mean().item(),
+   150     32000      13864.0      0.4     19.5                  "pos_loss": pos_loss.mean().item(),
+   151     32000      10428.8      0.3     14.6                  "jerk_loss": jerk_loss.mean().item(),
+   152     32000       7550.1      0.2     10.6                  "total_loss": total_loss.mean().item(),
+   153     32000       5256.9      0.2      7.4                  "total_reward": total_reward.mean().item()
+   154                                                       }
+   155                                                   else:
+   156                                                       rotation_matrix_b2i = T.quaternion_to_matrix(self._q.roll(1, dims=-1)).clamp_(min=-1.0+1e-6, max=1.0-1e-6)
+   157                                                       yaw, pitch, roll = T.matrix_to_euler_angles(rotation_matrix_b2i, "ZYX").unbind(dim=-1)
+   158                                                       attitude_loss = roll**2 + pitch**2
+   159                                                       vel_diff = (self._v - self.target_vel).norm(dim=-1)
+   160                                                       vel_loss = F.smooth_l1_loss(vel_diff, torch.zeros_like(vel_diff), reduction="none")
+   161                                                       jerk_loss = self._w.norm(dim=-1)
+   162                                                       pos_loss = 1 - (-(self._p-self.target_pos).norm(dim=-1)).exp()
+   163                                                       
+   164                                                       total_loss = (
+   165                                                           self.loss_weights.quadrotor.vel * vel_loss +
+   166                                                           self.loss_weights.quadrotor.jerk * jerk_loss +
+   167                                                           self.loss_weights.quadrotor.pos * pos_loss +
+   168                                                           self.loss_weights.quadrotor.attitude * attitude_loss
+   169                                                       )
+   170                                                       total_reward = (
+   171                                                           self.reward_weights.constant - 
+   172                                                           self.reward_weights.quadrotor.vel * vel_loss -
+   173                                                           self.reward_weights.quadrotor.jerk * jerk_loss -
+   174                                                           self.reward_weights.quadrotor.pos * pos_loss -
+   175                                                           self.reward_weights.quadrotor.attitude * attitude_loss
+   176                                                       ).detach()
+   177                                                       
+   178                                                       loss_components = {
+   179                                                           "vel_loss": vel_loss.mean().item(),
+   180                                                           "jerk_loss": jerk_loss.mean().item(),
+   181                                                           "attitute_loss": attitude_loss.mean().item(),
+   182                                                           "pos_loss": pos_loss.mean().item(),
+   183                                                           "total_loss": total_loss.mean().item(),
+   184                                                           "total_reward": total_reward.mean().item()
+   185                                                       }
+   186     32000          7.8      0.0      0.0          return total_loss, total_reward, loss_components
+

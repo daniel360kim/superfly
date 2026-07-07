@@ -1,0 +1,13 @@
+[
+  {
+    "name": "construction",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConstructionSite/ConstructionSite.stage.usd",
+    "env_scale": 0.01,
+    "start": [-24.237, -1.405, 1.258],
+    "goal": [52.006, -11.739, 2.00],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  }
+]
+

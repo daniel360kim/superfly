@@ -1,0 +1,184 @@
+algo:
+  name: sha2c
+  network: ${network}
+  l_rollout: 32
+  actor_lr: 0.001
+  critic_lr: 0.003
+  gamma: 0.99
+  lmbda: 0.95
+  entropy_weight: 0.01
+  actor_grad_norm: 1.0
+  critic_grad_norm: 10.0
+  n_minibatch: 8
+  target_update_rate: 1.0
+  critic_network:
+    name: mlp
+    hidden_dim:
+    - 256
+    - 128
+env:
+  render:
+    name: position_control_renderer
+    headless: true
+    n_envs: ${env.n_envs}
+    n_agents: ${n_agents}
+    dt: ${env.dt}
+    render_n_envs: 256
+    env_spacing: 0.5
+    physics_engine: physx
+    ground_plane: true
+    record_video: ${record_video}
+    video_camera:
+      width: 512
+      height: 288
+      fov: 60.0
+      far_plane: 20
+  randomizer:
+    name: default_randomizer
+    enabled: true
+  imu:
+    name: default_imu
+    enable_drift: true
+    enable_noise: true
+    imu_mounting_error_range_deg: 2.0
+    acc_drift_std: 0.13564659966250536
+    acc_noise_std: 0.15690639999999997
+    gyro_drift_std: 0.0014352700094407325
+    gyro_noise_std: 0.02443460952792061
+  name: position_control
+  abbr: pc
+  dynamics: ${dynamics}
+  dt: 0.0333
+  length:
+    default: 10
+    enabled: false
+    min: 10
+    max: 10
+  n_envs: ${n_envs}
+  n_agents: ${n_agents}
+  obs_frame: local
+  max_time: 20
+  wait_before_truncate: 5.0
+  max_target_vel: 10.0
+  min_target_vel: 5.0
+  last_action_in_obs: false
+  loss_weights:
+    pointmass:
+      vel: 1.0
+      jerk: 0.01
+      pos: 0.1
+    quadrotor:
+      vel: 1.0
+      jerk: 0.001
+      pos: 3.0
+      attitude: 0.1
+  reward_weights:
+    constant: 1.0
+    pointmass:
+      vel: 0.5
+      jerk: 0.01
+      pos: 0.1
+    quadrotor:
+      vel: 1.0
+      jerk: 0.001
+      pos: 3.0
+      attitude: 0.1
+dynamics:
+  name: velocity_pointmass
+  abbr: pmv
+  action_is_velocity: true
+  n_envs: ${n_envs}
+  n_agents: ${n_agents}
+  dt: ${env.dt}
+  action_frame: local
+  m: 1.0
+  g: 9.81
+  lmbda:
+    default: 1.2
+    enabled: true
+    min: 0.5
+    max: 2.0
+  alpha: 1.0
+  align_yaw_with_target_direction: false
+  align_yaw_with_vel_ema: true
+  vel_ema_factor:
+    default: 0.1
+    enabled: true
+    min: 0.08
+    max: 0.12
+  max_vel:
+    xy:
+      default: 5
+      enabled: true
+      min: 3
+      max: 8
+    z:
+      default: 3
+      enabled: true
+      min: 2
+      max: 5
+  solver_type: rk4
+  n_substeps: 1
+network:
+  name: mlp
+  hidden_dim:
+  - 256
+  - 128
+sensor:
+  name: camera
+  width: 16
+  height: 9
+  horizontal_fov: 86.0
+  max_dist: 5.0
+  onboard_position:
+  - 0.2
+  - 0.0
+  - 0.05
+  onboard_attitude:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  n_envs: ${n_envs}
+  n_agents: ${n_agents}
+  pitch_angle_deg:
+    default: 0
+    enabled: true
+    min: -5
+    max: 5
+  yaw_angle_deg:
+    default: 0
+    enabled: true
+    min: -3
+    max: 3
+  roll_angle_deg:
+    default: 0
+    enabled: true
+    min: -3
+    max: 3
+logger:
+  name: tensorboard
+l_rollout: ${algo.l_rollout}
+n_agents: 1
+n_envs: 1024
+n_updates: 1000
+log_freq: 10
+log_level: info
+save_freq: 100
+device: 0
+n_jobs: 1
+headless: true
+display_image: false
+record_video: false
+runname: ''
+checkpoint: null
+export:
+  obs_frame: ${env.obs_frame}
+  action_frame: ${dynamics.action_frame}
+  action_is_velocity: ${oc.select:dynamics.action_is_velocity,false}
+  jit: true
+  onnx: true
+torch_profile: false
+seed: 0
+torch_deterministic: false
+ref_path: null

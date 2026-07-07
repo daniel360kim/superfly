@@ -1,0 +1,44 @@
+# Python caches / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments (each method trains in its own venv)
+.venv/
+venv/
+env/
+
+# Comparison harness outputs (regenerated each run)
+starling-deployment/compare/results/
+
+# Sim / camera debug artifacts (regenerated each run)
+starling-deployment/camera_debug.png
+starling-deployment/depth_debug.npy
+starling-deployment/*.mp4
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Scene-mesh clearance cache (large .npz, re-extracted on demand)
+starling-deployment/compare/mesh_cache/
+
+# End-to-end comparison run outputs (regenerated per run)
+starling-deployment/compare/results_e2e/
+starling-deployment/results/
+
+# Sim scene assets (large USD files, not source)
+starling-deployment/starling/
+
+# Hydra training run outputs / logs (regenerated per run)
+outputs/
+train.log
+
+# External method repos cloned locally, not tracked as submodules
+/depthnav/
+/DiffPhysDrone/
+/SAFE_Benchmark/
+/diffaero/
