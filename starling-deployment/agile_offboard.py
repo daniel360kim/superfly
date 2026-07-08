@@ -26,6 +26,7 @@ Usage (after running run_px4_sim.py --policy agile):
 
 import argparse
 import math
+import os
 import time
 import threading
 from pathlib import Path
@@ -42,6 +43,9 @@ from agile_debug_transport import AgileDebugPublisher
 # ---------------------------------------------------------------------------
 
 CONTROL_HZ = 30.0
+# Target rate for the (expensive) net forward pass. The MPC/attitude loop can run
+# faster than this; net_every = round(control_hz / NET_HZ) holds the net near here.
+NET_HZ = 15.0
 HEARTBEAT_HZ = 2.0
 G = 9.80665
 
@@ -142,18 +146,19 @@ def wait_for_heartbeat(mav, timeout=120):
     print(f"Heartbeat received from system {mav.target_system} component {mav.target_component}")
 
 
-def request_stream_rates(mav):
-    """Ask PX4 to stream the state messages at STREAM_HZ on THIS link.
+def request_stream_rates(mav, stream_hz=STREAM_HZ):
+    """Ask PX4 to stream the state messages at stream_hz on THIS link.
     Without this the GCS link's defaults apply (position 1 Hz, attitude
-    10 Hz) and the MPC runs on second-stale state -> attitude limit cycle."""
-    interval_us = int(1e6 / STREAM_HZ)
+    10 Hz) and the MPC runs on second-stale state -> attitude limit cycle.
+    Should be >= the control rate so each MPC solve sees fresh state."""
+    interval_us = int(1e6 / stream_hz)
     for msg_id, name in STREAMED_MSGS.items():
         mav.mav.command_long_send(
             mav.target_system, mav.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
             float(msg_id), float(interval_us), 0, 0, 0, 0, 0,
         )
-        print(f"Requested {name} at {STREAM_HZ:.0f} Hz")
+        print(f"Requested {name} at {stream_hz:.0f} Hz")
 
 
 def set_offboard_mode(mav):
@@ -305,9 +310,61 @@ def main():
     parser.add_argument("--keepout", action="store_true",
                         help="Enable depth-derived obstacle-memory keep-out constraints "
                              "in the MPC (not used upstream).")
+    parser.add_argument("--att-lookahead-s", type=float, default=None,
+                        help="How far ahead [s] to sample the MPC attitude setpoint "
+                             "streamed to PX4. Default = control period (1/control_hz); "
+                             "the legacy behaviour is 0.1 (the MPC stage-1 node), which "
+                             "over-anticipates and drives the attitude limit cycle.")
+    parser.add_argument("--q-att", type=float, default=None,
+                        help="MPC attitude tracking weight (Q_attitude). Upstream "
+                             "mpc_params.yaml uses 200; the port defaults to 50. Sets "
+                             "AGILE_MPC_Q_ATT before the acados solver is built.")
+    parser.add_argument("--r", type=float, default=None,
+                        help="MPC input weight R = diag([thrust, wx, wy, wz]). Port "
+                             "defaults to 0.1; upstream mpc_params.yaml uses 1.0. Higher "
+                             "R relative to Q makes control smoother/less aggressive. Sets "
+                             "AGILE_MPC_R before the acados solver is built.")
+    parser.add_argument("--t-min", type=float, default=None,
+                        help="MPC min collective thrust [m/s^2] (mass-normalized). "
+                             "Upstream mpc_params.yaml = 5.0 (~0.5 g), now the port "
+                             "default; the legacy port used 1.0. Sets AGILE_MPC_T_MIN.")
+    parser.add_argument("--t-max", type=float, default=None,
+                        help="MPC max collective thrust [m/s^2] (mass-normalized). "
+                             "Upstream mpc_params.yaml = 20.0 (~2 g), now the port "
+                             "default; the legacy port used 40.0. Wider bands let the MPC "
+                             "plan more extreme attitudes. Sets AGILE_MPC_T_MAX.")
+    parser.add_argument("--max-bodyrate-xy", type=float, default=None,
+                        help="MPC max roll/pitch rate [rad/s]. Upstream = 6.0 (default). "
+                             "Sets AGILE_MPC_MAX_BODYRATE_XY.")
+    parser.add_argument("--max-bodyrate-z", type=float, default=None,
+                        help="MPC max yaw rate [rad/s]. Upstream = 2.0 (default). "
+                             "Sets AGILE_MPC_MAX_BODYRATE_Z.")
+    parser.add_argument("--control-hz", type=float, default=CONTROL_HZ,
+                        help=f"Rate [Hz] of the MPC solve + SET_ATTITUDE_TARGET loop "
+                             f"(default {CONTROL_HZ:.0f}). Higher rates make the attitude "
+                             f"setpoint more achievable and reduce the limit cycle; the net "
+                             f"still runs near {NET_HZ:.0f} Hz (net_every scales with it).")
+    parser.add_argument("--stream-hz", type=float, default=STREAM_HZ,
+                        help=f"Rate [Hz] to request PX4 stream state (default {STREAM_HZ:.0f}). "
+                             f"Automatically raised to at least --control-hz so no MPC solve "
+                             f"runs on stale state.")
     parser.add_argument("--no-debug-viz", action="store_true",
                         help="Disable UDP debug frames for sim overhead trajectory viz.")
     args = parser.parse_args()
+
+    # Must be set BEFORE AgilePolicy builds the acados MPC (make_solver reads it).
+    if args.q_att is not None:
+        os.environ["AGILE_MPC_Q_ATT"] = str(args.q_att)
+    if args.r is not None:
+        os.environ["AGILE_MPC_R"] = str(args.r)
+    if args.t_min is not None:
+        os.environ["AGILE_MPC_T_MIN"] = str(args.t_min)
+    if args.t_max is not None:
+        os.environ["AGILE_MPC_T_MAX"] = str(args.t_max)
+    if args.max_bodyrate_xy is not None:
+        os.environ["AGILE_MPC_MAX_BODYRATE_XY"] = str(args.max_bodyrate_xy)
+    if args.max_bodyrate_z is not None:
+        os.environ["AGILE_MPC_MAX_BODYRATE_Z"] = str(args.max_bodyrate_z)
 
     goal_xy = np.array(args.goal) if args.goal is not None else None
 
@@ -320,7 +377,16 @@ def main():
     print(f"Connecting to {args.connect} ...")
     mav = mavutil.mavlink_connection(args.connect)
     wait_for_heartbeat(mav)
-    request_stream_rates(mav)
+
+    # Control rate: the loop resolves the MPC and streams SET_ATTITUDE_TARGET at
+    # this rate. Upstream agile_autonomy closes the low level loop far faster than
+    # the 30 Hz stage-1 node, so a higher rate here (with att_lookahead_s = control
+    # period) keeps the attitude setpoint achievable and kills the limit cycle. The
+    # net still runs at ~NET_HZ (net_every scales with the control rate).
+    control_hz = float(args.control_hz)
+    # Stream state at least as fast as we control so no MPC solve sees stale state.
+    stream_hz = max(float(args.stream_hz), control_hz)
+    request_stream_rates(mav, stream_hz)
 
     state = DroneState()
     stop_event = threading.Event()
@@ -329,15 +395,21 @@ def main():
     recv_thread.start()
 
     hover_thrust = float(np.clip(G / MAX_ACCEL, 0.0, 1.0))
+    # Keep the expensive net forward pass near NET_HZ regardless of control rate.
+    net_every = max(1, round(control_hz / NET_HZ))
+    print(f"Control loop @ {control_hz:.0f} Hz, state stream @ {stream_hz:.0f} Hz, "
+          f"net every {net_every} ticks (~{control_hz / net_every:.0f} Hz).")
     policy = AgilePolicy(
         checkpoint_path=args.checkpoint,
         max_vel=args.max_vel,
         hover_thrust=hover_thrust,
-        control_hz=CONTROL_HZ,
+        control_hz=control_hz,
+        net_every=net_every,
         max_tilt_deg=args.max_tilt_deg,
         att_lp=args.att_lp,
         ref_lookahead_s=args.ref_lookahead_s,
         use_keepout=args.keepout,
+        att_lookahead_s=args.att_lookahead_s,
     )
     debug_pub = None if args.no_debug_viz else AgileDebugPublisher()
     if debug_pub is not None:
@@ -378,7 +450,7 @@ def main():
 
     policy.reset()
 
-    control_dt = 1.0 / CONTROL_HZ
+    control_dt = 1.0 / control_hz
     heartbeat_dt = 1.0 / HEARTBEAT_HZ
     last_heartbeat = time.time()
     start_time = time.time()
@@ -481,7 +553,7 @@ def main():
                             f"thrust={cmd.thrust_norm:.3f} mode={cmd.mode_idx} "
                             f"alphas={np.round(cmd.alphas, 3)} keepout={cmd.n_keepout}\n"
                             f"  msg rates: {rate_str} "
-                            f"(want {STREAM_HZ:.0f}; ~1 Hz position = stale-state limit cycle)\n"
+                            f"(want {stream_hz:.0f}; ~1 Hz position = stale-state limit cycle)\n"
                             f"  cur RPY(ENU)={np.round(cur_rpy, 1)} armed={state.armed} "
                             f"offboard={state.offboard}\n---"
                         )

@@ -290,10 +290,14 @@ class PegasusApp:
                  debug_frames: bool = True, log_traj: str = None,
                  goal_xyz: tuple = None, record_depth_video: str = None,
                  record_rgb_video: str = None,
-                 record_video_fps: float = 15.0, record_video_scale: int = 4):
+                 record_video_fps: float = 15.0, record_video_scale: int = 4,
+                 agile_overhead_debug_path: str = None,
+                 agile_depth_flip: str = "none"):
         self.SPAWN_YAW_DEG = spawn_yaw_deg
         self.auto_stop = auto_stop
         self.debug_frames = debug_frames
+        self.agile_overhead_debug_path = agile_overhead_debug_path
+        self._agile_depth_flip = agile_depth_flip
         self._record_video_scale = max(1, record_video_scale)
         self._depth_video = (Mp4Writer(record_depth_video, record_video_fps, "depth")
                              if record_depth_video else None)
@@ -437,6 +441,7 @@ class PegasusApp:
         self._agile_debug_sub = (AgileDebugSubscriber() if self.policy == "agile" else None)
         self._last_agile_depth = None
         self._dbg_n = 0           # frame counter for throttled debug dumps
+        self._agile_dbg_n = 0     # independent from generic depth debug frames
         self._dbg_every = 1       # save a debug PNG every N published frames
         self.stop_sim = False
         self._camera_ready_logged = False  # prints once when the depth camera becomes ready
@@ -910,6 +915,17 @@ class PegasusApp:
         if depth.shape != (AG_NET_SIZE, AG_NET_SIZE):
             depth = cv2.resize(depth, (AG_NET_SIZE, AG_NET_SIZE),
                                interpolation=cv2.INTER_LINEAR)
+        # Optional flip to match upstream agile_autonomy, whose depth callback does
+        # cv2.flip(depth, -1) (both axes; the sensor was mounted inverted). The net
+        # was trained on that convention. "both" == cv2.flip(-1); "v"/"h" isolate an
+        # axis for A/B testing left-right vs up-down misregistration.
+        if self._agile_depth_flip == "both":
+            depth = depth[::-1, ::-1]
+        elif self._agile_depth_flip == "v":
+            depth = depth[::-1, :]
+        elif self._agile_depth_flip == "h":
+            depth = depth[:, ::-1]
+        depth = np.ascontiguousarray(depth)
         self._last_agile_depth = depth
         self._depth_pub.send(depth, compress=True)
         self._dump_depth_debug(depth)
@@ -973,13 +989,14 @@ class PegasusApp:
         """Overhead XY map: obstacles, goal, drone, and PlaNet candidate trajectories.
 
         Trajectories arrive over UDP from agile_offboard (local ENU); depth inset
-        is the same 224x224 frame published to the policy. Writes agile_overhead_debug.png."""
-        if not self.debug_frames or self._agile_debug_sub is None:
+        is the same 224x224 frame published to the policy."""
+        if self.agile_overhead_debug_path is None or self._agile_debug_sub is None:
             return
         frame = self._agile_debug_sub.latest()
         if frame is None:
             return
-        if self._dbg_n % self._dbg_every != 0:
+        self._agile_dbg_n += 1
+        if self._agile_dbg_n % self._dbg_every != 0:
             return
         try:
             st = self.drone.state
@@ -1062,7 +1079,7 @@ class PegasusApp:
             ax.set_xlabel("East [m]")
             ax.set_ylabel("North [m]")
             ax.set_title(
-                f"agile overhead  frame={self._dbg_n}  trk={frame.tracker}  "
+                f"agile overhead  frame={self._agile_dbg_n}  trk={frame.tracker}  "
                 f"sel=mode{frame.mode_idx}  speed={speed:.1f}m/s\n"
                 f"alphas={np.round(frame.alphas, 3)}  "
                 f"(magenta=selected trajectory, wedge=depth FOV)"
@@ -1088,7 +1105,7 @@ class PegasusApp:
                 axd.set_ylabel("row (0=up)")
 
             fig.tight_layout()
-            fig.savefig("agile_overhead_debug.png", dpi=100)
+            fig.savefig(self.agile_overhead_debug_path, dpi=100)
             plt.close(fig)
         except Exception as e:
             carb.log_warn(f"agile overhead debug dump failed: {e}")
@@ -1321,6 +1338,17 @@ def main():
     parser.add_argument("--no-debug-frames", action="store_true",
                         help="Skip writing camera_debug.png and depth_debug.npy each frame "
                              "(matplotlib + disk I/O are a major sim bottleneck).")
+    parser.add_argument("--agile-overhead-debug", type=str, default=None,
+                        metavar="PATH",
+                        help="Agile policy only: write the overhead trajectory/depth debug "
+                             "PNG to PATH each sim frame. Can be used with --no-debug-frames "
+                             "to avoid the heavier camera_debug/depth_debug outputs.")
+    parser.add_argument("--agile-depth-flip", choices=["none", "both", "v", "h"],
+                        default="none",
+                        help="Agile policy only: flip the depth image before publishing. "
+                             "Upstream agile_autonomy does cv2.flip(depth, -1) == 'both' "
+                             "(the net was trained on inverted depth). 'v'/'h' isolate one "
+                             "axis to A/B test up-down vs left-right misregistration.")
     parser.add_argument("--record-depth-video", type=str, default=None, metavar="PATH",
                         help="Encode the EXACT depth fed to the policy to an MP4 (turbo "
                              "colormap, headless-safe). Used by compare/run_comparison.py "
@@ -1370,6 +1398,12 @@ def main():
         record_rgb_video=args.record_rgb_video,
         record_video_fps=args.record_video_fps,
         record_video_scale=args.record_video_scale,
+        agile_overhead_debug_path=(
+            args.agile_overhead_debug
+            if args.agile_overhead_debug is not None
+            else (None if args.no_debug_frames else "agile_overhead_debug.png")
+        ),
+        agile_depth_flip=args.agile_depth_flip,
     )
     pg_app.run()
 

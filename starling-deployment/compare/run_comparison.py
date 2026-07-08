@@ -90,6 +90,8 @@ VIDEO_SCALE = 4           # min upscale for the depth-grid frames
 PX4_MODEL = "none_iris"   # PX4 SITL vehicle model
 PX4_BOOT_TIMEOUT = 60.0   # seconds to wait for PX4 to reach a ready state
 SIM_GRACE = 30.0          # seconds for the sim to auto-stop after offboard ends
+# Live agile overhead debug PNG (refreshed every sim frame when --agile-debug-overhead).
+AGILE_DEBUG_OVERHEAD_LIVE = _DEPLOY / "agile_overhead_debug.png"
 
 # Scene-mesh clearance for USD environments (see extract_scene_mesh.py):
 # extracted once per (usd, env_scale, params) into MESH_CACHE_DIR and reused
@@ -109,17 +111,20 @@ SCENE_MESH_Z_BELOW = 20.0       # crop floor: this far under min(start_z, goal_z
 SCENE_MESH_Z_ABOVE = 50.0       # crop ceiling: this far over max(start_z, goal_z)
 
 DEFAULT_MAX_SPEED = 3.0
-DEFAULT_AGILE_MAX_SPEED = 7.0   # upstream agile_autonomy test_time_velocity
+# Agile cruise/MPC tuning validated 2026-07-08 (after fixing the net's de-yaw
+# bug in wrapper/agile_core.py): a faster control loop and heavier attitude
+# tracking than the acados-port defaults keep the streamed attitude setpoint
+# achievable and avoid the stale-state limit cycle (see agile-oscillation-fix
+# / agile-autonomy-integration memory notes for the full history).
+DEFAULT_AGILE_MAX_SPEED = 4.0
+AGILE_MAX_TILT_DEG = 30.0
+AGILE_CONTROL_HZ = 100.0
+AGILE_MPC_Q_ATT = 200.0
 
 
 def effective_agile_max_speed(args) -> float:
-    """Agile cruise cap passed to agile_offboard --max-vel.
-
-    --agile-max-speed wins when set. Otherwise --max-speed applies to agile too
-    when the user changes it from the default; with no speed flags agile stays at
-    the upstream 7 m/s default while other methods use DEFAULT_MAX_SPEED."""
-    if args.agile_max_speed is not None:
-        return float(args.agile_max_speed)
+    """Agile cruise cap passed to agile_offboard --max-vel: --max-speed when the
+    user changes it from the default, else the validated agile cruise speed."""
     if float(args.max_speed) != DEFAULT_MAX_SPEED:
         return float(args.max_speed)
     return DEFAULT_AGILE_MAX_SPEED
@@ -196,8 +201,13 @@ def method_registry():
             # agile --checkpoint is a TF2 checkpoint PREFIX (ckpt-50.index/.data-*
             # alongside; there is no `checkpoint` pointer file) -- never a plain file.
             checkpoint=_REPO / "checkpoints" / "AgileAutonomy" / "ckpt-50",
-            speed_args=lambda a: ["--max-vel", str(effective_agile_max_speed(a)),
-                                  "--max-tilt-deg", str(a.agile_max_tilt_deg)],
+            speed_args=lambda a: [
+                "--max-vel", str(effective_agile_max_speed(a)),
+                "--max-tilt-deg", str(AGILE_MAX_TILT_DEG),
+                "--att-lp", "1.0",
+                "--control-hz", str(AGILE_CONTROL_HZ),
+                "--q-att", str(AGILE_MPC_Q_ATT),
+            ],
         ),
     }
 
@@ -607,6 +617,8 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
                "--scale", str(scenario["scale"]),
                "--auto-stop", "--no-debug-frames",
                "--log-traj", str(npz_path)]
+    if method == "agile" and args.agile_debug_overhead:
+        sim_cmd += ["--agile-overhead-debug", str(AGILE_DEBUG_OVERHEAD_LIVE)]
     if args.headless:
         sim_cmd.append("--headless")
     if video_dir is not None:
@@ -679,6 +691,10 @@ def run_trial(method, cfg, args, scenario):
     print(f"\n=== {method}  {label}  goal={np.round(goal,2).tolist()} ===")
     print("  sim:      " + " ".join(sim_cmd))
     print("  offboard: " + " ".join(off_cmd))
+    if method == "agile" and args.agile_debug_overhead:
+        print(f"  [agile-debug] live overhead viz -> {AGILE_DEBUG_OVERHEAD_LIVE}")
+        print("  [agile-debug] open that PNG in your editor/image viewer and refresh "
+              "to watch trajectories + depth during the flight")
     if args.dry_run:
         return None
 
@@ -712,6 +728,11 @@ def run_trial(method, cfg, args, scenario):
         for p in (sim,):
             if p.poll() is None:
                 p.kill()
+
+    if method == "agile" and args.agile_debug_overhead and AGILE_DEBUG_OVERHEAD_LIVE.exists():
+        snap = trial_dir / "agile_overhead_debug.png"
+        shutil.copy2(AGILE_DEBUG_OVERHEAD_LIVE, snap)
+        print(f"  [agile-debug] saved snapshot -> {snap}")
 
     if not npz_path.exists():
         print(f"  [warn] no trajectory logged at {npz_path}; trial failed to run.")
@@ -926,11 +947,11 @@ def main():
                     help="Cruise speed for diffphys/diffaero/depthnav offboards, and "
                          "for agile when --agile-max-speed is not set (agile default "
                          "stays 7 m/s if this is left at 3 m/s).")
-    ap.add_argument("--agile-max-speed", type=float, default=None,
-                    help="Cruise speed for agile only (overrides --max-speed for "
-                         "agile; default 7 m/s upstream test_time_velocity).")
-    ap.add_argument("--agile-max-tilt-deg", type=float, default=30.0,
-                    help="Attitude tilt clamp [deg] passed to agile_offboard.py.")
+    ap.add_argument("--agile-debug-overhead", action="store_true",
+                    help="TEMPORARY: for agile trials only, enable the live overhead "
+                         "trajectory/depth debug PNG (refreshed every sim frame at "
+                         f"{AGILE_DEBUG_OVERHEAD_LIVE}; also copied into each trial dir "
+                         "on exit). Slower than --no-debug-frames.")
     ap.add_argument("--drone-radius", type=float, default=0.2,
                     help="Collision radius [m] for clearance scoring (also diffphys --margin).")
     ap.add_argument("--goal-radius", type=float, default=1.0,

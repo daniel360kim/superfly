@@ -113,7 +113,7 @@ class AgilePolicy:
                  hover_thrust: float = G / 20.0, control_hz: float = 30.0,
                  net_every: int = 2, max_tilt_deg: float = 90.0,
                  att_lp: float = 1.0, ref_lookahead_s: float = REF_LOOKAHEAD_S,
-                 use_keepout: bool = False):
+                 use_keepout: bool = False, att_lookahead_s: float | None = None):
         self.config = LoquercioModelConfig()
         print(f"[agile] loading PlaNet checkpoint from {checkpoint_path} ...", flush=True)
         self.net = TensorFlowLoquercioBackend(checkpoint_path, self.config)
@@ -130,6 +130,10 @@ class AgilePolicy:
         self.att_lp = float(att_lp)
         self.ref_lookahead_s = float(ref_lookahead_s)
         self.use_keepout = bool(use_keepout)
+        # Sample the MPC attitude at the control period by default (not the 0.1 s
+        # stage-1 node) so the setpoint doesn't over-anticipate at control_hz.
+        self.att_lookahead_s = (self.control_dt if att_lookahead_s is None
+                                else float(att_lookahead_s))
 
         # altitude-hold thrust PD + slow integrator. The I-term matters: the
         # nominal hover_thrust (g/20) is below the Iris's true hover point, and
@@ -196,9 +200,20 @@ class AgilePolicy:
         # rates, body-frame goal direction (ref_frame=bf, velocity_frame=bf).
         local_velocity = R_enu.T @ vel_enu
         local_goal = R_enu.T @ goal_dir_world
+        # De-yaw the rotation-matrix input. The checkpoint was trained on flights
+        # along world +x (near-zero yaw), and the net reads absolute yaw in R as
+        # an error to correct: feeding the raw matrix at yaw=90 deg curls an
+        # empty-scene straight-ahead plan ~50 deg LEFT (end wp y=+8.7 vs +0.8 at
+        # yaw 0, ckpt-50 ablation 2026-07-08) and drowns out obstacle avoidance.
+        # Body-frame velocity/rates/goal are yaw-invariant already; the plan is
+        # mapped back to world with the FULL R_enu in compute(), so only the net
+        # input is de-yawed (tilt is preserved).
+        yaw = math.atan2(R_enu[1, 0], R_enu[0, 0])
+        cz, sz = math.cos(-yaw), math.sin(-yaw)
+        R_deyaw = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]]) @ R_enu
         state = np.concatenate([
             np.asarray(pos_enu, np.float32),
-            np.asarray(R_enu, np.float32).reshape(-1),
+            np.asarray(R_deyaw, np.float32).reshape(-1),
             local_velocity, np.asarray(angular_body, np.float32),
             local_goal,
         ]).astype(np.float32)
@@ -319,7 +334,8 @@ class AgilePolicy:
             _u0, status, minfo = self.mpc.compute(
                 x0, world_points.astype(np.float64), self._cruise_alt, yaw_des,
                 dt_wp=WAYPOINT_DT, max_vel=self.max_vel,
-                obstacles_xy_r=keepout, alt_hold=True)
+                obstacles_xy_r=keepout, alt_hold=True,
+                att_lookahead_s=self.att_lookahead_s)
             if status in (0, 2):
                 attitude_q = np.asarray(minfo["q_pred"], dtype=np.float64)
                 if self.max_tilt_deg < 89.0:

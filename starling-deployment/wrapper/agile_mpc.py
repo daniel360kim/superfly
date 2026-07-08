@@ -24,6 +24,7 @@ after leaving the camera FOV.
 
 from __future__ import annotations
 
+import math
 import os
 import numpy as np
 import scipy.linalg
@@ -96,7 +97,11 @@ def make_solver(json_file, qp_solver='FULL_CONDENSING_QPOASES'):
     qpos = float(os.environ.get("AGILE_MPC_Q_POS", "100"))
     qatt = float(os.environ.get("AGILE_MPC_Q_ATT", "50"))
     Q = np.diag([qpos, qpos, qpos, qatt, qatt, qatt, qatt, 10., 10., 10.])
-    R = np.diag([0.1, 0.1, 0.1, 0.1])
+    # Input weight R = diag([thrust, wx, wy, wz]). Port default 0.1; upstream
+    # mpc_params.yaml uses R_thrust=R_pitchroll=R_yaw=1.0. Raising R relative to
+    # Q makes the solver smoother / less aggressive on attitude+thrust inputs.
+    rin = float(os.environ.get("AGILE_MPC_R", "0.1"))
+    R = np.diag([rin, rin, rin, rin])
     ocp.cost.cost_type = 'LINEAR_LS'
     ocp.cost.cost_type_e = 'LINEAR_LS'
     ocp.cost.W = scipy.linalg.block_diag(Q, R)
@@ -107,10 +112,18 @@ def make_solver(json_file, qp_solver='FULL_CONDENSING_QPOASES'):
     ocp.cost.yref = np.zeros(NY)
     ocp.cost.yref_e = np.zeros(NY_E)
 
-    # Input bounds from upstream mpc_params.yaml: max_bodyrate_xy=6, max_bodyrate_z=2.
+    # Input bounds from upstream mpc_params.yaml: max_bodyrate_xy=6, max_bodyrate_z=2,
+    # min_thrust=5, max_thrust=20 (mass-normalized, i.e. m/s^2: ~0.5 g .. 2 g about the
+    # g=9.81 hover). The port previously used a much wider [1, 40] thrust band, which lets
+    # the MPC plan near-zero / very high collective thrust and produce more extreme
+    # attitude solutions. Thrust bounds are env-overridable to A/B the old band.
+    t_min = float(os.environ.get("AGILE_MPC_T_MIN", "5.0"))
+    t_max = float(os.environ.get("AGILE_MPC_T_MAX", "20.0"))
+    wxy = float(os.environ.get("AGILE_MPC_MAX_BODYRATE_XY", "6.0"))
+    wz = float(os.environ.get("AGILE_MPC_MAX_BODYRATE_Z", "2.0"))
     ocp.constraints.idxbu = np.arange(NU)
-    ocp.constraints.lbu = np.array([1.0, -6.0, -6.0, -2.0])
-    ocp.constraints.ubu = np.array([40.0, 6.0, 6.0, 2.0])
+    ocp.constraints.lbu = np.array([t_min, -wxy, -wxy, -wz])
+    ocp.constraints.ubu = np.array([t_max, wxy, wxy, wz])
     x0 = np.zeros(NX); x0[3] = 1.0
     ocp.constraints.x0 = x0
 
@@ -301,11 +314,35 @@ class MPC:
         for i in range(N + 1):
             self.solver.set(i, 'p', params)
 
+    def _attitude_at(self, t_ahead):
+        """Predicted body->world attitude (wxyz) `t_ahead` seconds into the MPC
+        horizon, SLERP-interpolated between the discretization nodes (spaced DT).
+
+        Node 0's attitude is x0 (the CURRENT measured attitude), so sampling at
+        the control period (~1/control_hz) instead of a whole node (DT=0.1 s)
+        gives PX4 a setpoint just ahead of the current pose rather than the 0.1 s
+        prediction. Sending the 0.1 s-ahead node at a 30 Hz control rate is a
+        3-step over-anticipation that drives the attitude limit cycle."""
+        node = max(0.0, float(t_ahead)) / DT
+        i0 = int(math.floor(node))
+        if i0 >= N:
+            return np.asarray(self.solver.get(N, 'x')[3:7], dtype=np.float64)
+        q0 = np.asarray(self.solver.get(i0, 'x')[3:7], dtype=np.float64)
+        frac = node - i0
+        if frac <= 1e-6:
+            return q0
+        q1 = np.asarray(self.solver.get(i0 + 1, 'x')[3:7], dtype=np.float64)
+        return _slerp_wxyz(q0, q1, frac)
+
     def compute(self, x0, world_pts, cruise_alt, yaw_des, dt_wp=0.1, max_vel=7.0,
-                obstacles_xy_r=None, alt_hold=True):
+                obstacles_xy_r=None, alt_hold=True, att_lookahead_s=DT):
         """High-level: build the feasible flatness reference from the selected net
         trajectory (anchored at x0's position), set the obstacle-avoidance
-        constraints, and solve. Returns (u0, status, info)."""
+        constraints, and solve. Returns (u0, status, info).
+
+        att_lookahead_s: how far into the predicted horizon to sample the attitude
+        setpoint streamed to PX4 (default DT = the legacy stage-1 0.1 s node). Set
+        to the control period to stop over-anticipating at low control rates."""
         self._set_obstacles(obstacles_xy_r, x0[:2])
         # Anchor the reference quaternion to the CURRENT attitude hemisphere, else the
         # LINEAR_LS residual ||q - q_ref|| can blow up when q_ref lands on the opposite
@@ -322,13 +359,34 @@ class MPC:
         self._warmed = True
         for _ in range(n_iter):
             u0, status = self.solve(x0, yref_stages, yref_term)
-        # Feed PX4 the predicted NEXT attitude (stage 1, dt=0.1 s ahead) + thrust and
-        # let PX4's fast attitude loop track it (robust at a 30 Hz update; raw
-        # body-rate setpoints would need a faster outer loop).
-        q_pred = np.asarray(self.solver.get(1, 'x')[3:7], dtype=np.float64)  # wxyz, ENU body->world
+        # Feed PX4 the predicted attitude `att_lookahead_s` ahead + thrust and let
+        # PX4's fast attitude loop track it. Sampling at the control period (not the
+        # 0.1 s stage-1 node) avoids the over-anticipation limit cycle at 30 Hz.
+        q_pred = self._attitude_at(att_lookahead_s)  # wxyz, ENU body->world
         info = {"q_ref0": q0, "T_ref0": float(yref_stages[0][10]), "status": status,
                 "q_pred": q_pred, "u0": np.asarray(u0, dtype=np.float64)}
         return np.asarray(u0, dtype=np.float64), status, info
+
+
+def _slerp_wxyz(q0, q1, frac):
+    """Spherical linear interpolation between two wxyz quaternions (hemisphere
+    aligned). frac in [0,1]: 0 -> q0, 1 -> q1."""
+    q0 = np.asarray(q0, dtype=np.float64)
+    q1 = np.asarray(q1, dtype=np.float64)
+    q0 = q0 / (np.linalg.norm(q0) + 1e-12)
+    q1 = q1 / (np.linalg.norm(q1) + 1e-12)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:                      # take the shorter arc
+        q1 = -q1
+        d = -d
+    if d > 0.9995:                   # nearly parallel -> linear + renormalize
+        q = q0 + frac * (q1 - q0)
+        return q / (np.linalg.norm(q) + 1e-12)
+    theta0 = math.acos(d)
+    sin0 = math.sin(theta0)
+    s0 = math.sin((1.0 - frac) * theta0) / sin0
+    s1 = math.sin(frac * theta0) / sin0
+    return s0 * q0 + s1 * q1
 
 
 def state_x0(pos_enu, R_enu, vel_enu):
