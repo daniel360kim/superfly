@@ -1,0 +1,12 @@
+[
+    {
+        "name": "diffaero_planar_field",
+        "obstacles": "diffaero",
+        "seed": 0,
+        "scale": 3.0,
+        "goal": [3.0, 20.0, 2.0],
+        "start": [3.0, -5.0, 1.0],
+        "timeout": 90,
+        "climb_alt": 2
+    }
+]

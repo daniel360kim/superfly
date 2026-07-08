@@ -50,6 +50,7 @@ Velocity-command DiffAero policy (PX4 velocity loop, no depth for env=pc checkpo
 
 import argparse
 import math
+import subprocess
 import carb
 from isaacsim import SimulationApp
 
@@ -88,6 +89,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from depth_transport import DepthPublisher, RENDER_H, RENDER_W
+from agile_debug_transport import AgileDebugSubscriber
 from obstacle_field import generate as generate_field
 
 
@@ -169,6 +171,22 @@ DN_FOV_X_DEG = 89.0
 DN_CAM_ANGLE_DEG = 0.0                  # forward, no downward pitch
 DN_NEAR, DN_FAR = 0.25, 20.0
 
+# --- Agile Autonomy (Loquercio) camera params (wrapper/agile_core.py) ---
+# Matches uzh-rpg/agile_autonomy flightmare.yaml: 640x480, 91 deg horizontal
+# FOV, forward-facing (pitch 0), far 20 m. The offboard consumes RAW planar
+# Z-depth in metres (the net converts to mm/80 internally).
+#
+# RESOLUTION: the Loquercio net's MobileNet backbone takes a 224x224 input, and
+# the original training loader (planner_learning data_loader.decode_depth_cv2)
+# fed it VGA-class SGM depth (640x480) DOWNSAMPLED to 224 via cv2.resize
+# (bilinear). We reproduce that: render at AG_RENDER_W/H, then bilinear-resize
+# to AG_NET_SIZE (224) and ship THAT.
+AG_RENDER_W, AG_RENDER_H = 640, 480     # VGA native render (flightmare.yaml)
+AG_NET_SIZE = 224                       # net input; bilinear-downsampled, shipped
+AG_FOV_X_DEG = 91.0                     # flightmare.yaml camera.fov
+AG_CAM_ANGLE_DEG = 0.0                  # forward, no downward pitch
+AG_FAR = 20.0
+
 # --- RGB "drone_camera" used only for video logging (--record-rgb-video) ---
 # The policy depth cameras render at 64x36..128x72, far too small to watch, so
 # recording RGB gets its own camera at a watchable resolution. It is mounted at
@@ -233,10 +251,30 @@ class Mp4Writer:
             carb.log_warn(f"{self.label} video frame failed: {e}")
             self._failed = True
 
+    def _reencode_h264(self):
+        """OpenCV mp4v (MPEG-4 part 2) plays in QuickTime but not VS Code/Cursor
+        (Chromium needs H.264). Re-encode once at close; no-op if ffmpeg missing."""
+        if self._failed or not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        tmp = self.path.with_name(f"{self.path.stem}._h264{self.path.suffix}")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.path),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                 str(tmp)],
+                check=True,
+            )
+            tmp.replace(self.path)
+        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+            carb.log_warn(f"{self.label} video H.264 re-encode failed: {e}")
+            if tmp.exists():
+                tmp.unlink()
+
     def close(self):
         if self._writer is not None:
             self._writer.release()
             self._writer = None
+            self._reencode_h264()
             print(f"[record] saved {self.label} video -> {self.path}")
 
 
@@ -313,6 +351,7 @@ class PegasusApp:
         # distribution field is the default; --obstacles diffaero regenerates the
         # field to match DiffAero's training distribution (around the start->goal
         # line). --obstacles none skips procedural obstacles (use scene geometry only).
+        _SPAWN_DEFAULT = (0.0, 0.0, 1.0)
         if obstacles == "none":
             spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]), float(spawn_xyz[2])]
         elif obstacles == "diffaero":
@@ -320,12 +359,20 @@ class PegasusApp:
             self.field = generate_diffaero(seed=seed, scale=scale)
             print("[obstacle_field]", self.field.summary())
             self._spawn_obstacles(self.field)
-            spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
+            if tuple(spawn_xyz) != _SPAWN_DEFAULT:
+                spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]),
+                             float(spawn_xyz[2])]
+            else:
+                spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
         else:
             self.field = generate_field(seed=seed, scale=scale)
             print("[obstacle_field]", self.field.summary())
             self._spawn_obstacles(self.field)
-            spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
+            if tuple(spawn_xyz) != _SPAWN_DEFAULT:
+                spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]),
+                             float(spawn_xyz[2])]
+            else:
+                spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
 
         self._spawn_pos = spawn_pos  # kept for the trajectory npz 'start' field
 
@@ -340,6 +387,8 @@ class PegasusApp:
             self._setup_camera_diffaero()
         elif policy == "depthnav":
             self._setup_camera_depthnav()
+        elif policy == "agile":
+            self._setup_camera_agile()
         else:
             self._setup_camera_diffphys()
         config_multirotor.graphical_sensors = [self._camera]
@@ -385,6 +434,8 @@ class PegasusApp:
 
         self.world.reset()
         self._depth_pub = DepthPublisher()
+        self._agile_debug_sub = (AgileDebugSubscriber() if self.policy == "agile" else None)
+        self._last_agile_depth = None
         self._dbg_n = 0           # frame counter for throttled debug dumps
         self._dbg_every = 1       # save a debug PNG every N published frames
         self.stop_sim = False
@@ -466,6 +517,33 @@ class PegasusApp:
         self._camera.fy = self._camera.fx
         self._camera.cx = 0.5 * DN_RENDER_W
         self._camera.cy = 0.5 * DN_RENDER_H
+        self._camera._intrinsics = np.array([
+            [self._camera.fx, 0.0, self._camera.cx],
+            [0.0, self._camera.fy, self._camera.cy],
+            [0.0, 0.0, 1.0]])
+
+    def _setup_camera_agile(self):
+        """Forward-facing depth camera for Agile Autonomy (Loquercio).
+
+        VGA render (AG_RENDER_W x AG_RENDER_H) at 91 deg horizontal FOV
+        (flightmare.yaml), square pixels (fy == fx), no downward pitch, mounted at
+        body [0.1, 0, 0]. _publish_depth_agile bilinear-downsamples the RAW
+        planar Z-depth to 224x224 (matching Loquercio's training loader) and
+        ships that in metres; the offboard's wrapper/agile_core.py does the
+        mm/80 encoding. See the AG_* constants note for why we render high."""
+        self._camera = MonocularCamera("depth_cam", config={
+            "depth": True,
+            "position": np.array([0.10, 0.0, 0.0]),
+            "orientation": np.array([0.0, -AG_CAM_ANGLE_DEG, 180.0]),
+            "resolution": (AG_RENDER_W, AG_RENDER_H),  # VGA-class, downsampled to 224
+            "frequency": 30,
+            "intrinsics": None,
+        })
+        self._camera.fov = AG_FOV_X_DEG
+        self._camera.fx = 0.5 * AG_RENDER_W / math.tan(0.5 * math.radians(AG_FOV_X_DEG))
+        self._camera.fy = self._camera.fx
+        self._camera.cx = 0.5 * AG_RENDER_W
+        self._camera.cy = 0.5 * AG_RENDER_H
         self._camera._intrinsics = np.array([
             [self._camera.fx, 0.0, self._camera.cx],
             [0.0, self._camera.fy, self._camera.cy],
@@ -702,6 +780,8 @@ class PegasusApp:
             self._publish_depth_diffaero()
         elif self.policy == "depthnav":
             self._publish_depth_depthnav()
+        elif self.policy == "agile":
+            self._publish_depth_agile()
         else:
             self._publish_depth_diffphys()
 
@@ -799,6 +879,42 @@ class PegasusApp:
         self._dump_depth_debug(depth)
         self._record_depth_video_frame(depth)
 
+    def _publish_depth_agile(self):
+        """Publish the 224x224 RAW planar metric depth Agile Autonomy expects.
+
+        BILINEAR-downsample the VGA-class camera render (distance_to_image_plane)
+        to exactly (AG_NET_SIZE, AG_NET_SIZE) = 224 and send it in metres --
+        this reproduces Loquercio's training loader (cv2.resize of VGA SGM depth
+        to 224), rather than rendering at 84 and letting the net upsample. The
+        offboard's wrapper/agile_core.py does the mm/80 encoding, so NO
+        normalization/pooling here. The frame is shipped zlib-compressed
+        (compress=True) because a raw 224x224 float32 (200 KB) exceeds the UDP
+        datagram cap. Convention: row 0 = up, col 0 = left (as the other paths)."""
+        cam, full_set = self._camera_ready()
+        if cam is None or not full_set:
+            return
+        depth = cam.get_depth()
+        if depth is None:
+            return
+        depth = np.asarray(depth, dtype=np.float32)
+        if depth.size == 0:
+            return
+        # Replace inf / nan / no-return with the far value, then cap at AG_FAR
+        # BEFORE resizing -- the training loader did np.minimum(depth, 20000)
+        # ahead of cv2.resize, so far pixels don't bleed large values across an
+        # obstacle edge during interpolation.
+        depth = np.nan_to_num(depth, nan=AG_FAR, posinf=AG_FAR, neginf=AG_FAR)
+        depth = np.clip(depth, 0.0, AG_FAR)
+        # Bilinear downsample to the net's 224x224 input (matches training's
+        # cv2.resize; INTER_LINEAR is cv2.resize's default, what the loader used).
+        if depth.shape != (AG_NET_SIZE, AG_NET_SIZE):
+            depth = cv2.resize(depth, (AG_NET_SIZE, AG_NET_SIZE),
+                               interpolation=cv2.INTER_LINEAR)
+        self._last_agile_depth = depth
+        self._depth_pub.send(depth, compress=True)
+        self._dump_depth_debug(depth)
+        self._record_depth_video_frame(depth)
+
     def _dump_depth_debug(self, depth):
         """Save the EXACT published depth array + the drone's RGB view to
         camera_debug.png (+ depth .npy) every N frames. RGB comes from the SAME
@@ -825,7 +941,7 @@ class PegasusApp:
             ncols = 2 if rgb is not None else 1
             fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4.5), squeeze=False)
 
-            depth_vmax = DA_MAX_DIST if self.policy == "diffaero" else 24.0
+            depth_vmax = {"diffaero": DA_MAX_DIST, "agile": AG_FAR}.get(self.policy, 24.0)
             ax = axes[0][0]
             im = ax.imshow(depth, origin="upper", cmap="turbo", vmin=0.3, vmax=depth_vmax)
             fig.colorbar(im, ax=ax, label="range [m]" if self.policy == "diffaero" else "depth [m]")
@@ -844,6 +960,138 @@ class PegasusApp:
             plt.close(fig)
         except Exception as e:
             carb.log_warn(f"camera debug dump failed: {e}")
+
+    def _local_to_world(self, pts_local):
+        """PX4-local ENU (offboard) -> sim world ENU."""
+        origin = np.asarray(self._spawn_pos, dtype=np.float64).reshape(3)
+        pts = np.asarray(pts_local, dtype=np.float64)
+        if pts.ndim == 1:
+            return origin + pts.reshape(3)
+        return origin + pts
+
+    def _dump_agile_overhead_debug(self):
+        """Overhead XY map: obstacles, goal, drone, and PlaNet candidate trajectories.
+
+        Trajectories arrive over UDP from agile_offboard (local ENU); depth inset
+        is the same 224x224 frame published to the policy. Writes agile_overhead_debug.png."""
+        if not self.debug_frames or self._agile_debug_sub is None:
+            return
+        frame = self._agile_debug_sub.latest()
+        if frame is None:
+            return
+        if self._dbg_n % self._dbg_every != 0:
+            return
+        try:
+            st = self.drone.state
+            pos_w = np.asarray(st.position, dtype=np.float64).reshape(3)
+            vel_w = np.asarray(st.linear_velocity, dtype=np.float64).reshape(3)
+            # Pegasus State exposes position/velocity only (no orientation quaternion).
+            # Use the offboard-reported yaw for the camera FOV wedge; use velocity
+            # heading for the sim-GT arrow when moving.
+            yaw_policy = float(frame.yaw)
+            speed = float(np.linalg.norm(vel_w[:2]))
+            if speed > 0.2:
+                yaw_gt = math.atan2(float(vel_w[1]), float(vel_w[0]))
+            else:
+                yaw_gt = yaw_policy
+
+            fld = getattr(self, "field", None)
+            goal_w = None
+            if self._goal_xyz is not None:
+                g = np.asarray(self._goal_xyz, dtype=np.float64).reshape(-1)
+                if g.size == 2:
+                    g = np.append(g, self._spawn_pos[2])
+                goal_w = g
+            elif fld is not None and fld.p_target is not None:
+                goal_w = np.asarray(fld.p_target, dtype=np.float64).reshape(3)
+
+            ncols = 2 if self._last_agile_depth is not None else 1
+            fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 6.5), squeeze=False)
+            ax = axes[0][0]
+
+            if fld is not None:
+                for cx, cy, cz, r in getattr(fld, "spheres", []) or []:
+                    ax.add_patch(plt.Circle((cx, cy), r, color="#cc4444", alpha=0.35, lw=0))
+                for cx, cy, r in getattr(fld, "cyl_v", []) or []:
+                    ax.add_patch(plt.Circle((cx, cy), r, color="#cc4444", alpha=0.45, lw=0))
+                for box in getattr(fld, "boxes", []) or []:
+                    cx, cy = float(box[0]), float(box[1])
+                    hx, hy = float(box[3]), float(box[4])
+                    ax.add_patch(plt.Rectangle((cx - hx, cy - hy), 2 * hx, 2 * hy,
+                                               color="#cc4444", alpha=0.25, lw=0))
+
+            traj_w = self._local_to_world(frame.trajectories_local)
+            for i in range(traj_w.shape[0]):
+                xy = traj_w[i, :, :2]
+                is_sel = i == frame.mode_idx
+                ax.plot(xy[:, 0], xy[:, 1],
+                        color="#ff00ff" if is_sel else "#996699",
+                        lw=3.5 if is_sel else 1.5,
+                        alpha=1.0 if is_sel else 0.55,
+                        label=f"mode {i} a={frame.alphas[i]:.2f}" + (" *" if is_sel else ""))
+                ax.scatter(xy[0, 0], xy[0, 1], s=20,
+                           color="#ff00ff" if is_sel else "#996699", zorder=5)
+
+            fov_half = math.radians(AG_FOV_X_DEG * 0.5)
+            rng = 12.0
+            arc_x = [pos_w[0]]
+            arc_y = [pos_w[1]]
+            for a in np.linspace(yaw_policy - fov_half, yaw_policy + fov_half, 24):
+                arc_x.append(pos_w[0] + rng * math.cos(a))
+                arc_y.append(pos_w[1] + rng * math.sin(a))
+            arc_x.append(pos_w[0])
+            arc_y.append(pos_w[1])
+            ax.fill(arc_x, arc_y, color="#44aaff", alpha=0.12, lw=0)
+
+            ax.scatter(pos_w[0], pos_w[1], s=80, c="#2266ff", marker="o", zorder=6, label="drone (sim GT)")
+            hx = pos_w[0] + 3.0 * math.cos(yaw_gt)
+            hy = pos_w[1] + 3.0 * math.sin(yaw_gt)
+            ax.annotate("", xy=(hx, hy), xytext=(pos_w[0], pos_w[1]),
+                        arrowprops=dict(arrowstyle="-|>", color="#2266ff", lw=2.0))
+
+            pos_ob = self._local_to_world(frame.pos_local)
+            ax.scatter(pos_ob[0], pos_ob[1], s=40, facecolors="none", edgecolors="#000000",
+                       linewidths=1.2, zorder=6, label="drone (offboard)")
+
+            if goal_w is not None:
+                ax.scatter(goal_w[0], goal_w[1], s=120, marker="*", c="#22aa22", zorder=6, label="goal")
+
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(True, alpha=0.25)
+            ax.legend(loc="upper right", fontsize=8)
+            ax.set_xlabel("East [m]")
+            ax.set_ylabel("North [m]")
+            ax.set_title(
+                f"agile overhead  frame={self._dbg_n}  trk={frame.tracker}  "
+                f"sel=mode{frame.mode_idx}  speed={speed:.1f}m/s\n"
+                f"alphas={np.round(frame.alphas, 3)}  "
+                f"(magenta=selected trajectory, wedge=depth FOV)"
+            )
+            pts = [pos_w[:2]]
+            if goal_w is not None:
+                pts.append(goal_w[:2])
+            pts.extend(traj_w.reshape(-1, 3)[:, :2])
+            pts = np.asarray(pts, dtype=np.float64)
+            cx, cy = float(pos_w[0]), float(pos_w[1])
+            rad = max(15.0, float(np.max(np.linalg.norm(pts - pos_w[:2], axis=1)) + 5.0))
+            ax.set_xlim(cx - rad, cx + rad)
+            ax.set_ylim(cy - rad, cy + rad)
+
+            if ncols == 2:
+                axd = axes[0][1]
+                d = np.asarray(self._last_agile_depth, dtype=np.float32)
+                im = axd.imshow(d, origin="upper", cmap="turbo", vmin=0.3, vmax=AG_FAR)
+                fig.colorbar(im, ax=axd, fraction=0.046, label="depth [m]")
+                axd.set_title(f"policy depth ({d.shape[1]}x{d.shape[0]})\n"
+                              "obstacle should appear here")
+                axd.set_xlabel("col (0=left)")
+                axd.set_ylabel("row (0=up)")
+
+            fig.tight_layout()
+            fig.savefig("agile_overhead_debug.png", dpi=100)
+            plt.close(fig)
+        except Exception as e:
+            carb.log_warn(f"agile overhead debug dump failed: {e}")
 
     def _sim_time(self):
         """Clock used to pace the video recorders: Isaac's SIMULATED time, so
@@ -881,6 +1129,10 @@ class PegasusApp:
             return d, DA_MAX_DIST
         if self.policy == "depthnav":
             return np.clip(depth, DN_NEAR, DN_FAR), DN_FAR
+        if self.policy == "agile":
+            # The net consumes the raw 224x224 planar depth (mm/80 encoding is
+            # monotone in this grid), so this IS the policy's input view.
+            return np.clip(depth, 0.0, AG_FAR), AG_FAR
         d = np.clip(depth, 0.3, 24.0)
         d = d.reshape(RENDER_H // 4, 4, RENDER_W // 4, 4).min(axis=(1, 3))
         return d, 24.0
@@ -989,6 +1241,8 @@ class PegasusApp:
             while simulation_app.is_running() and not self.stop_sim:
                 self.world.step(render=True)
                 self._publish_depth()
+                if self.policy == "agile":
+                    self._dump_agile_overhead_debug()
                 self._record_rgb_video_frame()
                 if self._traj is not None:
                     self._log_pose(time.time() - t0)
@@ -1037,15 +1291,20 @@ def main():
                         help="World scale (corridor depth ~= 8*scale m)")
     parser.add_argument("--spawn", type=float, nargs=3, default=(0.0, 0.0, 1.0),
                         metavar=("X", "Y", "Z"),
-                        help="Drone spawn position (ENU metres) when --obstacles none.")
+                        help="Drone spawn position (ENU metres). Required for "
+                             "--obstacles none; optional override for procedural "
+                             "fields (diffphys/diffaero) when not the default "
+                             "(0,0,1).")
     parser.add_argument("--spawn-yaw", type=float, default=0.0,
                         help="Spawn yaw [deg]. EKF heading is mag-locked in sim, so this "
                              "mainly affects the initial facing; the field is rotated instead.")
-    parser.add_argument("--policy", choices=["diffphys", "diffaero", "depthnav"], default="diffphys",
+    parser.add_argument("--policy", choices=["diffphys", "diffaero", "depthnav", "agile"],
+                        default="diffphys",
                         help="Which policy's camera/depth pipeline to configure: "
                              "diffphys (12x16, 78.6 deg, 24 m, planar, pitched 20 deg down), "
-                             "diffaero (9x16, 86 deg, 5 m, Euclidean, forward), or "
-                             "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward).")
+                             "diffaero (9x16, 86 deg, 5 m, Euclidean, forward), "
+                             "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward), or "
+                             "agile (640x480 render -> 224x224, 91 deg, 20 m, planar, forward).")
     parser.add_argument("--obstacles", choices=["diffphys", "diffaero", "none"], default="diffphys",
                         help="Obstacle-field distribution: diffphys, diffaero, or none "
                              "(scene geometry only, no procedural primitives).")

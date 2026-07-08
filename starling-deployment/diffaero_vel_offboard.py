@@ -14,8 +14,10 @@ the policy's world-frame velocity setpoint straight to PX4's velocity loop.
     with env=pc (no depth); env=oa checkpoints also consume 9x16 perception.
   * Action (action_frame=local): world-frame velocity setpoint
     vel_cmd = Rz @ scaled_action, sent to PX4 as NED (vx, vy, vz).
-  * Yaw: derived from velocity EMA (align_yaw_with_vel_ema), published via the
-    yaw field of SET_POSITION_TARGET_LOCAL_NED.
+  * Yaw: rate-limited slew toward velocity EMA (matches training); held below
+    yaw_hold_speed. Pre-policy YAW phase still faces the goal once.
+  * Altitude: planar policies output horizontal velocity only; a light altitude
+    PID supplies vz while holding --climb-alt.
 
 Usage:
     # Against PX4 SITL (after running run_px4_sim.py --policy diffaero):
@@ -51,7 +53,17 @@ DA_INTRINSICS = Intrinsics(
 CONTROL_HZ = 30.0
 HEARTBEAT_HZ = 2.0
 OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
+POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
 PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
+
+
+def _mark_policy_phase(event: str):
+    """Append '<event> <ts>' to POLICY_PHASE_FILE; never let it kill the loop."""
+    try:
+        with open(POLICY_PHASE_FILE, "a") as f:
+            f.write(f"{event} {time.time()}\n")
+    except Exception:
+        pass
 
 _rot_ENU_to_NED = Rotation.from_quat([0.70711, 0.70711, 0.0, 0.0])
 _rot_FLU_to_FRD = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])
@@ -205,6 +217,21 @@ def enu_vel_to_ned(vel_enu: np.ndarray) -> tuple[float, float, float]:
     return float(vel_enu[1]), float(vel_enu[0]), float(-vel_enu[2])
 
 
+def altitude_vz_ned(
+    cruise_alt: float,
+    pos_enu: np.ndarray,
+    vel_enu: np.ndarray,
+    kp: float = 2.0,
+    kd: float = 1.0,
+    max_vz: float = 1.5,
+) -> float:
+    """NED vz command to hold cruise_alt (planar policies do not command z)."""
+    alt_err = cruise_alt - float(pos_enu[2])
+    vz_meas_ned = -float(vel_enu[2])
+    vz_cmd = -kp * alt_err - kd * vz_meas_ned
+    return float(np.clip(vz_cmd, -max_vz, max_vz))
+
+
 def send_land_command(mav):
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
@@ -330,8 +357,8 @@ def main():
     print("Loading policy (setpoints streaming in background) ...")
     from wrapper.diffaero_vel_core import DiffAeroVelPolicy
     policy = DiffAeroVelPolicy(**policy_kwargs)
-    max_vel_xy = float(policy.max_action[0, 0].cpu())
-    max_vel_z = float(policy.max_action[0, 2].cpu())
+    max_vel_xy = policy.max_vel_xy
+    max_vel_z = policy.max_vel_z
 
     print("Setting OFFBOARD mode...")
     set_offboard_mode(mav)
@@ -362,7 +389,14 @@ def main():
 
     phase = "CLIMB"
     landing_sent = False
+    yaw_ned_cmd = yaw_ned
     print(f"CLIMB: velocity climb to {args.climb_alt:.1f} m at {args.climb_rate:.1f} m/s ...")
+    if policy.planar:
+        print(
+            f"Planar policy: horizontal velocity from actor, altitude PID + "
+            f"rate-limited yaw (max {policy.max_yaw_rate_deg:.0f} deg/s).",
+            flush=True,
+        )
 
     try:
         while True:
@@ -418,6 +452,8 @@ def main():
                     )
                     if abs(math.degrees(yaw_err)) < args.yaw_tol_deg and state.offboard:
                         phase = "POLICY"
+                        yaw_ned_cmd = yaw_cur_ned
+                        _mark_policy_phase("start")
                         print(f"\n>>> HANDOFF to velocity policy, "
                               f"yaw={math.degrees(yaw_cur_ned):.1f} deg <<<\n")
                     if verbose:
@@ -432,10 +468,19 @@ def main():
                         depth_planar=depth_range,
                     )
                     cmd = policy.compute(obs)
-                    vx_n, vy_e, vz_d = enu_vel_to_ned(cmd.vel_cmd_enu)
-                    send_velocity_target_ned(mav, vx_n, vy_e, vz_d, cmd.yaw_ned)
+                    vx_n, vy_e, _ = enu_vel_to_ned(cmd.vel_cmd_enu)
+                    if policy.planar:
+                        vz_d = altitude_vz_ned(
+                            args.climb_alt, pos, vel, max_vz=max_vel_z,
+                        )
+                    else:
+                        _, _, vz_d = enu_vel_to_ned(cmd.vel_cmd_enu)
+                    yaw_ned_cmd = policy.slew_yaw_ned_cmd(yaw_ned_cmd, control_dt)
+                    yaw_out = yaw_ned_cmd
+                    send_velocity_target_ned(mav, vx_n, vy_e, vz_d, yaw_out)
                     if np.linalg.norm(goal_enu - pos) < 0.5:
                         phase = "LANDING"
+                        _mark_policy_phase("end")
                         print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
                     if verbose:
                         print(
@@ -445,7 +490,8 @@ def main():
                             f"  goal(ENU)    = {np.round(goal_enu, 2)}\n"
                             f"  vel_cmd(ENU) = {np.round(cmd.vel_cmd_enu, 2)}  "
                             f"|v|={cmd.vel_norm:.2f}\n"
-                            f"  yaw_ned(deg) = {math.degrees(cmd.yaw_ned):.1f}\n"
+                            f"  vz_ned       = {vz_d:.2f}\n"
+                            f"  yaw_ned(deg) = {math.degrees(yaw_out):.1f}\n"
                             f"  offboard={state.offboard}  armed={state.armed}\n"
                             "---"
                         )
