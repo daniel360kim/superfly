@@ -90,8 +90,6 @@ VIDEO_SCALE = 4           # min upscale for the depth-grid frames
 PX4_MODEL = "none_iris"   # PX4 SITL vehicle model
 PX4_BOOT_TIMEOUT = 60.0   # seconds to wait for PX4 to reach a ready state
 SIM_GRACE = 30.0          # seconds for the sim to auto-stop after offboard ends
-# Live agile overhead debug PNG (refreshed every sim frame when --agile-debug-overhead).
-AGILE_DEBUG_OVERHEAD_LIVE = _DEPLOY / "agile_overhead_debug.png"
 
 # Scene-mesh clearance for USD environments (see extract_scene_mesh.py):
 # extracted once per (usd, env_scale, params) into MESH_CACHE_DIR and reused
@@ -617,8 +615,6 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
                "--scale", str(scenario["scale"]),
                "--auto-stop", "--no-debug-frames",
                "--log-traj", str(npz_path)]
-    if method == "agile" and args.agile_debug_overhead:
-        sim_cmd += ["--agile-overhead-debug", str(AGILE_DEBUG_OVERHEAD_LIVE)]
     if args.headless:
         sim_cmd.append("--headless")
     if video_dir is not None:
@@ -691,10 +687,6 @@ def run_trial(method, cfg, args, scenario):
     print(f"\n=== {method}  {label}  goal={np.round(goal,2).tolist()} ===")
     print("  sim:      " + " ".join(sim_cmd))
     print("  offboard: " + " ".join(off_cmd))
-    if method == "agile" and args.agile_debug_overhead:
-        print(f"  [agile-debug] live overhead viz -> {AGILE_DEBUG_OVERHEAD_LIVE}")
-        print("  [agile-debug] open that PNG in your editor/image viewer and refresh "
-              "to watch trajectories + depth during the flight")
     if args.dry_run:
         return None
 
@@ -728,11 +720,6 @@ def run_trial(method, cfg, args, scenario):
         for p in (sim,):
             if p.poll() is None:
                 p.kill()
-
-    if method == "agile" and args.agile_debug_overhead and AGILE_DEBUG_OVERHEAD_LIVE.exists():
-        snap = trial_dir / "agile_overhead_debug.png"
-        shutil.copy2(AGILE_DEBUG_OVERHEAD_LIVE, snap)
-        print(f"  [agile-debug] saved snapshot -> {snap}")
 
     if not npz_path.exists():
         print(f"  [warn] no trajectory logged at {npz_path}; trial failed to run.")
@@ -945,13 +932,10 @@ def main():
                          "elevated spawns). Override per scenario with \"climb_alt\".")
     ap.add_argument("--max-speed", type=float, default=DEFAULT_MAX_SPEED,
                     help="Cruise speed for diffphys/diffaero/depthnav offboards, and "
-                         "for agile when --agile-max-speed is not set (agile default "
-                         "stays 7 m/s if this is left at 3 m/s).")
-    ap.add_argument("--agile-debug-overhead", action="store_true",
-                    help="TEMPORARY: for agile trials only, enable the live overhead "
-                         "trajectory/depth debug PNG (refreshed every sim frame at "
-                         f"{AGILE_DEBUG_OVERHEAD_LIVE}; also copied into each trial dir "
-                         "on exit). Slower than --no-debug-frames.")
+                         f"for agile too if set (agile defaults to "
+                         f"{DEFAULT_AGILE_MAX_SPEED:.0f} m/s if this is left at "
+                         f"{DEFAULT_MAX_SPEED:.0f} m/s). diffaero_vel_planar ignores "
+                         "this (fixed at 1.5 m/s).")
     ap.add_argument("--drone-radius", type=float, default=0.2,
                     help="Collision radius [m] for clearance scoring (also diffphys --margin).")
     ap.add_argument("--goal-radius", type=float, default=1.0,
