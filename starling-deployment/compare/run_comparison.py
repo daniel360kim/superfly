@@ -537,7 +537,8 @@ def rescore_clearance(results_dir, sim_python):
         hp = r.get("hyperparams", {})
         rescored = metrics.score_trajectory(
             str(npz), drone_radius=hp.get("drone_radius", 0.2),
-            goal_radius=hp.get("goal_radius", 1.0), scene_mesh=str(mesh))
+            goal_radius=hp.get("goal_radius", 1.0), scene_mesh=str(mesh),
+            climb_alt=hp.get("climb_alt", metrics.DEFAULT_CLIMB_ALT))
         r.update(rescored)
         r["scene_mesh"] = str(mesh)
         r["success"] = (bool(r.get("reached")) or bool(r.get("policy_reported_reached"))) \
@@ -736,7 +737,10 @@ def run_trial(method, cfg, args, scenario):
                                        args.sim_python)
         res = metrics.score_trajectory(str(npz_path), drone_radius=args.drone_radius,
                                        goal_radius=args.goal_radius,
-                                       scene_mesh=str(scene_mesh) if scene_mesh else None)
+                                       scene_mesh=str(scene_mesh) if scene_mesh else None,
+                                       climb_alt=(scenario["climb_alt"]
+                                                  if scenario["climb_alt"] is not None
+                                                  else args.climb_alt))
         if scene_mesh is not None:
             res["scene_mesh"] = str(scene_mesh)
     # The offboard hands off to LANDING only once inside its own goal threshold,

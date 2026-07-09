@@ -200,6 +200,13 @@ RGB_W, RGB_H = 640, 360
 # Ctrl-C, which races Isaac's SIGINT teardown (see run()).
 OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
 
+# Phase sentinel the offboard scripts append to ("start <unix_ts>" at the
+# climb/yaw -> policy handoff, "end <unix_ts>" at policy -> landing). Read at
+# trajectory-save time so the .npz carries the policy window and metrics.py
+# can clip clearance/speed to the policy flight exactly. Must match
+# POLICY_PHASE_FILE in the offboard scripts / compare/run_comparison.py.
+POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+
 
 class Mp4Writer:
     """cv2 MP4 writer paced by an external clock (headless-safe), lazily opened
@@ -312,6 +319,7 @@ class PegasusApp:
         self.log_traj = log_traj
         self._goal_xyz = goal_xyz  # explicit goal override for npz (None = use field p_target)
         self._traj = [] if log_traj else None
+        self._traj_sim = [] if log_traj else None   # per-pose SIM time (see _log_pose)
         self._autostop_n = 0
         if self.auto_stop:
             # Clear any stale sentinel from a previous run so we don't stop
@@ -1202,12 +1210,19 @@ class PegasusApp:
     def _log_pose(self, t):
         """Append (t, pos_enu(3), vel_enu(3)) from the drone's ground-truth state.
         Pegasus Vehicle.state is refreshed every physics step (ENU position +
-        ENU linear_velocity); never let a logging hiccup kill the sim loop."""
+        ENU linear_velocity); never let a logging hiccup kill the sim loop.
+
+        t is WALL-clock (needed to map the offboard's phase-file unix
+        timestamps to log indices); SIMULATED time is captured alongside into
+        _traj_sim because durations must be scored in sim time -- the render
+        loop runs slower than realtime (headless RTX), so wall-clock durations
+        overstate flight times while the logged velocities are sim-frame m/s."""
         try:
             st = self.drone.state
             p = np.asarray(st.position, dtype=np.float64)
             v = np.asarray(st.linear_velocity, dtype=np.float64)
             self._traj.append((t, p[0], p[1], p[2], v[0], v[1], v[2]))
+            self._traj_sim.append(self._sim_time())
         except Exception as e:
             carb.log_warn(f"trajectory log failed: {e}")
 
@@ -1221,6 +1236,20 @@ class PegasusApp:
             out = self.log_traj
             traj = np.asarray(self._traj, dtype=np.float64)
             data = dict(traj=traj, policy=self.policy, seed=self._seed)
+            if self._traj_sim and len(self._traj_sim) == traj.shape[0]:
+                data["t_sim"] = np.asarray(self._traj_sim, dtype=np.float64)
+            # Wall-clock zero of the traj timestamps + the offboard's policy
+            # phase handoffs (same machine clock), so metrics.py can clip
+            # clearance/speed to the policy flight exactly.
+            if getattr(self, "_t0", None) is not None:
+                data["t_unix0"] = float(self._t0)
+                try:
+                    for line in Path(POLICY_PHASE_FILE).read_text().splitlines():
+                        parts = line.split()
+                        if len(parts) == 2 and parts[0] in ("start", "end"):
+                            data[f"policy_{parts[0]}_unix"] = float(parts[1])
+                except (FileNotFoundError, ValueError):
+                    pass
             fld = getattr(self, "field", None)
             if fld is not None:
                 data["spheres"] = (np.asarray(fld.spheres, dtype=np.float64).reshape(-1, 4)
@@ -1247,6 +1276,7 @@ class PegasusApp:
 
     def run(self):
         t0 = time.time()
+        self._t0 = t0   # wall-clock zero of the trajectory log timestamps
         print(f"[capture] SIM START wall_clock={time.strftime('%H:%M:%S', time.localtime(t0))}"
               f".{int(t0 % 1 * 1000):03d} -- start your screen recording now")
         if self.auto_stop:
@@ -1254,8 +1284,15 @@ class PegasusApp:
                   "automatically once the offboard script exits (landed, "
                   "Ctrl-C, or crash), no manual Ctrl-C needed.")
         self.timeline.play()
+        exit_reason = "unknown"
         try:
-            while simulation_app.is_running() and not self.stop_sim:
+            while True:
+                if not simulation_app.is_running():
+                    exit_reason = "simulation_app.is_running() went False"
+                    break
+                if self.stop_sim:
+                    exit_reason = "stop_sim (auto-stop done-file)"
+                    break
                 self.world.step(render=True)
                 self._publish_depth()
                 if self.policy == "agile":
@@ -1271,7 +1308,14 @@ class PegasusApp:
                         print("[auto-stop] offboard process finished -- "
                               "stopping sim loop normally.")
                         self.stop_sim = True
+        except BaseException as e:
+            exit_reason = f"exception {type(e).__name__}: {e}"
+            raise
         finally:
+            # carb.log_warn: Python prints are lost in Kit's fast shutdown,
+            # carb messages reach the console reliably.
+            carb.log_warn(f"sim loop exit after {time.time() - t0:.1f}s: {exit_reason}; "
+                          f"done_file={Path(OFFBOARD_DONE_FILE).exists()}")
             if self._traj is not None:
                 self._save_trajectory()
             self._close_videos()
