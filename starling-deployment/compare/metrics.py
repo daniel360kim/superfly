@@ -7,13 +7,16 @@ the analytic obstacle field and goal/start (see run_px4_sim._save_trajectory).
 This module scores that run on the three metric families the comparison harness
 reports -- all pure NumPy, no Isaac/torch, so it runs anywhere and is unit-testable:
 
-  - success rate     : reached the goal (within goal_radius) AND never collided
+  - success rate     : reached the goal (within goal_radius HORIZONTALLY, in XY
+                       -- altitude is not scored, see score_trajectory's reached
+                       comment) AND never collided
   - collision/clear  : collided (clearance < 0 at any tick) + minimum clearance,
                        clearance = (distance from drone centre to nearest obstacle
                        surface) - drone_radius, via per-shape signed-distance fns
   - time & speed     : time-to-goal (POLICY flight only: policy handoff ->
-                       first goal hit, excluding the scripted takeoff/climb/yaw
-                       and the post-goal landing), mean and peak speed.
+                       horizontal arrival over the goal, excluding the scripted
+                       takeoff/climb/yaw AND the terminal descent/landing that a
+                       2D-goal policy flies after arriving), mean and peak speed.
                        All durations are in SIMULATED seconds (matching the
                        recorded videos and the sim-frame velocities), taken
                        from the npz's per-pose t_sim or reconstructed from
@@ -351,32 +354,51 @@ def score_trajectory(npz_path, drone_radius=0.2, goal_radius=1.0, scene_mesh=Non
                            if p_end is not None else None)
     res["policy_window_source"] = p_src if p_start is not None else None
 
-    # --- goal reached + time-to-goal (policy handoff -> first sample inside
-    # radius); computed before collision scoring because the scene-mesh
-    # clearance segment ends at the first goal hit ---
+    # --- goal reached + time-to-goal, both scored HORIZONTALLY (in XY);
+    # computed before collision scoring because the scene-mesh clearance
+    # segment ends at the first (3D) goal hit ---
     first_hit = None
     if "goal" in z:
         goal = np.asarray(z["goal"], float).reshape(3)
-        dist_goal = np.linalg.norm(P - goal[None, :], axis=1)
+        dist_goal = np.linalg.norm(P - goal[None, :], axis=1)         # 3D (diagnostic)
+        dist_xy = np.linalg.norm(P[:, :2] - goal[None, :2], axis=1)   # horizontal
         res["min_dist_to_goal_m"] = float(np.min(dist_goal))
-        hit = np.where(dist_goal <= goal_radius)[0]
-        if hit.size and tko is not None:
-            first_hit = int(hit[0])
+        res["min_dist_to_goal_xy_m"] = float(np.min(dist_xy))
+        # "reached" = arrived HORIZONTALLY over the goal (within goal_radius in
+        # XY); altitude is deliberately NOT part of the test. The 2D-goal
+        # policies (agile, diffaero: --goal is XY-only) cruise at climb altitude
+        # and only their post-arrival landing descent controls Z, so a 3D check
+        # would grade the offboard's landing rather than the policy's navigation
+        # (and left agile at the 1.0 m boundary). 3D policies (depthnav,
+        # diffphys) arrive at goal altitude anyway, so this only changes the
+        # marginal cases. The 3D closest approach is still reported
+        # (min_dist_to_goal_m) as a diagnostic.
+        xy_hit_all = np.where(dist_xy <= goal_radius)[0]
+        hit3d = np.where(dist_goal <= goal_radius)[0]
+        # 3D-sphere entry still drives the scene-mesh clearance segment and the
+        # speed window (the productive flight ends at goal contact); None when
+        # the drone arrived over the goal but never within goal_radius in 3D.
+        first_hit = int(hit3d[0]) if hit3d.size else None
+        if xy_hit_all.size and tko is not None:
             res["reached"] = True
-            # time-to-goal measures the POLICY flight ONLY: from the climb/yaw
-            # -> policy handoff to the first goal hit. This excludes the
-            # scripted pre-policy takeoff/climb/yaw (which starts at tko, ~5-8 s
-            # earlier and varies with climb height) and -- ending at goal
-            # contact -- the post-goal landing descent, so it reports how long
-            # the policy itself flew. Falls back to takeoff only when the policy
-            # handoff couldn't be located (p_start is None).
+            # time-to-goal measures the POLICY flight ONLY, bounded at BOTH ends:
+            #   start = the climb/yaw -> policy handoff (p_start), excluding the
+            #     scripted takeoff/climb/yaw (begins at tko, ~5-8 s earlier);
+            #   end   = HORIZONTAL arrival over the goal (first XY hit after the
+            #     handoff) -- NOT the 3D-sphere entry, which 2D-goal policies
+            #     only reach after a multi-second terminal landing DESCENT that
+            #     is not policy flight (it inflated time-to-goal by ~4-5 s).
+            # Falls back to takeoff for the start when the handoff is unknown.
             seg_start = p_start if p_start is not None else tko
-            res["time_to_goal_s"] = float(t[first_hit] - t[seg_start])
+            xy_hit = np.where(dist_xy[seg_start:] <= goal_radius)[0]
+            goal_end = (seg_start + int(xy_hit[0])) if xy_hit.size else seg_start
+            res["time_to_goal_s"] = float(t[goal_end] - t[seg_start])
         else:
-            res["reached"] = bool(hit.size)  # reached-without-moving can't happen
+            res["reached"] = bool(xy_hit_all.size)  # reached-without-moving can't happen
             res["time_to_goal_s"] = None
     else:
         res["min_dist_to_goal_m"] = None
+        res["min_dist_to_goal_xy_m"] = None
         res["reached"] = None
         res["time_to_goal_s"] = None
 
