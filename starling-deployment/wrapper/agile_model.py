@@ -8,7 +8,8 @@ is a faithful copy -- any behavioural deviation from SAFE is called out with a
 "DEVIATION:" comment (there are none in this file; the known SAFE bugs are in
 its reference/tracking layer, fixed in agile_mpc.py / agile_core.py).
 
-The network maps (depth image sequence, 21-dim IMU-style state) -> `modes`
+The network maps (depth image sequence or frozen CL4Nav RGB features, plus a
+21-dim IMU-style state) -> `modes`
 candidate local trajectories, each `1 (alpha cost) + 3*out_seq_len` numbers:
 out_seq_len waypoints at a fixed 0.1 s spacing in the CAMERA/BODY frame.
 Checkpoints are TF2 object checkpoints saved as a PREFIX (ckpt-50.index +
@@ -39,6 +40,8 @@ class LoquercioModelConfig:
     use_attitude: bool = True
     use_bodyrates: bool = True
     freeze_backbone: bool = False
+    visual_input: str = "mobilenet"
+    visual_feature_dim: int = 128
 
     @property
     def raw_state_dim(self) -> int:
@@ -48,15 +51,18 @@ class LoquercioModelConfig:
     def output_dim_per_mode(self) -> int:
         return 1 + self.state_dim * self.out_seq_len
 
+    @property
+    def uses_cl4nav(self) -> bool:
+        return self.visual_input == "cl4nav_frozen"
+
 
 def _tf():
     try:
         import tensorflow as tf
     except ImportError as exc:
         raise RuntimeError(
-            "TensorFlow is required for the agile method. Run this under "
-            "starling-deployment/agile_python.sh (the agile venv at "
-            "starling-deployment/.venv)."
+            "TensorFlow is required for the Agile methods. Run this through "
+            "starling-deployment/agile_python.sh (tf_gpu by default)."
         ) from exc
     return tf
 
@@ -96,16 +102,17 @@ class PlaNet:
                 input_size = (config.img_height, config.img_width, channels)
 
                 if config.use_rgb or config.use_depth:
-                    self.backbone = [
-                        tf.keras.applications.MobileNet(
-                            include_top=False,
-                            weights=None,
-                            input_shape=input_size,
-                            pooling=None,
-                        )
-                    ]
-                    self.backbone[0].trainable = not config.freeze_backbone
-                    self.resize_op = [tf.keras.layers.Conv1D(128, 1, padding='valid')]
+                    if not config.uses_cl4nav:
+                        self.backbone = [
+                            tf.keras.applications.MobileNet(
+                                include_top=False,
+                                weights=None,
+                                input_shape=input_size,
+                                pooling=None,
+                            )
+                        ]
+                        self.backbone[0].trainable = not config.freeze_backbone
+                        self.resize_op = [tf.keras.layers.Conv1D(128, 1, padding='valid')]
                     self.img_mergenet = [
                         tf.keras.layers.Conv1D(128, 2, padding='same'),
                         tf.keras.layers.LeakyReLU(alpha=1e-2),
@@ -178,7 +185,10 @@ class PlaNet:
                     fn_output_signature=tf.float32,
                 )
                 img_fts = tf.transpose(img_fts, (1, 0, 2))
-                x = img_fts
+                return self._merge_visual_features(img_fts)
+
+            def _merge_visual_features(self, visual_features):
+                x = visual_features
                 for layer in self.img_mergenet:
                     x = layer(x)
                 x = tf.transpose(x, (0, 2, 1))
@@ -202,6 +212,12 @@ class PlaNet:
                 return x
 
             def _preprocess_frames(self, inputs):
+                if config.uses_cl4nav:
+                    visual_features = tf.ensure_shape(
+                        inputs['visual_features'],
+                        [None, config.seq_len, config.visual_feature_dim],
+                    )
+                    return self._merge_visual_features(visual_features)
                 if config.use_rgb and config.use_depth:
                     img_seq = tf.concat((inputs['rgb'], inputs['depth']), axis=-1)
                 elif config.use_rgb:
@@ -323,17 +339,58 @@ def _restore_keras3_checkpoint(tf, model, checkpoint_prefix: str) -> int:
     return assigned
 
 
-class TensorFlowLoquercioBackend:
-    """Loads the agile_autonomy PlaNet checkpoint and runs depth+IMU inference."""
+def _restore_optimizer_backed_checkpoint(tf, model, checkpoint_prefix: str) -> int:
+    """Restore CL4Nav checkpoints saved by Keras optimizer variable order."""
+    indexed = []
+    for name, shape in tf.train.list_variables(checkpoint_prefix):
+        match = re.fullmatch(
+            r"optimizer/_trainable_variables/(\d+)/\.ATTRIBUTES/VARIABLE_VALUE", name)
+        if match:
+            indexed.append((int(match.group(1)), name, tuple(shape)))
+    indexed.sort()
+    weights = list(model.trainable_weights)
+    if len(indexed) != len(weights):
+        raise ValueError(
+            f"CL4Nav checkpoint has {len(indexed)} trainable tensors, but the "
+            f"PlaNet head has {len(weights)}")
+    for expected_index, ((index, key, shape), weight) in enumerate(zip(indexed, weights)):
+        if index != expected_index:
+            raise ValueError(f"CL4Nav checkpoint trainable-variable index gap at {index}")
+        if shape != tuple(weight.shape):
+            raise ValueError(
+                f"CL4Nav checkpoint shape mismatch at tensor {index} ({key}): "
+                f"{shape} != {tuple(weight.shape)} for {weight.path}")
+    for (_, key, _), weight in zip(indexed, weights):
+        weight.assign(tf.train.load_variable(checkpoint_prefix, key))
+    return len(weights)
 
-    def __init__(self, checkpoint_path: str, config: LoquercioModelConfig):
+
+class TensorFlowLoquercioBackend:
+    """Loads PlaNet and runs depth+IMU or CL4Nav-RGB+IMU inference."""
+
+    def __init__(self, checkpoint_path: str, config: LoquercioModelConfig,
+                 cl4nav_onnx_path: str | None = None,
+                 cl4nav_provider: str = "CUDAExecutionProvider"):
         self.tf = _tf()
         self.config = config
+        self.visual_encoder = None
+        if config.uses_cl4nav:
+            if not cl4nav_onnx_path:
+                raise ValueError("cl4nav_onnx_path is required for CL4Nav RGB inference")
+            from wrapper.cl4nav_encoder import FrozenCL4NavEncoder
+            self.visual_encoder = FrozenCL4NavEncoder(
+                cl4nav_onnx_path, tf=self.tf,
+                feature_dim=config.visual_feature_dim,
+                execution_provider=cl4nav_provider)
         self.network = create_network(config)
         self._warm_start_network()
         checkpoint_prefix = resolve_checkpoint_prefix(checkpoint_path)
-        keras_major = int(str(self.tf.keras.__version__).split(".", 1)[0])
-        if keras_major >= 3:
+        variable_names = [name for name, _ in self.tf.train.list_variables(checkpoint_prefix)]
+        if any(name.startswith("optimizer/_trainable_variables/") for name in variable_names):
+            self.loaded_weight_count = _restore_optimizer_backed_checkpoint(
+                self.tf, self.network.model, checkpoint_prefix
+            )
+        elif int(str(self.tf.keras.__version__).split(".", 1)[0]) >= 3:
             self.loaded_weight_count = _restore_keras3_checkpoint(
                 self.tf, self.network.model, checkpoint_prefix
             )
@@ -347,25 +404,31 @@ class TensorFlowLoquercioBackend:
 
     def _warm_start_network(self) -> None:
         inputs = {
-            'depth': np.zeros(
-                (1, self.config.seq_len, self.config.img_height, self.config.img_width, 3),
-                dtype=np.float32,
-            ),
             'imu': np.zeros(
                 (1, self.config.seq_len, self.config.raw_state_dim),
                 dtype=np.float32,
             ),
         }
+        if self.config.uses_cl4nav:
+            inputs['visual_features'] = np.zeros(
+                (1, self.config.seq_len, self.config.visual_feature_dim), dtype=np.float32
+            )
+        else:
+            inputs['depth'] = np.zeros(
+                (1, self.config.seq_len, self.config.img_height, self.config.img_width, 3),
+                dtype=np.float32,
+            )
         _ = self.network(inputs)
 
-    def infer(self, depth: np.ndarray, imu: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def infer(self, visual: np.ndarray, imu: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Returns (alphas, trajectories) with modes sorted ascending by |alpha|
         (index 0 = the network's lowest-cost prediction); trajectories is
         (modes, 3*out_seq_len) in the camera/body frame."""
-        inputs = {
-            'depth': depth.astype(np.float32, copy=False),
-            'imu': imu.astype(np.float32, copy=False),
-        }
+        inputs = {'imu': imu.astype(np.float32, copy=False)}
+        if self.config.uses_cl4nav:
+            inputs['visual_features'] = self.visual_encoder(visual)
+        else:
+            inputs['depth'] = visual.astype(np.float32, copy=False)
         pred = self.network(inputs).numpy()
         pred = pred[:, np.abs(pred[0, :, 0]).argsort(), :]
         alphas = np.abs(pred[0, :, 0])

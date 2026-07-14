@@ -16,6 +16,9 @@ starling-deployment/compare/results/
 # Sim / camera debug artifacts (regenerated each run)
 starling-deployment/camera_debug.png
 starling-deployment/depth_debug.npy
+starling-deployment/rgb_debug.npy
+starling-deployment/.superfly_offboard_done
+starling-deployment/.superfly_policy_phase
 starling-deployment/*.mp4
 
 # Editor / OS

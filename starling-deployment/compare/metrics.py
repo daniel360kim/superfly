@@ -249,7 +249,10 @@ def takeoff_index(t, speed):
             search_from = j
             break
         i = j
-    sustained = np.convolve(moving[search_from:].astype(int),
+    search_tail = moving[search_from:].astype(int)
+    if search_tail.size < TAKEOFF_HOLD_N:
+        return None
+    sustained = np.convolve(search_tail,
                             np.ones(TAKEOFF_HOLD_N, dtype=int), "valid") == TAKEOFF_HOLD_N
     if not sustained.any():
         return None

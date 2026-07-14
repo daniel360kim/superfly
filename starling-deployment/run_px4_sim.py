@@ -89,6 +89,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from depth_transport import DepthPublisher, RENDER_H, RENDER_W
+from rgb_transport import RGBPublisher
 from agile_debug_transport import AgileDebugSubscriber
 from obstacle_field import generate as generate_field
 
@@ -173,8 +174,9 @@ DN_NEAR, DN_FAR = 0.25, 20.0
 
 # --- Agile Autonomy (Loquercio) camera params (wrapper/agile_core.py) ---
 # Matches uzh-rpg/agile_autonomy flightmare.yaml: 640x480, 91 deg horizontal
-# FOV, forward-facing (pitch 0), far 20 m. The offboard consumes RAW planar
-# Z-depth in metres (the net converts to mm/80 internally).
+# FOV, forward-facing (pitch 0), far 20 m. For RGB, match Flightmare's published
+# left-camera body translation [0, baseline, 0.1] with baseline=0.1 m. The
+# original Superfly depth adapter retains its prior [0.1, 0, 0] mount.
 #
 # RESOLUTION: the Loquercio net's MobileNet backbone takes a 224x224 input, and
 # the original training loader (planner_learning data_loader.decode_depth_cv2)
@@ -194,18 +196,25 @@ AG_FAR = 20.0
 # depth camera, so the RGB video shows the same viewpoint the policy sees.
 RGB_W, RGB_H = 640, 360
 
+# PegasusInterface.load_environment() only schedules its async loader and
+# returns immediately. A standalone app can therefore reset the World and
+# create render products while remote USD dependencies are still loading. In
+# particular, RTX may try to upload Box.usd's DomeLight HDR before its HTTPS
+# stream is ready and permanently fall back to an untextured sky for that run.
+ASSET_LOAD_TIMEOUT_S = 120.0
+
 # Sentinel file diffaero_offboard.py / diffdrone_offboard.py touch on exit
 # (any reason: landed, Ctrl-C, crash). --auto-stop polls for it so this script
 # can stop through its own normal loop exit instead of needing a manual
 # Ctrl-C, which races Isaac's SIGINT teardown (see run()).
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
+OFFBOARD_DONE_FILE = str(Path(__file__).resolve().parent / ".superfly_offboard_done")
 
 # Phase sentinel the offboard scripts append to ("start <unix_ts>" at the
 # climb/yaw -> policy handoff, "end <unix_ts>" at policy -> landing). Read at
 # trajectory-save time so the .npz carries the policy window and metrics.py
 # can clip clearance/speed to the policy flight exactly. Must match
 # POLICY_PHASE_FILE in the offboard scripts / compare/run_comparison.py.
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+POLICY_PHASE_FILE = str(Path(__file__).resolve().parent / ".superfly_policy_phase")
 
 
 class Mp4Writer:
@@ -222,6 +231,9 @@ class Mp4Writer:
 
     def __init__(self, path, fps, label):
         self.path = Path(path)
+        self._recording_path = self.path.with_name(
+            f"{self.path.stem}._recording{self.path.suffix}"
+        )
         self.fps = fps
         self.label = label
         self._writer = None
@@ -236,11 +248,16 @@ class Mp4Writer:
         try:
             if self._writer is None:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._recording_path.unlink(missing_ok=True)
                 h, w = frame_bgr.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                self._writer = cv2.VideoWriter(str(self.path), fourcc, self.fps, (w, h))
+                self._writer = cv2.VideoWriter(
+                    str(self._recording_path), fourcc, self.fps, (w, h)
+                )
                 if not self._writer.isOpened():
-                    raise RuntimeError(f"cv2.VideoWriter failed to open {self.path}")
+                    raise RuntimeError(
+                        f"cv2.VideoWriter failed to open {self._recording_path}"
+                    )
                 print(f"[record] {self.label} video -> {self.path} "
                       f"({w}x{h} @ {self.fps:.0f} fps)")
                 self._t0 = t
@@ -261,17 +278,19 @@ class Mp4Writer:
     def _reencode_h264(self):
         """OpenCV mp4v (MPEG-4 part 2) plays in QuickTime but not VS Code/Cursor
         (Chromium needs H.264). Re-encode once at close; no-op if ffmpeg missing."""
-        if self._failed or not self.path.exists() or self.path.stat().st_size == 0:
+        source = self._recording_path
+        if self._failed or not source.exists() or source.stat().st_size == 0:
             return
         tmp = self.path.with_name(f"{self.path.stem}._h264{self.path.suffix}")
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.path),
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(source),
                  "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                  str(tmp)],
                 check=True,
             )
             tmp.replace(self.path)
+            source.unlink(missing_ok=True)
         except (FileNotFoundError, subprocess.CalledProcessError) as e:
             carb.log_warn(f"{self.label} video H.264 re-encode failed: {e}")
             if tmp.exists():
@@ -349,6 +368,7 @@ class PegasusApp:
                 from pxr import UsdGeom, Gf
                 prim = self.world.stage.GetPrimAtPath("/World/layout")
                 UsdGeom.XformCommonAPI(prim).SetScale(Gf.Vec3f(env_scale, env_scale, env_scale))
+            self._wait_for_stage_assets(usd_environment)
             print(f"[environment] loaded USD stage {usd_environment} (scale={env_scale})")
             # Custom USD stages typically carry no lighting, so the scene renders
             # black. Spawn a sun + ambient sky so it (and the depth camera) can see.
@@ -357,7 +377,17 @@ class PegasusApp:
             # the ground/trees. Add static triangle-mesh colliders to the geometry.
             self._add_colliders()
         else:
-            self.pg.load_environment(SIMULATION_ENVIRONMENTS[environment])
+            # Do not use PegasusInterface.load_environment() here. It wraps
+            # load_environment_async() in ensure_future() and returns before
+            # /World/layout exists, which races the World reset/camera creation
+            # below. Referencing the same official asset synchronously keeps
+            # the pristine Pegasus USD while making its dependency ordering
+            # deterministic in this standalone app.
+            environment_asset = SIMULATION_ENVIRONMENTS[environment]
+            self.pg.load_asset(environment_asset, "/World/layout")
+            self._wait_for_stage_assets(environment_asset)
+            print(f"[environment] loaded Pegasus scene {environment!r}: "
+                  f"{environment_asset}")
 
         # Spawn the obstacle field (analytic primitives). The DiffPhysDrone-
         # distribution field is the default; --obstacles diffaero regenerates the
@@ -399,7 +429,7 @@ class PegasusApp:
             self._setup_camera_diffaero()
         elif policy == "depthnav":
             self._setup_camera_depthnav()
-        elif policy == "agile":
+        elif policy in ("agile", "agile_rgb"):
             self._setup_camera_agile()
         else:
             self._setup_camera_diffphys()
@@ -410,7 +440,7 @@ class PegasusApp:
         # resolution. Only created when recording (an extra render product
         # costs real frame time).
         self._rgb_camera = None
-        if self._rgb_video is not None:
+        if self._rgb_video is not None and self.policy != "agile_rgb":
             self._rgb_camera = MonocularCamera("drone_camera", config={
                 "depth": False,
                 "position": np.array(self._camera._position),
@@ -445,14 +475,51 @@ class PegasusApp:
         )
 
         self.world.reset()
-        self._depth_pub = DepthPublisher()
-        self._agile_debug_sub = (AgileDebugSubscriber() if self.policy == "agile" else None)
+        self._depth_pub = None if self.policy == "agile_rgb" else DepthPublisher()
+        self._rgb_pub = RGBPublisher() if self.policy == "agile_rgb" else None
+        self._rgb_frame_attached = False
+        self._agile_debug_sub = (
+            AgileDebugSubscriber() if self.policy in ("agile", "agile_rgb") else None)
         self._last_agile_depth = None
+        self._last_agile_rgb = None
         self._dbg_n = 0           # frame counter for throttled debug dumps
         self._agile_dbg_n = 0     # independent from generic depth debug frames
         self._dbg_every = 1       # save a debug PNG every N published frames
         self.stop_sim = False
         self._camera_ready_logged = False  # prints once when the depth camera becomes ready
+
+    def _wait_for_stage_assets(self, source: str,
+                               timeout_s: float = ASSET_LOAD_TIMEOUT_S):
+        """Drain USD dependency loading before physics and render setup.
+
+        AddReference() composes the root layer synchronously, but referenced
+        layers, materials, and remote textures can still be discovered during
+        subsequent Kit updates. Require several idle updates so a transient
+        zero observed before discovery cannot release initialization early.
+        """
+        import omni.usd
+
+        layout = self.world.stage.GetPrimAtPath("/World/layout")
+        if not layout or not layout.IsValid():
+            raise RuntimeError(
+                f"Environment {source!r} did not create a valid /World/layout prim")
+
+        context = omni.usd.get_context()
+        deadline = time.monotonic() + float(timeout_s)
+        idle_updates = 0
+        peak_pending = 0
+        while idle_updates < 3:
+            simulation_app.update()
+            _, _, pending = context.get_stage_loading_status()
+            pending = int(pending)
+            peak_pending = max(peak_pending, pending)
+            idle_updates = idle_updates + 1 if pending == 0 else 0
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out after {timeout_s:.0f}s loading environment assets "
+                    f"from {source!r} ({pending} file(s) still pending)")
+        print(f"[environment] assets ready for {source} "
+              f"(peak pending={peak_pending})")
 
     def _setup_camera_diffphys(self):
         """Forward-facing depth camera pitched CAM_ANGLE_DEG down (DiffPhysDrone).
@@ -539,14 +606,17 @@ class PegasusApp:
         """Forward-facing depth camera for Agile Autonomy (Loquercio).
 
         VGA render (AG_RENDER_W x AG_RENDER_H) at 91 deg horizontal FOV
-        (flightmare.yaml), square pixels (fy == fx), no downward pitch, mounted at
-        body [0.1, 0, 0]. _publish_depth_agile bilinear-downsamples the RAW
-        planar Z-depth to 224x224 (matching Loquercio's training loader) and
-        ships that in metres; the offboard's wrapper/agile_core.py does the
-        mm/80 encoding. See the AG_* constants note for why we render high."""
-        self._camera = MonocularCamera("depth_cam", config={
-            "depth": True,
-            "position": np.array([0.10, 0.0, 0.0]),
+        (flightmare.yaml), square pixels (fy == fx), and no downward pitch.
+        agile_rgb uses Flightmare's published left-camera body translation
+        [0, 0.1, 0.1]; the original depth adapter retains its prior mount.
+        _publish_depth_agile bilinear-downsamples planar depth to 224x224 and
+        wrapper/agile_core.py applies the mm/80 encoding."""
+        is_rgb = self.policy == "agile_rgb"
+        camera_name = "rgb_cam" if is_rgb else "depth_cam"
+        camera_position = np.array([0.0, 0.10, 0.10] if is_rgb else [0.10, 0.0, 0.0])
+        self._camera = MonocularCamera(camera_name, config={
+            "depth": not is_rgb,
+            "position": camera_position,
             "orientation": np.array([0.0, -AG_CAM_ANGLE_DEG, 180.0]),
             "resolution": (AG_RENDER_W, AG_RENDER_H),  # VGA-class, downsampled to 224
             "frequency": 30,
@@ -789,7 +859,9 @@ class PegasusApp:
         )
 
     def _publish_depth(self):
-        if self.policy == "diffaero":
+        if self.policy == "agile_rgb":
+            self._publish_rgb_agile()
+        elif self.policy == "diffaero":
             self._publish_depth_diffaero()
         elif self.policy == "depthnav":
             self._publish_depth_depthnav()
@@ -808,7 +880,8 @@ class PegasusApp:
         if full_set and not self._camera_ready_logged:
             self._camera_ready_logged = True
             t = time.time()
-            print(f"[capture] depth camera ready at wall_clock="
+            sensor = "RGB" if self.policy == "agile_rgb" else "depth"
+            print(f"[capture] {sensor} camera ready at wall_clock="
                   f"{time.strftime('%H:%M:%S', time.localtime(t))}.{int(t % 1 * 1000):03d}")
         return cam, full_set
 
@@ -938,6 +1011,59 @@ class PegasusApp:
         self._depth_pub.send(depth, compress=True)
         self._dump_depth_debug(depth)
         self._record_depth_video_frame(depth)
+
+    def _publish_rgb_agile(self):
+        """Publish the exact RGB preprocessing used by CL4Nav Agile training.
+
+        Isaac renders VGA RGB at the original Agile camera pose/FOV. OpenCV
+        bilinear-resizes uint8 RGB to 224x224, matching data_loader.decode_img_cv2,
+        then rgb_transport sends it losslessly (fragmented zlib).
+        """
+        cam, full_set = self._camera_ready()
+        if cam is None or not full_set:
+            return
+        if not self._rgb_frame_attached:
+            try:
+                cam.add_rgb_to_frame()
+                self._rgb_frame_attached = True
+            except Exception as exc:
+                carb.log_warn(f"RGB camera annotator attach failed: {exc}")
+                return
+        try:
+            rgb = cam.get_rgb()
+        except Exception as exc:
+            carb.log_warn(f"RGB camera read failed: {exc}")
+            return
+        if rgb is None:
+            return
+        rgb = np.asarray(rgb)
+        if rgb.size == 0 or rgb.ndim != 3 or rgb.shape[2] < 3:
+            return
+        rgb = rgb[..., :3]
+        if rgb.dtype != np.uint8:
+            rgb = np.nan_to_num(rgb.astype(np.float32), nan=0.0, posinf=255.0, neginf=0.0)
+            if rgb.size and float(rgb.max()) <= 1.0:
+                rgb *= 255.0
+            rgb = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+        if rgb.shape[:2] != (AG_NET_SIZE, AG_NET_SIZE):
+            rgb = cv2.resize(rgb, (AG_NET_SIZE, AG_NET_SIZE), interpolation=cv2.INTER_LINEAR)
+        rgb = np.ascontiguousarray(rgb)
+        self._last_agile_rgb = rgb
+        self._rgb_pub.send(rgb)
+        self._dump_rgb_debug(rgb)
+        self._record_rgb_array(rgb)
+
+    def _dump_rgb_debug(self, rgb):
+        if not self.debug_frames:
+            return
+        self._dbg_n += 1
+        if self._dbg_n % self._dbg_every != 0:
+            return
+        try:
+            np.save("rgb_debug.npy", rgb)
+            cv2.imwrite("camera_debug.png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        except Exception as exc:
+            carb.log_warn(f"RGB camera debug dump failed: {exc}")
 
     def _dump_depth_debug(self, depth):
         """Save the EXACT published depth array + the drone's RGB view to
@@ -1183,6 +1309,26 @@ class PegasusApp:
         except Exception as e:
             carb.log_warn(f"depth video frame failed: {e}")
 
+    def _record_rgb_array(self, rgb):
+        """Record an already prepared RGB policy frame without another camera.
+
+        The transport/model still consume ``rgb`` at its native resolution.
+        Upscaling happens only on the BGR copy handed to the video writer.
+        """
+        if self._rgb_video is None:
+            return
+        try:
+            frame = cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+            scale = self._record_video_scale
+            if scale > 1:
+                h, w = frame.shape[:2]
+                frame = cv2.resize(
+                    frame, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST
+                )
+            self._rgb_video.write(frame, self._sim_time())
+        except Exception as exc:
+            carb.log_warn(f"rgb video frame failed: {exc}")
+
     def _record_rgb_video_frame(self):
         """Append one frame from the RGB drone_camera to --record-rgb-video."""
         if self._rgb_video is None or self._rgb_camera is None:
@@ -1295,7 +1441,7 @@ class PegasusApp:
                     break
                 self.world.step(render=True)
                 self._publish_depth()
-                if self.policy == "agile":
+                if self.policy in ("agile", "agile_rgb"):
                     self._dump_agile_overhead_debug()
                 self._record_rgb_video_frame()
                 if self._traj is not None:
@@ -1336,7 +1482,7 @@ def main():
                               "/ depth_debug.npy to inspect the drone's view instead.")
     parser.add_argument("--environment", type=str, default="Box Room",
                         help="Pegasus/Isaac Sim background scene (key in SIMULATION_ENVIRONMENTS). "
-                             "Examples: 'Box Room', 'Warehouse', 'Hospital'. Ignored when "
+                             "Examples: Box Room, Warehouse, Hospital. Ignored when "
                              "--usd-environment is set.")
     parser.add_argument("--usd-environment", type=str, default=None,
                         help="Path or omniverse:// URL of a USD stage to load as the background "
@@ -1359,13 +1505,14 @@ def main():
     parser.add_argument("--spawn-yaw", type=float, default=0.0,
                         help="Spawn yaw [deg]. EKF heading is mag-locked in sim, so this "
                              "mainly affects the initial facing; the field is rotated instead.")
-    parser.add_argument("--policy", choices=["diffphys", "diffaero", "depthnav", "agile"],
+    parser.add_argument("--policy", choices=["diffphys", "diffaero", "depthnav", "agile", "agile_rgb"],
                         default="diffphys",
                         help="Which policy's camera/depth pipeline to configure: "
                              "diffphys (12x16, 78.6 deg, 24 m, planar, pitched 20 deg down), "
                              "diffaero (9x16, 86 deg, 5 m, Euclidean, forward), "
                              "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward), or "
-                             "agile (640x480 render -> 224x224, 91 deg, 20 m, planar, forward).")
+                             "agile (depth) or agile_rgb (CL4Nav RGB), both 640x480 "
+                             "render -> 224x224 at 91 deg, forward-facing.")
     parser.add_argument("--obstacles", choices=["diffphys", "diffaero", "none"], default="diffphys",
                         help="Obstacle-field distribution: diffphys, diffaero, or none "
                              "(scene geometry only, no procedural primitives).")

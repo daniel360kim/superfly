@@ -68,13 +68,13 @@ G = 9.80665
 # Sentinel file this script touches on exit (any reason) so run_px4_sim.py
 # --auto-stop can detect "the offboard process ended" and exit its own loop
 # normally, instead of relying on a manual Ctrl-C.
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
+OFFBOARD_DONE_FILE = str(Path(__file__).resolve().parent / ".superfly_offboard_done")
 
 # Phase sentinel for compare/run_comparison.py: "start <ts>" is written the
 # moment control hands off to the POLICY phase and "end <ts>" is appended when
 # it hands off to LANDING, so the harness's --timeout can budget the policy
 # flight only (not arming/climb/landing). Harness deletes it before each trial.
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+POLICY_PHASE_FILE = str(Path(__file__).resolve().parent / ".superfly_policy_phase")
 
 
 def _mark_policy_phase(event: str):

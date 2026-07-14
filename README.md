@@ -1,6 +1,6 @@
-# superfly — comparing DiffPhysDrone, DiffAero & DepthNav in one environment
+# superfly — comparing learned drone policies in one environment
 
-Three learned depth-based drone-navigation methods, trained in their own
+Learned depth- and RGB-based drone-navigation methods, trained in their own
 simulators, flown through the **same Isaac-Sim + PX4-SITL obstacle course** and
 scored on the **same metrics** so they can be compared head-to-head.
 
@@ -9,8 +9,10 @@ scored on the **same metrics** so they can be compared head-to-head.
 | **DiffPhysDrone** | `DiffPhysDrone/` — custom CUDA sim | `starling-deployment/diffdrone_offboard.py` | 15 Hz |
 | **DiffAero** | `diffaero/` — Taichi GPU sim (Hydra) | `starling-deployment/diffaero_offboard.py` | 30 Hz |
 | **DepthNav** | `depthnav/` — Habitat-sim | `starling-deployment/depthnav_offboard.py` | 50 Hz |
+| **Agile Autonomy** | Flightmare | `starling-deployment/agile_offboard.py` (depth/MobileNet) | 15 Hz net / 100 Hz MPC |
+| **Agile + CL4Nav RGB** | Flightmare + frozen CL4Nav | `starling-deployment/agile_offboard.py` (RGB/ONNX) | 15 Hz net / 100 Hz MPC |
 
-The three cannot share a *training* simulator (different physics, obs/action
+The methods cannot share a *training* simulator (different physics, obs/action
 spaces, timesteps, and conflicting pinned deps), so each keeps its native trainer
 and **its own venv**. They *do* share an *evaluation* substrate: the
 `starling-deployment/` Isaac-Sim + PX4-SITL harness. That is where the comparison
@@ -30,6 +32,8 @@ evaluation env during training.
 | **DiffPhysDrone** | custom CUDA kernel sim (`env_cuda.py`) | depth image + kinematic state → body-rate/thrust | `DiffPhysDrone/` |
 | **DiffAero** | Taichi GPU sim, Hydra-configured (`env=oa` obstacle-avoidance, `env=pc` position-control, `env=racing`) | depth/lidar/relpos sensor (configurable) → velocity or accel cmd | `diffaero/diffaero/env/` |
 | **DepthNav** | Habitat-sim (photorealistic scenes + physics) | depth image → velocity cmd | `depthnav/depthnav/envs/navigation_env.py` |
+| **Agile Autonomy** | Flightmare | depth + state → trajectory + MPC | `agile_autonomy/` |
+| **Agile + CL4Nav RGB** | Flightmare | RGB + state → frozen CL4Nav + trajectory + MPC | `agile_autonomy/` |
 
 Each has its own obstacle distribution, timestep, and reward — that's *why* they
 can't share a trainer. `DiffPhysDrone/env_cuda.py`'s procedural field (balls +
@@ -73,7 +77,7 @@ diffaero/               # trainer (Taichi, Hydra); deploy ckpt dir: checkpoints/
 depthnav/               # trainer (Habitat); deploy ckpt: depthnav/.../logs/level1/*.pth
 checkpoints/            # deployable policy artifacts per method
 starling-deployment/    # shared Isaac-Sim + PX4-SITL flight harness
-  run_px4_sim.py        #   one launcher, --policy {diffphys,diffaero,depthnav}
+  run_px4_sim.py        #   one launcher, --policy {diffphys,diffaero,depthnav,agile,agile_rgb}
   diffdrone_offboard.py #   per-method PX4 offboard controllers (CLIMB->[YAW]->POLICY)
   diffaero_offboard.py
   depthnav_offboard.py
@@ -101,7 +105,78 @@ Each runs in its own environment: `diffaero/.venv` (Taichi + torch), a DepthNav
 venv (`depthnav/requirements.txt`: torch 2.2.1 / numpy 1.23.5 + Habitat-sim), and
 a torch env for DiffPhysDrone.
 
-## Comparing the three (single environment, single command)
+## Agile + frozen CL4Nav RGB
+
+The `agile_rgb` method is the RGB policy trained in
+`agile_autonomy_ws/train_results/cl4nav_frozen/20260710-044532`: RGB is rendered
+at the original Agile camera pose (91° horizontal FOV, 640×480), bilinear-resized
+to 224×224 in RGB order, sent losslessly to the offboard process, normalized to
+`float32 [0,1]`, and encoded as NCHW by the frozen CL4Nav ONNX model. Its 128-D
+feature enters the newly trained PlaNet head from `ckpt-32`; the existing Agile
+MPC/control path is shared unchanged.
+
+The deploy artifacts placed in this checkout are:
+
+- `checkpoints/AgileAutonomyCL4Nav/cl4nav_encoder.onnx`
+- `checkpoints/AgileAutonomyCL4Nav/ckpt-32.{index,data-00000-of-00001}`
+
+`starling-deployment/agile_python.sh` uses the running `agile-autonomy-run`
+container's `tf_gpu` environment by default. It expects the container to use host
+networking and `/home/jason` to be mounted (the existing container has both).
+Set `SUPERFLY_AGILE_RUNTIME=local` to use `starling-deployment/.venv` instead.
+The complete Python runtime dependencies are pinned in
+`starling-deployment/requirements-agile-gpu.txt`; install them with:
+
+```bash
+docker exec agile-autonomy-run /opt/conda/envs/tf_gpu/bin/pip install -r \
+  /home/jason/superfly/starling-deployment/requirements-agile-gpu.txt
+```
+
+### CL4Nav held-out RGB/depth t-SNE
+
+To visualize the frozen encoder on CL4Nav's paired `provided_eval` split (which
+was not used for training), run:
+
+```bash
+/home/jason/miniconda3/envs/cl4nav5090/bin/python \
+  starling-deployment/compare/visualize_cl4nav_tsne.py
+```
+
+The script applies the same encoder to RGB and three-channel-repeated depth,
+jointly embeds the L2-normalized 128-D outputs, and labels the modalities with
+different colors and markers. The PNG, CSV coordinates, and compressed feature
+archive are written to `starling-deployment/compare/results/cl4nav_tsne/`.
+
+For a reproducible random sample of 925 training pairs from Agile Autonomy:
+
+```bash
+/home/jason/miniconda3/envs/cl4nav5090/bin/python \
+  starling-deployment/compare/visualize_cl4nav_tsne.py \
+  --dataset /home/jason/CL4Nav/datasets/agile_gt_depth \
+  --sample-pairs 925 --seed 0 \
+  --title "CL4Nav features on Agile Autonomy training data" \
+  --output-stem cl4nav_agile_rgb_vs_depth_tsne \
+  --output-dir starling-deployment/compare/results/cl4nav_tsne_agile
+```
+
+### Nucleus evaluation scenes
+
+The comparison uses the remote Construction Site and English College stages
+defined by `starling-deployment/compare/example_scenarios.json`. Isaac resolves
+their `omniverse://airlab-nucleus.andrew.cmu.edu/...` assets directly; no local
+scene rewrite or asset cache is required.
+
+```bash
+cd /home/jason/superfly/starling-deployment
+docker start agile-autonomy-run
+python3 compare/run_comparison.py compare/example_scenarios.json \
+  --methods diffphys diffaero depthnav agile agile_rgb \
+  --headless --record-video --report \
+  --sim-python /home/jason/isaacsim/python.sh \
+  --px4-dir /home/jason/PX4-Autopilot
+```
+
+## Comparing the methods (single environment, single command)
 
 The comparison flies each trained policy through the identical obstacle field
 (same seed → same layout, same start/goal) and scores the logged ground-truth
@@ -203,6 +278,8 @@ For each `(method, seed)` pair in `--methods` × `--seeds` it runs one **trial**
 | DiffPhysDrone | `checkpoints/DiffPhysDrone/checkpoint0004.pth` | present |
 | DiffAero | `checkpoints/DiffAero/sha2c_pmc/checkpoints/exported_actor.pt2` (export via `diffaero/script/export.py`) | present |
 | DepthNav | `depthnav/examples/navigation/logs/level1/level1_4_iteration_13500.pth` | **pending** |
+| Agile Autonomy | `checkpoints/AgileAutonomy/ckpt-50` | present |
+| Agile + CL4Nav RGB | `checkpoints/AgileAutonomyCL4Nav/ckpt-32` + `cl4nav_encoder.onnx` | present |
 
 `run_comparison.py` **auto-skips** any method whose checkpoint is missing (with a
 message), so `--methods diffphys diffaero depthnav` runs the available two today

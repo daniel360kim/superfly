@@ -1,0 +1,202 @@
+[
+  {
+    "name": "diffaero_field_seed0",
+    "obstacles": "diffaero",
+    "seed": 0,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_field_seed1",
+    "obstacles": "diffaero",
+    "seed": 1,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_field_seed2",
+    "obstacles": "diffaero",
+    "seed": 2,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_field_seed3",
+    "obstacles": "diffaero",
+    "seed": 3,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_field_seed4",
+    "obstacles": "diffaero",
+    "seed": 4,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_field_seed0",
+    "obstacles": "diffphys",
+    "seed": 0,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_field_seed1",
+    "obstacles": "diffphys",
+    "seed": 1,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_field_seed2",
+    "obstacles": "diffphys",
+    "seed": 2,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_field_seed3",
+    "obstacles": "diffphys",
+    "seed": 3,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_field_seed4",
+    "obstacles": "diffphys",
+    "seed": 4,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "construction_seed0",
+    "seed": 0,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConstructionSite/ConstructionSite.stage.usd",
+    "env_scale": 0.01,
+    "start": [-24.237, -1.405, 1.0],
+    "goal": [52.006, -11.739, 2.0],
+    "climb_alt": 3,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "construction_seed1",
+    "seed": 1,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConstructionSite/ConstructionSite.stage.usd",
+    "env_scale": 0.01,
+    "start": [-24.237, -1.405, 1.0],
+    "goal": [52.006, -11.739, 2.0],
+    "climb_alt": 3,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "construction_seed2",
+    "seed": 2,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConstructionSite/ConstructionSite.stage.usd",
+    "env_scale": 0.01,
+    "start": [-24.237, -1.405, 1.0],
+    "goal": [52.006, -11.739, 2.0],
+    "climb_alt": 3,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "construction_seed3",
+    "seed": 3,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConstructionSite/ConstructionSite.stage.usd",
+    "env_scale": 0.01,
+    "start": [-24.237, -1.405, 1.0],
+    "goal": [52.006, -11.739, 2.0],
+    "climb_alt": 3,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "construction_seed4",
+    "seed": 4,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConstructionSite/ConstructionSite.stage.usd",
+    "env_scale": 0.01,
+    "start": [-24.237, -1.405, 1.0],
+    "goal": [52.006, -11.739, 2.0],
+    "climb_alt": 3,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "english_college_seed0",
+    "seed": 0,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/EnglishCollege/EnglishCollege.stage.usd",
+    "env_scale": 0.01,
+    "start": [46.912, 127.707, 68.6],
+    "goal": [-43.27, 145.86, 71.0],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "english_college_seed1",
+    "seed": 1,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/EnglishCollege/EnglishCollege.stage.usd",
+    "env_scale": 0.01,
+    "start": [46.912, 127.707, 68.6],
+    "goal": [-43.27, 145.86, 71.0],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "english_college_seed2",
+    "seed": 2,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/EnglishCollege/EnglishCollege.stage.usd",
+    "env_scale": 0.01,
+    "start": [46.912, 127.707, 68.6],
+    "goal": [-43.27, 145.86, 71.0],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "english_college_seed3",
+    "seed": 3,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/EnglishCollege/EnglishCollege.stage.usd",
+    "env_scale": 0.01,
+    "start": [46.912, 127.707, 68.6],
+    "goal": [-43.27, 145.86, 71.0],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  },
+  {
+    "name": "english_college_seed4",
+    "seed": 4,
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/EnglishCollege/EnglishCollege.stage.usd",
+    "env_scale": 0.01,
+    "start": [46.912, 127.707, 68.6],
+    "goal": [-43.27, 145.86, 71.0],
+    "climb_alt": 5,
+    "timeout": 300,
+    "pre_policy_timeout": 240
+  }
+]

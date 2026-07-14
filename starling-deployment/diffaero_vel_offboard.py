@@ -52,8 +52,8 @@ DA_INTRINSICS = Intrinsics(
 
 CONTROL_HZ = 30.0
 HEARTBEAT_HZ = 2.0
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+OFFBOARD_DONE_FILE = str(Path(__file__).resolve().parent / ".superfly_offboard_done")
+POLICY_PHASE_FILE = str(Path(__file__).resolve().parent / ".superfly_policy_phase")
 PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
 
 

@@ -50,7 +50,7 @@ For every `(method, scenario)` pair:
    (each method has its own venv; see *Interpreters* below), the checkpoint,
    and the goal converted to PX4's spawn-relative local frame.
 4. **Phase-aware timeouts**: the offboard scripts write handoff events to
-   `/tmp/superfly_policy_phase`, so the pre-policy phase (heartbeat/arm/climb/
+   `starling-deployment/.superfly_policy_phase`, so the pre-policy phase (heartbeat/arm/climb/
    yaw), the policy flight, and the landing each get their own budget
    (`--pre-policy-timeout`, `--timeout`, `--landing-timeout`, all overridable
    per scenario). A slow PX4 boot can never eat the policy's flight budget.
@@ -81,7 +81,7 @@ A run is driven by a JSON list of scenarios; every method flies every entry.
     "goal": [-43.3, 145.9, 71.0],    // world-frame goal (always required for
                                      // scene-only; overrides the field's target)
     "climb_alt": 5,                  // climb height [m] ABOVE the spawn altitude
-    "timeout": 300,                  // policy-phase budget [s]
+    "timeout": 300,                  // policy budget [s]; <=0 disables it
     "pre_policy_timeout": 240,       // arm/climb/yaw budget [s]
     "landing_timeout": 90            // post-policy landing budget [s]
   }

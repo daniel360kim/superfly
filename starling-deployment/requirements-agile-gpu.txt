@@ -1,0 +1,15 @@
+# Python 3.10 runtime used by agile_python.sh for Agile Depth and Agile RGB.
+# Install with:
+#   python -m pip install -r requirements-agile-gpu.txt
+#
+# TensorFlow's `and-cuda` extra installs its CUDA 12 user-space libraries. The
+# host still needs a compatible NVIDIA driver and, for Docker, NVIDIA Container
+# Toolkit. acados and its generated solver are native dependencies and must be
+# installed separately; point ACADOS_SOURCE_DIR at that installation.
+
+tensorflow[and-cuda]==2.21.0
+onnxruntime-gpu==1.23.2
+numpy==1.26.4
+scipy==1.15.3
+pymavlink==2.4.49
+casadi==3.6.7

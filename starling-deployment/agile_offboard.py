@@ -1,19 +1,20 @@
 #!/usr/bin/env python
 """
 Agile Autonomy (Loquercio et al., uzh-rpg/agile_autonomy) offboard controller
-for PX4. Run under agile_python.sh (the agile venv at
-starling-deployment/.venv: TF + acados).
+for PX4. Run through agile_python.sh (the tf_gpu container environment by
+default, with TensorFlow GPU + ONNX Runtime CUDA + acados).
 
 Connects to PX4 via MAVLink, arms, climbs to --climb-alt, yaws to face the
 goal, then runs the PlaNet trajectory network + acados tracking MPC
-(wrapper/agile_core.py) at 30 Hz sending SET_ATTITUDE_TARGET.
+(wrapper/agile_core.py) at the configured control rate (100 Hz in comparisons), sending SET_ATTITUDE_TARGET.
 
 Mirrors diffaero_offboard.py's structure and CLI (--goal takes X Y; the goal
 altitude is --climb-alt) with one agile-specific addition that is NOT
 optional: right after the heartbeat it requests LOCAL_POSITION_NED and
-ATTITUDE_QUATERNION at 50 Hz via MAV_CMD_SET_MESSAGE_INTERVAL. udp:14550 is
-PX4's GCS link, which by default streams position at 1 Hz and attitude at
-10 Hz -- an MPC re-solving at 30 Hz on second-stale state produces a 0.5 Hz
+ATTITUDE_QUATERNION at least as fast as the control loop via
+MAV_CMD_SET_MESSAGE_INTERVAL. udp:14550 is PX4's GCS link, which by default
+streams position at 1 Hz and attitude at 10 Hz -- a fast MPC on stale state
+produces a 0.5 Hz
 +-30 deg pitch/roll limit cycle that also tilts the camera off the obstacles.
 Learned reactive policies tolerate that staleness; a stiff model-based
 tracker does not.
@@ -62,8 +63,8 @@ STREAMED_MSGS = {
 
 # Sentinel files shared with run_px4_sim.py --auto-stop / compare/run_comparison.py
 # (must match OFFBOARD_DONE_FILE / POLICY_PHASE_FILE there).
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+OFFBOARD_DONE_FILE = str(Path(__file__).resolve().parent / ".superfly_offboard_done")
+POLICY_PHASE_FILE = str(Path(__file__).resolve().parent / ".superfly_policy_phase")
 
 PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
 
@@ -277,8 +278,18 @@ def main():
     parser.add_argument("--goal", type=float, nargs=2, default=None, metavar=("X", "Y"),
                         help="Goal XY (ENU). Goal altitude is --climb-alt (horizontal "
                              "cruise). If omitted, the drone climbs and hovers.")
-    parser.add_argument("--depth", action="store_true",
-                        help="Subscribe to live depth frames over UDP (from the sim)")
+    sensor = parser.add_mutually_exclusive_group()
+    sensor.add_argument("--depth", action="store_true",
+                        help="Subscribe to live depth frames over UDP (original Agile)")
+    sensor.add_argument("--rgb", action="store_true",
+                        help="Subscribe to live RGB frames over UDP (CL4Nav Agile)")
+    parser.add_argument("--visual-input", choices=("depth", "cl4nav_rgb"), default=None,
+                        help="PlaNet visual frontend. Defaults to cl4nav_rgb with --rgb, "
+                             "otherwise depth.")
+    parser.add_argument("--cl4nav-onnx", default=None,
+                        help="Frozen CL4Nav encoder ONNX (required for cl4nav_rgb)")
+    parser.add_argument("--cl4nav-provider", default="CUDAExecutionProvider",
+                        help="ONNX Runtime provider; use CPUExecutionProvider for CPU")
     parser.add_argument("--climb-alt", type=float, default=2.0,
                         help="Climb to this altitude [m] before the policy takes over; "
                              "also the cruise/goal altitude.")
@@ -351,6 +362,11 @@ def main():
     parser.add_argument("--no-debug-viz", action="store_true",
                         help="Disable UDP debug frames for sim overhead trajectory viz.")
     args = parser.parse_args()
+    visual_input = args.visual_input or ("cl4nav_rgb" if args.rgb else "depth")
+    if visual_input == "cl4nav_rgb" and not args.rgb:
+        parser.error("--visual-input cl4nav_rgb requires --rgb")
+    if visual_input == "cl4nav_rgb" and not args.cl4nav_onnx:
+        parser.error("--visual-input cl4nav_rgb requires --cl4nav-onnx")
 
     # Must be set BEFORE AgilePolicy builds the acados MPC (make_solver reads it).
     if args.q_att is not None:
@@ -369,10 +385,15 @@ def main():
     goal_xy = np.array(args.goal) if args.goal is not None else None
 
     depth_sub = None
+    rgb_sub = None
     if args.depth:
         from depth_transport import DepthSubscriber
         depth_sub = DepthSubscriber()
         print("Depth subscriber listening for frames over UDP.")
+    elif args.rgb:
+        from rgb_transport import RGBSubscriber
+        rgb_sub = RGBSubscriber()
+        print("RGB subscriber listening for lossless frames over UDP.")
 
     print(f"Connecting to {args.connect} ...")
     mav = mavutil.mavlink_connection(args.connect)
@@ -410,6 +431,9 @@ def main():
         ref_lookahead_s=args.ref_lookahead_s,
         use_keepout=args.keepout,
         att_lookahead_s=args.att_lookahead_s,
+        visual_input=visual_input,
+        cl4nav_onnx_path=args.cl4nav_onnx,
+        cl4nav_provider=args.cl4nav_provider,
     )
     debug_pub = None if args.no_debug_viz else AgileDebugPublisher()
     if debug_pub is not None:
@@ -477,6 +501,7 @@ def main():
                 verbose = elapsed < 5.0 or (int(now) != int(now - control_dt))
 
                 depth = depth_sub.latest() if depth_sub else None
+                rgb = rgb_sub.latest() if rgb_sub else None
 
                 if goal_xy is not None:
                     goal_enu = np.array([goal_xy[0], goal_xy[1], args.climb_alt])
@@ -518,6 +543,7 @@ def main():
                         angular_rate_body=omega_body,
                         goal_enu=goal_enu,
                         depth=depth,
+                        rgb=rgb,
                     )
                     cmd = policy.compute(obs)
                     send_attitude_target(mav, cmd.attitude_ned_frd_wxyz, cmd.thrust_norm)

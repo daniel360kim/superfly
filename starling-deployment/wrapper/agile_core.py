@@ -1,10 +1,9 @@
-"""Agile Autonomy (Loquercio) policy core: depth + MAVLink state -> attitude/thrust.
+"""Agile Autonomy policy core: visual observation + MAVLink state -> attitude/thrust.
 
-Pipeline per control tick (agile_offboard.py runs this at 30 Hz):
-  1. (decimated, ~15 Hz) PlaNet inference (wrapper/agile_model.py): 224x224 depth
-     (the sim renders 640x480 and bilinear-downsamples to 224, matching
-     Loquercio's training loader) + 21-dim state -> `modes` candidate body-frame
-     trajectories + alpha costs.
+Pipeline per control tick (100 Hz in the comparison harness):
+  1. (decimated, ~15 Hz) PlaNet inference (wrapper/agile_model.py): either the
+     original 224x224 depth input or 224x224 RGB encoded by frozen CL4Nav ONNX,
+     plus the 21-dim state -> `modes` candidate body-frame trajectories + costs.
   2. Mode selection: fly mode 0 (lowest alpha), matching upstream
      agile_autonomy trajectory_decision.
   3. (every tick) acados MPC (wrapper/agile_mpc.py) tracks the selected
@@ -73,7 +72,8 @@ class AgileObs:
     R_enu: np.ndarray            # body FLU -> world ENU
     angular_rate_body: np.ndarray  # body FLU [rad/s]
     goal_enu: np.ndarray
-    depth: np.ndarray | None     # (224, 224) planar Z-depth [m], row 0 = up
+    depth: np.ndarray | None = None  # (224, 224) planar Z-depth [m], row 0 = up
+    rgb: np.ndarray | None = None    # (224, 224, 3) uint8 RGB, row 0 = up
 
 
 @dataclass
@@ -92,9 +92,9 @@ class AgilePolicy:
     """Owns the net, the MPC, the obstacle memory, and all frame plumbing.
 
     compute(obs) is the only entry point; it must be called at control_hz. The
-    expensive net forward pass runs every `net_every` ticks (15 Hz at the 30 Hz
-    control rate -- the rate the MPC reference pipeline was designed for); the
-    MPC re-solves EVERY tick against fresh state, which is what keeps the
+    expensive net forward pass runs every `net_every` ticks (about 14-15 Hz
+    in deployment); the MPC re-solves EVERY control tick against fresh state,
+    which is what keeps the
     attitude stream continuous for PX4."""
 
     # -- mode selection ----------------------------------------------------
@@ -113,10 +113,23 @@ class AgilePolicy:
                  hover_thrust: float = G / 20.0, control_hz: float = 30.0,
                  net_every: int = 2, max_tilt_deg: float = 90.0,
                  att_lp: float = 1.0, ref_lookahead_s: float = REF_LOOKAHEAD_S,
-                 use_keepout: bool = False, att_lookahead_s: float | None = None):
-        self.config = LoquercioModelConfig()
-        print(f"[agile] loading PlaNet checkpoint from {checkpoint_path} ...", flush=True)
-        self.net = TensorFlowLoquercioBackend(checkpoint_path, self.config)
+                 use_keepout: bool = False, att_lookahead_s: float | None = None,
+                 visual_input: str = "depth", cl4nav_onnx_path: str | None = None,
+                 cl4nav_provider: str = "CUDAExecutionProvider"):
+        if visual_input not in ("depth", "cl4nav_rgb"):
+            raise ValueError(f"Unsupported Agile visual input: {visual_input}")
+        self.visual_input = visual_input
+        self.config = (
+            LoquercioModelConfig(
+                use_rgb=True, use_depth=False, visual_input="cl4nav_frozen")
+            if visual_input == "cl4nav_rgb" else LoquercioModelConfig()
+        )
+        if use_keepout and visual_input == "cl4nav_rgb":
+            raise ValueError("--keepout requires depth and is unavailable for agile_rgb")
+        print(f"[agile] loading {visual_input} PlaNet checkpoint from "
+              f"{checkpoint_path} ...", flush=True)
+        self.net = TensorFlowLoquercioBackend(
+            checkpoint_path, self.config, cl4nav_onnx_path, cl4nav_provider)
         print(f"[agile] {self.net.loaded_weight_count} weights loaded from "
               f"{self.net.checkpoint_prefix}; building acados MPC ...", flush=True)
         self.mpc = MPC()
@@ -193,6 +206,18 @@ class AgilePolicy:
         normalized = depth_mm / 80.0
         model_depth = np.repeat(normalized[..., None], 3, axis=-1)
         return model_depth.reshape((1, 1, size, size, 3)).astype(np.float32)
+
+    def _rgb_to_model_input(self, rgb_hwc) -> np.ndarray:
+        if rgb_hwc is None:
+            raise RuntimeError(
+                "No RGB frame received. Start run_px4_sim.py with --policy agile_rgb "
+                "and launch agile_offboard.py with --rgb.")
+        rgb = np.asarray(rgb_hwc)
+        if rgb.ndim != 3 or rgb.shape[-1] != 3:
+            raise ValueError(f"Agile RGB frame must be HxWx3, got {rgb.shape}")
+        if not np.all(np.isfinite(rgb)):
+            raise ValueError("Agile RGB frame contains NaN or Inf")
+        return rgb.reshape((1, 1, *rgb.shape))
 
     def _state_to_model_input(self, pos_enu, R_enu, vel_enu, angular_body,
                               goal_dir_world) -> np.ndarray:
@@ -308,10 +333,12 @@ class AgilePolicy:
 
         # --- net inference (decimated) ---
         if self._world_points is None or (self._tick % self.net_every) == 0:
-            depth_in = self._depth_to_model_input(obs.depth)
+            visual_in = (self._rgb_to_model_input(obs.rgb)
+                         if self.visual_input == "cl4nav_rgb"
+                         else self._depth_to_model_input(obs.depth))
             state_in = self._state_to_model_input(
                 pos, R_enu, vel, obs.angular_rate_body, goal_dir)
-            alphas, trajectories = self.net.infer(depth_in, state_in)
+            alphas, trajectories = self.net.infer(visual_in, state_in)
             local_per_mode = [t.reshape(self.config.state_dim, self.config.out_seq_len)
                               for t in trajectories]
             self._mode_idx = self._select_mode(local_per_mode, obs.depth)

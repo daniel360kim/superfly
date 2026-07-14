@@ -13,7 +13,7 @@ Scenario entry schema (only "goal" is always required; "start" too unless a
 procedural obstacle field supplies the spawn):
     {
       "name": "forest_a",                  // label; default scenario<i>
-      "environment": "Box Room",           // named Pegasus scene, OR:
+      "environment": "Box Room",              // named Pegasus scene, OR:
       "usd_environment": "omniverse://.../stage.usd",
       "env_scale": 0.01,                   // scale for usd_environment
       "obstacles": "none",                 // none | diffphys | diffaero
@@ -25,7 +25,7 @@ procedural obstacle field supplies the spawn):
       "goal": [x, y, z],                   // world-frame goal
       "climb_alt": 2.0,                    // climb height [m] ABOVE the spawn
                                            // altitude (PX4 local frame)
-      "timeout": 180,                      // POLICY-phase budget [s]
+      "timeout": 180,                      // POLICY budget [s]; <=0 disables it
       "pre_policy_timeout": 120,           // arm/climb/yaw budget [s]
       "landing_timeout": 90                // post-policy landing budget [s]
     }
@@ -74,7 +74,7 @@ import metrics                               # noqa: E402  (compare/metrics.py)
 
 # Sentinel each *_offboard.py writes on exit; run_px4_sim --auto-stop watches it.
 # Must match OFFBOARD_DONE_FILE in run_px4_sim.py / diffdrone_offboard.py.
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
+OFFBOARD_DONE_FILE = str(_DEPLOY / ".superfly_offboard_done")
 
 # Phase sentinel each *_offboard.py appends to: "start <ts>" at the CLIMB/YAW ->
 # POLICY handoff, "end <ts>" at the POLICY -> LANDING handoff (diffaero /
@@ -82,7 +82,7 @@ OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
 # POLICY_PHASE_FILE in the offboard scripts. Lets --timeout budget the policy
 # flight only, with separate caps for the pre-policy (arm/climb/yaw) and
 # post-policy (landing) phases.
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+POLICY_PHASE_FILE = str(_DEPLOY / ".superfly_policy_phase")
 
 # Fixed run parameters that used to be CLI flags but never needed changing.
 VIDEO_FPS = 15.0          # --record-video MP4 frame rate
@@ -118,6 +118,7 @@ DEFAULT_AGILE_MAX_SPEED = 4.0
 AGILE_MAX_TILT_DEG = 30.0
 AGILE_CONTROL_HZ = 100.0
 AGILE_MPC_Q_ATT = 200.0
+CL4NAV_ONNX = _REPO / "checkpoints" / "AgileAutonomyCL4Nav" / "cl4nav_encoder.onnx"
 
 
 def effective_agile_max_speed(args) -> float:
@@ -190,11 +191,11 @@ def method_registry():
         "agile": dict(
             policy="agile",
             offboard="agile_offboard.py",
-            control_hz=30.0,
+            control_hz=AGILE_CONTROL_HZ,
             goal_argc=2,                     # agile --goal takes X Y only (like diffaero)
-            # Not a venv python but an exec shim: acados' generated .so needs
-            # ACADOS_SOURCE_DIR/LD_LIBRARY_PATH in the process env BEFORE python
-            # starts; the shim sets them, then execs starling-deployment/.venv.
+            # Not a Python binary but an exec shim: acados' generated .so needs
+            # ACADOS_SOURCE_DIR/LD_LIBRARY_PATH before Python starts; the shim
+            # runs the policy in the GPU container's tf_gpu environment.
             python=_DEPLOY / "agile_python.sh",
             # agile --checkpoint is a TF2 checkpoint PREFIX (ckpt-50.index/.data-*
             # alongside; there is no `checkpoint` pointer file) -- never a plain file.
@@ -207,16 +208,37 @@ def method_registry():
                 "--q-att", str(AGILE_MPC_Q_ATT),
             ],
         ),
+        "agile_rgb": dict(
+            policy="agile_rgb",
+            offboard="agile_offboard.py",
+            control_hz=AGILE_CONTROL_HZ,
+            goal_argc=2,
+            python=_DEPLOY / "agile_python.sh",
+            checkpoint=_REPO / "checkpoints" / "AgileAutonomyCL4Nav" / "ckpt-32",
+            input_args=lambda a: [
+                "--rgb", "--visual-input", "cl4nav_rgb",
+                "--cl4nav-onnx", str(a.agile_rgb_onnx or CL4NAV_ONNX),
+                "--cl4nav-provider", a.cl4nav_provider,
+            ],
+            speed_args=lambda a: [
+                "--max-vel", str(effective_agile_max_speed(a)),
+                "--max-tilt-deg", str(AGILE_MAX_TILT_DEG),
+                "--att-lp", "1.0",
+                "--control-hz", str(AGILE_CONTROL_HZ),
+                "--q-att", str(AGILE_MPC_Q_ATT),
+            ],
+        ),
     }
 
 
-def checkpoint_ready(method, ckpt: Path) -> bool:
+def checkpoint_ready(method, ckpt: Path, onnx_path: Path | None = None) -> bool:
     """diffaero's checkpoint is a directory (needs exported_actor.pt2); agile's is
     a TF2 checkpoint PREFIX (needs <prefix>.index); the others are .pth/.pt files."""
     if method in ("diffaero", "diffaero_vel", "diffaero_vel_planar"):
         return (ckpt / "checkpoints" / "exported_actor.pt2").exists()
-    if method == "agile":
-        return Path(str(ckpt) + ".index").exists()
+    if method in ("agile", "agile_rgb"):
+        ready = Path(str(ckpt) + ".index").exists()
+        return ready and (method != "agile_rgb" or (onnx_path is not None and onnx_path.exists()))
     return ckpt.exists()
 
 
@@ -619,10 +641,10 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
     if args.headless:
         sim_cmd.append("--headless")
     if video_dir is not None:
-        # depth.mp4 = policy-input depth grid (turbo colormap); rgb.mp4 =
-        # onboard RGB drone_camera at the same viewpoint.
-        sim_cmd += ["--record-depth-video", str(video_dir / "depth.mp4"),
-                    "--record-rgb-video", str(video_dir / "rgb.mp4"),
+        # agile_rgb records its exact policy RGB; depth methods record both views.
+        if method != "agile_rgb":
+            sim_cmd += ["--record-depth-video", str(video_dir / "depth.mp4")]
+        sim_cmd += ["--record-rgb-video", str(video_dir / "rgb.mp4"),
                     "--record-video-fps", str(VIDEO_FPS),
                     "--record-video-scale", str(VIDEO_SCALE)]
     if scenario["usd_environment"]:
@@ -660,10 +682,10 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
     climb_alt = scenario["climb_alt"] if scenario["climb_alt"] is not None else args.climb_alt
     off_cmd = [off_python, cfg["offboard"],
                "--checkpoint", str(ckpt),
-               "--connect", args.connect,
-               "--depth",
-               "--goal", *goal_vals,
-               "--climb-alt", str(climb_alt)]
+               "--connect", args.connect]
+    off_cmd += cfg.get("input_args", lambda a: ["--depth"])(args)
+    off_cmd += ["--goal", *goal_vals,
+                "--climb-alt", str(climb_alt)]
     off_cmd += cfg["speed_args"](args)
     return sim_cmd, off_cmd
 
@@ -710,8 +732,12 @@ def run_trial(method, cfg, args, scenario):
         off = subprocess.Popen(off_cmd, cwd=str(_DEPLOY))
         wait_offboard_phased(off, args, scenario)
         # Ensure the sim's --auto-stop trips even if offboard was killed (its
-        # own on-exit sentinel write only runs on a clean/Ctrl-C exit).
-        Path(OFFBOARD_DONE_FILE).write_text(str(time.time()))
+        # own on-exit sentinel write only runs on a clean/Ctrl-C exit). Agile
+        # runs inside a root-owned container, so replace its sentinel instead
+        # of opening that existing 0644 file as the host user.
+        done_file = Path(OFFBOARD_DONE_FILE)
+        done_file.unlink(missing_ok=True)
+        done_file.write_text(str(time.time()))
         try:
             sim.wait(timeout=SIM_GRACE)
         except subprocess.TimeoutExpired:
@@ -761,7 +787,7 @@ def run_trial(method, cfg, args, scenario):
         climb_alt=(scenario["climb_alt"] if scenario["climb_alt"] is not None
                    else args.climb_alt),
         connect=args.connect)
-    if method == "agile":
+    if method in ("agile", "agile_rgb"):
         res["hyperparams"]["agile_max_speed"] = effective_agile_max_speed(args)
     res["scenario"] = {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                        for k, v in scenario.items()}
@@ -804,25 +830,29 @@ def wait_offboard_phased(off, args, scenario):
     ("start" until "end" or exit), and landing_timeout covers landing after
     "end". So a slow PX4 boot or a long final descent can't eat the policy's
     flight budget. Each budget is the scenario's value if set, else the CLI
-    default (environments differ in size, so budgets are per-scenario)."""
-    timeout = scenario["timeout"] or args.timeout
-    pre_policy = scenario["pre_policy_timeout"] or args.pre_policy_timeout
-    landing = scenario["landing_timeout"] or args.landing_timeout
+    default (environments differ in size, so budgets are per-scenario).
+    A budget <= 0 disables that phase's timeout."""
+    timeout = (args.timeout if scenario["timeout"] is None
+               else float(scenario["timeout"]))
+    pre_policy = (args.pre_policy_timeout if scenario["pre_policy_timeout"] is None
+                  else float(scenario["pre_policy_timeout"]))
+    landing = (args.landing_timeout if scenario["landing_timeout"] is None
+               else float(scenario["landing_timeout"]))
     launched = time.time()
     while off.poll() is None:
         t_start, t_end = _read_policy_phase()
         now = time.time()
         if t_start is None:
-            if now - launched > pre_policy:
+            if pre_policy > 0 and now - launched > pre_policy:
                 _kill_offboard(off, "offboard never reached the policy handoff "
                                f"within {pre_policy:.0f}s")
                 return
         elif t_end is None:
-            if now - t_start > timeout:
+            if timeout > 0 and now - t_start > timeout:
                 _kill_offboard(off, f"policy phase exceeded {timeout:.0f}s")
                 return
         else:
-            if now - t_end > landing:
+            if landing > 0 and now - t_end > landing:
                 _kill_offboard(off, f"landing exceeded {landing:.0f}s")
                 return
         time.sleep(0.5)
@@ -925,10 +955,10 @@ def main():
                          "module docstring for the entry schema). Every method flies "
                          "every scenario. Not needed with --report-only.")
     ap.add_argument("--methods", nargs="+",
-                    default=["diffphys", "diffaero", "depthnav", "agile"],
+                    default=["diffphys", "diffaero", "depthnav", "agile", "agile_rgb"],
                     choices=["diffphys", "diffaero", "diffaero_vel", "diffaero_vel_planar",
-                             "depthnav", "agile"],
-                    help="Methods to compare (default: all four; add diffaero_vel "
+                             "depthnav", "agile", "agile_rgb"],
+                    help="Methods to compare (default: five methods; add diffaero_vel "
                          "or diffaero_vel_planar for velocity-command DiffAero).")
     ap.add_argument("--climb-alt", type=float, default=2.0,
                     help="Default climb height [m] ABOVE the spawn altitude before the "
@@ -936,7 +966,7 @@ def main():
                          "elevated spawns). Override per scenario with \"climb_alt\".")
     ap.add_argument("--max-speed", type=float, default=DEFAULT_MAX_SPEED,
                     help="Cruise speed for diffphys/diffaero/depthnav offboards, and "
-                         f"for agile too if set (agile defaults to "
+                         f"for both Agile methods if set (Agile defaults to "
                          f"{DEFAULT_AGILE_MAX_SPEED:.0f} m/s if this is left at "
                          f"{DEFAULT_MAX_SPEED:.0f} m/s). diffaero_vel_planar ignores "
                          "this (fixed at 1.5 m/s).")
@@ -949,22 +979,26 @@ def main():
                     help="Run Isaac Sim without the GUI viewport (faster; recommended "
                          "for batch comparison runs).")
     ap.add_argument("--record-video", action="store_true",
-                    help="Save per-trial MP4s to <results-dir>/<scenario>/<method>/"
-                         "depth.mp4 (turbo colormap of the depth grid fed to the "
-                         "policy) and rgb.mp4 (onboard RGB drone_camera at the same "
-                         "viewpoint). Headless-safe.")
+                    help="Save per-trial MP4s. Depth methods get depth.mp4 plus rgb.mp4; "
+                         "agile_rgb gets rgb.mp4 containing its exact policy input. "
+                         "Headless-safe.")
     ap.add_argument("--sim-python", default=os.environ.get("ISAACSIM_PYTHON"),
                     help="Interpreter for run_px4_sim.py (Isaac's python). "
                          "Default $ISAAC_PYTHON or 'python'.")
     for m in ("diffphys", "diffaero", "diffaero_vel", "diffaero_vel_planar",
-              "depthnav", "agile"):
+              "depthnav", "agile", "agile_rgb"):
         ap.add_argument(f"--{m}-python", default=None, help=f"Interpreter for {m} offboard.")
         ap.add_argument(f"--{m}-checkpoint", default=None, help=f"Checkpoint override for {m}.")
+    ap.add_argument("--agile-rgb-onnx", "--agile_rgb-onnx", dest="agile_rgb_onnx",
+                    default=None, help="CL4Nav encoder ONNX override for agile_rgb.")
+    ap.add_argument("--cl4nav-provider", default="CUDAExecutionProvider",
+                    help="ONNX Runtime provider for agile_rgb.")
     ap.add_argument("--warmup", type=float, default=45.0,
                     help="Seconds to let Isaac boot before launching offboard.")
     ap.add_argument("--timeout", type=float, default=180.0,
-                    help="Default max POLICY-phase flight time [s] per trial (measured "
-                         "from the climb/yaw -> policy handoff, excluding takeoff and "
+                    help="Default max POLICY-phase flight time [s] per trial; <=0 disables "
+                         "the policy timeout. Measured from the climb/yaw -> policy handoff, "
+                         "excluding takeoff and "
                          "landing). Override per scenario with \"timeout\".")
     ap.add_argument("--pre-policy-timeout", type=float, default=120.0,
                     help="Default max seconds to reach the policy handoff (heartbeat "
@@ -1046,9 +1080,23 @@ def main():
         for method in args.methods:
             cfg = registry[method]
             ckpt = Path(getattr(args, f"{method}_checkpoint") or cfg["checkpoint"])
-            if not args.dry_run and not checkpoint_ready(method, ckpt):
-                print(f"\n[skip] {method}: checkpoint not found at {ckpt} "
-                      f"-- skipping (provide one or --{method}-checkpoint).")
+            onnx = (Path(args.agile_rgb_onnx or CL4NAV_ONNX)
+                    if method == "agile_rgb" else None)
+            # DiffPhysDrone supplies the shared Model class used directly by
+            # diffphys and by the DepthNav PX4 wrapper. A checkpoint alone is
+            # only a state_dict, so do not launch a trial guaranteed to fail
+            # when this source file is absent.
+            model_source = _REPO / "DiffPhysDrone" / "model.py"
+            if (not args.dry_run and method in ("diffphys", "depthnav")
+                    and not model_source.is_file()):
+                print()
+                print(f"[skip] {method}: required source model is missing: "
+                      f"{model_source} -- skipping.")
+                continue
+            if not args.dry_run and not checkpoint_ready(method, ckpt, onnx):
+                extra = f" and ONNX {onnx}" if onnx is not None else ""
+                print(f"\n[skip] {method}: required model artifacts not found at "
+                      f"{ckpt}{extra} -- skipping.")
                 continue
             for scenario in scenarios:
                 run_trial(method, cfg, args, scenario)
