@@ -19,6 +19,11 @@ body (x fwd, y left, z up) — identical to the ENU world / FLU body used by the
 other offboards here, so no extra remapping: vel_body = R_enu^T vel_enu,
 world waypoints = pos + R_enu @ wp_body.
 
+X15 test-time augmentation: env GSDS_TTA_N=N (N>1) averages the policy over
+N-1 color-jittered copies of the RGB frame per net tick (clean frame always
+included; per-sample mode commitment before averaging). See the GSDS_TTA_*
+constants below. Off by default; unset => byte-identical behavior.
+
 Depth far-cap remap: the u16-mm wire codec saturates at 65.535 m but the
 student's encode_depth treats far/sky as DEPTH_HI = 100 m (gsplat renders mask
 sky to "no return" -> 100). Pixels arriving >= FAR_CAP are remapped to 100 m
@@ -59,6 +64,21 @@ GSDS_GUARD_RADIUS = float(os.environ.get("GSDS_GUARD_RADIUS", "0.354"))
 GSDS_REPULSION_THRESH = float(os.environ.get("GSDS_REPULSION_THRESH", "4.0"))
 GSDS_REPULSION_CAP = float(os.environ.get("GSDS_REPULSION_CAP", "1.0"))
 GSDS_REPULSION_COVER = float(os.environ.get("GSDS_REPULSION_COVER", "0.15"))
+# X15 deploy-side test-time augmentation (TTA), env-gated. GSDS_TTA_N=N (N>1)
+# runs the student, per net tick, on the clean frame PLUS N-1 lightly
+# color-jittered copies (one batched forward), then flies the AVERAGE of the
+# per-sample selected trajectories — see tta_select_average for why the
+# average must happen AFTER per-sample mode commitment, never per-mode.
+# Jitter ranges (uniform draws, gs_drone_sim.domain_rand.color_jitter):
+# hue ±GSDS_TTA_HUE of the hue circle, saturation/contrast scale 1±delta.
+# T4 purity rule: this is still RGB-only at test — the jitter perturbs the
+# RGB input tensor only; no depth or other modality is consulted by the
+# augmentation, so TTA'd headline rows remain legal "RGB-only at deploy"
+# (label them +TTA). Unset or N<=1 => byte-identical pre-X15 behavior.
+GSDS_TTA_HUE = float(os.environ.get("GSDS_TTA_HUE", "0.03"))
+GSDS_TTA_SAT = float(os.environ.get("GSDS_TTA_SAT", "0.15"))       # 0.85-1.15x
+GSDS_TTA_CONTRAST = float(os.environ.get("GSDS_TTA_CONTRAST", "0.15"))
+GSDS_TTA_SEED = int(os.environ.get("GSDS_TTA_SEED", "0"))
 FAR_CAP = 65.0          # wire-codec saturation threshold -> remap to DEPTH_HI
 G = 9.80665
 
@@ -71,6 +91,55 @@ def quat_enu_flu_to_ned_frd_wxyz(R_enu_flu: np.ndarray) -> np.ndarray:
     rot = _rot_ENU_to_NED * Rotation.from_matrix(R_enu_flu) * _rot_FLU_to_FRD
     q = rot.as_quat()
     return np.array([q[3], q[0], q[1], q[2]])
+
+
+def _tta_n_from_env() -> int:
+    """Parse GSDS_TTA_N. Unset/empty -> 1 (TTA off). N<=1 -> 1. A set-but-
+    unparsable value raises: a typo'd screen env must fail loudly, not
+    silently fly non-TTA and pollute the comparison."""
+    raw = os.environ.get("GSDS_TTA_N", "").strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError as e:
+        raise ValueError(f"GSDS_TTA_N must be an integer, got {raw!r}") from e
+    return n if n > 1 else 1
+
+
+def tta_select_average(traj: np.ndarray, cost: np.ndarray,
+                       modes: np.ndarray | None = None):
+    """X15 TTA aggregation: per-sample mode commitment, then average.
+
+    traj (S,M,T,3), cost (S,M) — S TTA samples (sample 0 = clean frame) of an
+    M-hypothesis head. `modes` (S,) optionally overrides the per-sample
+    selection (deploy passes the depth-guarded selection); default is
+    per-sample argmin cost.
+
+    Why not average traj/cost over samples per mode index: the M hypothesis
+    slots have no canonical identity across different inputs — under jitter
+    the head may emit the same hypothesis set permuted, and per-index
+    averaging would then blend DIFFERENT maneuvers (e.g. dodge-left averaged
+    with dodge-right = fly straight into the obstacle). Instead each sample
+    first commits to ONE trajectory (its selected mode); the committed
+    trajectories are averaged. Result is invariant to any per-sample
+    permutation of the (traj, cost) mode axis.
+
+    Returns (avg_traj (T,3), modes (S,), disagree) where disagree is the
+    fraction of samples 1..S-1 whose selected mode INDEX differs from the
+    clean sample's — the selection-instability diagnostic (high = tiny
+    appearance jitter flips which hypothesis wins).
+    """
+    traj = np.asarray(traj)
+    cost = np.asarray(cost)
+    S = traj.shape[0]
+    if modes is None:
+        modes = cost.argmin(axis=1)
+    modes = np.asarray(modes, dtype=np.int64)
+    picked = traj[np.arange(S), modes]                     # (S,T,3)
+    avg = picked.mean(axis=0)
+    disagree = float(np.mean(modes[1:] != modes[0])) if S > 1 else 0.0
+    return avg, modes, disagree
 
 
 @dataclass
@@ -162,11 +231,112 @@ class GsdsPolicy:
         if dump_obs_dir:
             os.makedirs(dump_obs_dir, exist_ok=True)
 
+        # X15 TTA (see module-level GSDS_TTA_* docs). Everything below is
+        # inert when GSDS_TTA_N is unset or <=1 — the deploy path is then
+        # byte-identical to pre-X15.
+        self.tta_n = _tta_n_from_env()
+        if self.tta_n > 1 and not self.use_rgb:
+            print(f"[gsds] TTA: GSDS_TTA_N={self.tta_n} ignored -- checkpoint "
+                  f"has use_rgb=False (color jitter has nothing to touch)",
+                  flush=True)
+            self.tta_n = 1
+        self._tta_gen = None
+        self._tta_dis_sum = 0.0
+        self._tta_dis_ticks = 0
+        self._tta_last_log = 0.0
+        if self.tta_n > 1:
+            # domain_rand lives in the same gs_drone_sim package this module
+            # already hard-imports above (policy.model / policy.data), so in
+            # any venv where GsdsPolicy loads at all this import cannot fail
+            # independently; it is pure torch (no torchvision/extra deps).
+            from gs_drone_sim.domain_rand import ObsDRConfig, color_jitter
+            self._tta_jitter_fn = color_jitter
+            self._tta_cfg = ObsDRConfig(
+                rgb_hue_delta=GSDS_TTA_HUE,
+                rgb_sat_delta=GSDS_TTA_SAT,
+                rgb_contrast_delta=GSDS_TTA_CONTRAST)
+            # color_jitter draws via an explicit generator on the tensor's
+            # device; seeded so a given flight's jitter stream is reproducible.
+            self._tta_gen = torch.Generator(device=self.device)
+            self._tta_gen.manual_seed(GSDS_TTA_SEED)
+            self._tta_latency_probe()
+
         # altitude-hold PD+I (alt_mode="hold", same constants as agile_core);
         # in alt_mode="plan" the I-term still trims hover-thrust mismatch.
         self.kp_alt, self.kd_alt, self.ki_alt = 4.0, 4.0, 0.4
 
         self.reset()
+
+    def _tta_latency_probe(self) -> None:
+        """Measure and print per-net-tick policy time for the chosen TTA N,
+        once at startup. TTA runs as ONE batched forward of N samples, so the
+        real cost is the batched time (<< naive serial N*F on GPU); both are
+        printed. Budget: the control loop ticks at up to 28 Hz (~35.7 ms);
+        warn if the measured TTA forward exceeds ~20 ms."""
+        n = GSDS_IMG_SIZE
+        probe = {"vec": torch.zeros(1, 6, device=self.device)}
+        probe["rgb"] = torch.rand(1, 3, n, n, device=self.device)
+        if self.use_depth:
+            probe["depth"] = torch.zeros(1, 1, n, n, device=self.device)
+
+        def _time_ms(item, reps: int = 10) -> float:
+            with torch.no_grad():
+                for _ in range(3):                       # warmup
+                    self.model(item)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                for _ in range(reps):
+                    self.model(item)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+            return (time.perf_counter() - t0) / reps * 1e3
+
+        f_ms = _time_ms(probe)
+        tta_ms = _time_ms(self._tta_expand(probe))
+        # the probe consumed jitter draws; restore the seeded flight stream
+        self._tta_gen.manual_seed(GSDS_TTA_SEED)
+        print(f"[gsds] TTA enabled: N={self.tta_n} "
+              f"(hue ±{GSDS_TTA_HUE}, sat/contrast ±{GSDS_TTA_SAT}/"
+              f"±{GSDS_TTA_CONTRAST}, seed {GSDS_TTA_SEED}); "
+              f"single forward {f_ms:.1f} ms, batched TTA forward "
+              f"{tta_ms:.1f} ms (naive serial N*F ~ {self.tta_n * f_ms:.1f} ms); "
+              f"tick budget 35.7 ms @ 28 Hz", flush=True)
+        if tta_ms > 20.0:
+            print(f"[gsds] WARNING: TTA per-tick policy time {tta_ms:.1f} ms "
+                  f"exceeds the ~20 ms guard (28 Hz budget 35.7 ms) -- risk "
+                  f"of missed control ticks; lower GSDS_TTA_N", flush=True)
+
+    def _tta_expand(self, item: dict) -> dict:
+        """Replicate a batch-1 net input to tta_n samples: sample 0 keeps the
+        clean frame, samples 1..N-1 get independent per-image color jitter on
+        the RGB channel ONLY (depth/vec are replicated untouched — RGB-only
+        at test, see GSDS_TTA_* docs)."""
+        S = self.tta_n
+        out = {k: v.expand(S, *v.shape[1:]) for k, v in item.items()}
+        jittered = self._tta_jitter_fn(
+            item["rgb"].expand(S - 1, -1, -1, -1).contiguous(),
+            self._tta_cfg, self._tta_gen)
+        out["rgb"] = torch.cat([item["rgb"], jittered], dim=0)
+        return out
+
+    def _tta_log(self, modes: np.ndarray, disagree: float) -> None:
+        """Once-per-second stderr line: across-sample mode-selection
+        disagreement rate (mean over the second's net ticks). Diagnostic for
+        appearance sensitivity — a high rate means imperceptible color jitter
+        flips which hypothesis wins (the camouflage-failure signature)."""
+        self._tta_dis_sum += disagree
+        self._tta_dis_ticks += 1
+        now = time.time()
+        if now - self._tta_last_log >= 1.0:
+            print(f"[gsds][tta] N={self.tta_n} sel-disagree="
+                  f"{self._tta_dis_sum / max(self._tta_dis_ticks, 1):.2f} "
+                  f"over {self._tta_dis_ticks} net ticks; "
+                  f"last modes={modes.tolist()}",
+                  file=sys.stderr, flush=True)
+            self._tta_dis_sum = 0.0
+            self._tta_dis_ticks = 0
+            self._tta_last_log = now
 
     def reset(self):
         self._tick = -1
@@ -323,15 +493,38 @@ class GsdsPolicy:
         if item is None:
             return False
         item["vec"] = self._encode_vec(obs)
+        tta = self.tta_n > 1
+        if tta:
+            item = self._tta_expand(item)          # batch of tta_n samples
         with torch.no_grad():
-            traj, cost = self.model(item)          # (1,M,T,3), (1,M)
-        traj = traj[0].cpu().numpy()               # (M,T,3) body frame
-        cost = cost[0].cpu().numpy()
-        mode = int(np.argmin(cost))
-        if self.depth_guard and obs.depth is not None:
-            mode = self._depth_guarded_mode(traj, cost, obs, mode)
+            traj, cost = self.model(item)          # (S,M,T,3), (S,M); S=1 off
+        if tta:
+            traj_s = traj.cpu().numpy()            # (S,M,T,3)
+            cost_s = cost.cpu().numpy()            # (S,M)
+            modes = cost_s.argmin(axis=1)
+            if self.depth_guard and obs.depth is not None:
+                # guard semantics preserved PER SAMPLE (never average in a
+                # visibly blocked hypothesis); shares the one live depth frame
+                modes = np.array(
+                    [self._depth_guarded_mode(traj_s[s], cost_s[s], obs,
+                                              int(modes[s]))
+                     for s in range(self.tta_n)], dtype=np.int64)
+            wp_body, modes, disagree = tta_select_average(traj_s, cost_s,
+                                                          modes)
+            self._tta_log(modes, disagree)
+            # clean-frame sample keeps the diagnostic surface (costs/spread/
+            # dump) comparable with non-TTA flights
+            traj = traj_s[0]                       # (M,T,3) body frame
+            cost = cost_s[0]
+            mode = int(modes[0])
+        else:
+            traj = traj[0].cpu().numpy()           # (M,T,3) body frame
+            cost = cost[0].cpu().numpy()
+            mode = int(np.argmin(cost))
+            if self.depth_guard and obs.depth is not None:
+                mode = self._depth_guarded_mode(traj, cost, obs, mode)
+            wp_body = traj[mode]                   # (T,3)
         # world-frame anchoring at the pose the obs was rendered from
-        wp_body = traj[mode]                       # (T,3)
         if self.depth_repulsion > 0.0:
             # keepout-lite: uniform lateral plan shift (p_des moves, v_des —
             # a finite difference — is untouched). Recomputed per net tick.
@@ -349,15 +542,22 @@ class GsdsPolicy:
         self._spread = float(np.linalg.norm(traj - centroid, axis=-1).mean())
         if self.dump_obs_dir:
             try:
+                extra = {}
+                if tta:
+                    # traj_bf/cost/mode above are the CLEAN sample's; the
+                    # flown plan is the TTA average — record it + selections
+                    extra = dict(tta_modes=modes, tta_wp_body=wp_body,
+                                 tta_disagree=disagree)
                 np.savez_compressed(
                     os.path.join(self.dump_obs_dir,
                                  f"net_{self._dump_n:05d}.npz"),
                     t=time.time(),
                     depth=(obs.depth if obs.depth is not None else np.zeros(0)),
                     rgb=(obs.rgb if obs.rgb is not None else np.zeros(0)),
-                    vec=item["vec"].cpu().numpy(),
+                    vec=item["vec"][:1].cpu().numpy(),
                     pos=obs.position_enu, R=obs.R_enu, vel=obs.velocity_enu,
-                    goal=obs.goal_enu, traj_bf=traj, cost=cost, mode=mode)
+                    goal=obs.goal_enu, traj_bf=traj, cost=cost, mode=mode,
+                    **extra)
                 self._dump_n += 1
             except Exception:
                 pass
