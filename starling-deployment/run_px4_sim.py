@@ -1450,7 +1450,14 @@ class PegasusApp:
             data["start"] = np.asarray(start, dtype=np.float64)
             np.savez(out, **data)
             print(f"[log-traj] saved {traj.shape[0]} poses -> {out}")
-            if getattr(self, "obstacle_assets", False):
+            # GSDS_SKIP_OBST_SAMPLING=1: skip asset surface sampling entirely.
+            # sample_subtree group-OOM-kills the 32Gi OSMO container (jobs
+            # 32/33, PointInstancer expansion) and crashes Kit locally too —
+            # no traj.npz has ever actually carried obst_samples; scoring has
+            # always fallen back to the analytic field. Skipping just makes
+            # the de-facto behavior explicit and survivable.
+            if (getattr(self, "obstacle_assets", False)
+                    and _os.environ.get("GSDS_SKIP_OBST_SAMPLING", "0") != "1"):
                 try:
                     _cmp = str(Path(__file__).resolve().parent / "compare")
                     if _cmp not in sys.path:
