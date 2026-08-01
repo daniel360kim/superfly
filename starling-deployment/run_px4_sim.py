@@ -379,6 +379,30 @@ class PegasusApp:
             # ConiferForest needs env_scale=0.01 to read correctly in this metre stage
             # (USD does NOT auto-convert metersPerUnit across references).
             self.pg.load_asset(usd_environment, "/World/layout")
+            # Empty-stage guard (F2, notes/robust_2026-07/usd_osmo_diagnosis.md):
+            # when the reference cannot be opened (e.g. unauthenticated
+            # omniverse:// inside an OSMO container), load_asset fails SILENTLY
+            # -- /World/layout composes empty and the trial flies in a void,
+            # recording plausible-looking numbers (jobs 32/33). Detect that
+            # here. Healthy stages compose children under /World/layout
+            # (verified: ConstructionSite -> World/ConstructionSite,
+            # EnglishCollege -> Root/College), so no-children == nothing
+            # composed. GSDS_REQUIRE_STAGE unset => warning only, behavior
+            # otherwise unchanged; GSDS_REQUIRE_STAGE=1 => abort non-zero.
+            _layout = self.world.stage.GetPrimAtPath("/World/layout")
+            if not _layout.IsValid() or not _layout.GetChildren():
+                print(f"[usd-guard] STAGE EMPTY: /World/layout has no children "
+                      f"after loading {usd_environment} -- the USD reference "
+                      f"did not compose (bad path, or omniverse:// URL without "
+                      f"auth?).", file=sys.stderr, flush=True)
+                if os.environ.get("GSDS_REQUIRE_STAGE") == "1":
+                    print("[usd-guard] GSDS_REQUIRE_STAGE=1 -- aborting instead "
+                          "of flying in a void.", file=sys.stderr, flush=True)
+                    try:
+                        simulation_app.close()
+                    except Exception:
+                        pass
+                    os._exit(66)
             if env_scale != 1.0:
                 from pxr import UsdGeom, Gf
                 prim = self.world.stage.GetPrimAtPath("/World/layout")

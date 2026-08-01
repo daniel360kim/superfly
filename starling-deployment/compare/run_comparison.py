@@ -112,6 +112,27 @@ SCENE_MESH_XY_MARGIN = 50.0     # horizontal margin [m] around start/goal
 SCENE_MESH_Z_BELOW = 20.0       # crop floor: this far under min(start_z, goal_z)
 SCENE_MESH_Z_ABOVE = 50.0       # crop ceiling: this far over max(start_z, goal_z)
 
+# F2 OSMO USD-stage retarget (notes/robust_2026-07/usd_osmo_diagnosis.md):
+# omniverse:// Nucleus URLs cannot authenticate inside OSMO containers (no
+# cached credential, browser SSO impossible headless), so the staging tarball
+# ships the stages and GSDS_USD_STAGE_ROOT points at them. The rewrite happens
+# only at the point of use (sim --usd-environment arg + mesh extraction cmd):
+# scenario JSONs stay byte-identical and mesh-cache keys (scene_mesh_path) are
+# still computed from the ORIGINAL URL, so shipped cache entries keep hitting.
+# GSDS_USD_STAGE_ROOT unset (the local default) => identity, byte-for-byte
+# unchanged behavior.
+USD_STAGE_PREFIX = "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/"
+
+
+def retarget_usd(usd):
+    """Map omniverse://.../Library/Stages/<X> -> $GSDS_USD_STAGE_ROOT/<X> when
+    that env var is set; identity otherwise (and for non-Stages references)."""
+    root = os.environ.get("GSDS_USD_STAGE_ROOT")
+    if not root or not usd or not str(usd).startswith(USD_STAGE_PREFIX):
+        return usd
+    return os.path.join(root, str(usd)[len(USD_STAGE_PREFIX):])
+
+
 DEFAULT_MAX_SPEED = 3.0
 # Agile cruise/MPC tuning validated 2026-07-08 (after fixing the net's de-yaw
 # bug in wrapper/agile_core.py): a faster control loop and heavier attitude
@@ -593,11 +614,14 @@ def ensure_scene_mesh(usd, env_scale, start, goal, sim_python):
     if not usd:
         return None
     bounds = scene_mesh_bounds(start, goal)
+    # Cache key from the ORIGINAL usd reference; only the extraction subprocess
+    # gets the retargeted (local, GSDS_USD_STAGE_ROOT) path. Unset env: no-op.
     path = scene_mesh_path(usd, env_scale, bounds)
     if path.exists():
         return path
     MESH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [sim_python or "python", str(_HERE / "extract_scene_mesh.py"), str(usd),
+    cmd = [sim_python or "python", str(_HERE / "extract_scene_mesh.py"),
+           str(retarget_usd(usd)),
            "--env-scale", str(env_scale), "--out", str(path),
            "--sample-h", str(SCENE_MESH_SAMPLE_H),
            "--ground-deg", str(SCENE_MESH_GROUND_DEG),
@@ -736,7 +760,8 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
     if scenario.get("obstacle_assets"):
         sim_cmd += ["--obstacle-assets"]
     if scenario["usd_environment"]:
-        sim_cmd += ["--usd-environment", scenario["usd_environment"],
+        # retarget_usd: identity unless GSDS_USD_STAGE_ROOT is set (OSMO).
+        sim_cmd += ["--usd-environment", retarget_usd(scenario["usd_environment"]),
                     "--env-scale", str(scenario["env_scale"])]
     else:
         sim_cmd += ["--environment", scenario["environment"]]
