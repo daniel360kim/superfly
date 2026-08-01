@@ -1,0 +1,11 @@
+[
+  {
+    "name": "diffaero_field_s0",
+    "obstacles": "diffaero",
+    "seed": 0,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  }
+]

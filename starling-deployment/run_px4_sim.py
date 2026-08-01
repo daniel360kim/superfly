@@ -66,6 +66,15 @@ _pre_args, _ = _pre_parser.parse_known_args()
 
 simulation_app = SimulationApp({"headless": _pre_args.headless})
 
+# Optional non-interactive Nucleus auth via an Omniverse Navigator API token
+# (OMNI_API_TOKEN env var) -- no-op if unset, so existing username/password /
+# interactive-login paths are untouched.
+import os as _os
+_omni_api_token = _os.environ.get("OMNI_API_TOKEN")
+if _omni_api_token:
+    import omni.client
+    omni.client.register_authentication_callback(lambda prefix: ("$omni-api-token", _omni_api_token))
+
 import time
 from pathlib import Path
 import omni.timeline
@@ -88,7 +97,7 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from depth_transport import DepthPublisher, RENDER_H, RENDER_W
+from depth_transport import DepthPublisher, RgbPublisher, RENDER_H, RENDER_W
 from agile_debug_transport import AgileDebugSubscriber
 from obstacle_field import generate as generate_field
 
@@ -187,6 +196,21 @@ AG_FOV_X_DEG = 91.0                     # flightmare.yaml camera.fov
 AG_CAM_ANGLE_DEG = 0.0                  # forward, no downward pitch
 AG_FAR = 20.0
 
+# --- gs_drone_sim (gsds / gsds_depth) camera params ---
+# Matches the gs_drone_sim policy-observation camera (env.py / render_cache.py):
+# 224x224 NATIVE render (the student trained on native-224 gsplat renders, so
+# no high-res+downsample step), square pixels, 90 deg FOV both axes, forward
+# (no pitch), planar Z-depth. The student's depth encoding clips to
+# [0.3, 100] m with far/sky = 100 (DEPTH_HI); we publish far = GS_FAR = 100.
+# NOTE the u16-mm wire codec saturates at 65.535 m -- wrapper/gsds_core.py
+# remaps received pixels >= 65 m back to 100 m before encoding. The SAME
+# camera also feeds a JPEG RGB stream (RgbPublisher, port 15002): the RGB
+# student needs RGB frames, and both are published for either policy name.
+GS_SIZE = 224
+GS_FOV_X_DEG = 90.0
+GS_CAM_ANGLE_DEG = 0.0                  # forward, no downward pitch
+GS_FAR = 100.0
+
 # --- RGB "drone_camera" used only for video logging (--record-rgb-video) ---
 # The policy depth cameras render at 64x36..128x72, far too small to watch, so
 # recording RGB gets its own camera at a watchable resolution. It is mounted at
@@ -260,7 +284,11 @@ class Mp4Writer:
 
     def _reencode_h264(self):
         """OpenCV mp4v (MPEG-4 part 2) plays in QuickTime but not VS Code/Cursor
-        (Chromium needs H.264). Re-encode once at close; no-op if ffmpeg missing."""
+        (Chromium needs H.264). Re-encode once at close; no-op if ffmpeg missing.
+        Never let a failure here escape -- release() has already finalized the
+        original mp4v file by the time this runs, and a caller (_close_videos)
+        must not have that finalization of OTHER writers skipped just because
+        this cosmetic step broke."""
         if self._failed or not self.path.exists() or self.path.stat().st_size == 0:
             return
         tmp = self.path.with_name(f"{self.path.stem}._h264{self.path.suffix}")
@@ -272,17 +300,23 @@ class Mp4Writer:
                 check=True,
             )
             tmp.replace(self.path)
-        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        except Exception as e:
             carb.log_warn(f"{self.label} video H.264 re-encode failed: {e}")
             if tmp.exists():
                 tmp.unlink()
 
-    def close(self):
+    def release(self):
+        """Finalize the underlying mp4 (writes the moov atom/frame index) --
+        the step that MUST happen for every writer even if another writer's
+        close() has trouble. Safe to call multiple times."""
         if self._writer is not None:
             self._writer.release()
             self._writer = None
-            self._reencode_h264()
             print(f"[record] saved {self.label} video -> {self.path}")
+
+    def close(self):
+        self.release()
+        self._reencode_h264()
 
 
 class PegasusApp:
@@ -370,21 +404,25 @@ class PegasusApp:
             from obstacle_field import generate_diffaero
             self.field = generate_diffaero(seed=seed, scale=scale)
             print("[obstacle_field]", self.field.summary())
-            self._spawn_obstacles(self.field)
             if tuple(spawn_xyz) != _SPAWN_DEFAULT:
                 spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]),
                              float(spawn_xyz[2])]
             else:
                 spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
+            # obstacles spawned AFTER the effective spawn is known so the
+            # asset substitution can keep a clear takeoff corridor (below)
+            self._asset_clear_xy = (spawn_pos[0], spawn_pos[1])
+            self._spawn_obstacles(self.field)
         else:
             self.field = generate_field(seed=seed, scale=scale)
             print("[obstacle_field]", self.field.summary())
-            self._spawn_obstacles(self.field)
             if tuple(spawn_xyz) != _SPAWN_DEFAULT:
                 spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]),
                              float(spawn_xyz[2])]
             else:
                 spawn_pos = [float(self.field.p_init[0]), float(self.field.p_init[1]), 0.1]
+            self._asset_clear_xy = (spawn_pos[0], spawn_pos[1])
+            self._spawn_obstacles(self.field)
 
         self._spawn_pos = spawn_pos  # kept for the trajectory npz 'start' field
 
@@ -401,6 +439,8 @@ class PegasusApp:
             self._setup_camera_depthnav()
         elif policy == "agile":
             self._setup_camera_agile()
+        elif policy in ("gsds", "gsds_depth"):
+            self._setup_camera_gsds()
         else:
             self._setup_camera_diffphys()
         config_multirotor.graphical_sensors = [self._camera]
@@ -446,6 +486,8 @@ class PegasusApp:
 
         self.world.reset()
         self._depth_pub = DepthPublisher()
+        self._rgb_pub = (RgbPublisher()
+                         if self.policy in ("gsds", "gsds_depth") else None)
         self._agile_debug_sub = (AgileDebugSubscriber() if self.policy == "agile" else None)
         self._last_agile_depth = None
         self._dbg_n = 0           # frame counter for throttled debug dumps
@@ -557,6 +599,34 @@ class PegasusApp:
         self._camera.fy = self._camera.fx
         self._camera.cx = 0.5 * AG_RENDER_W
         self._camera.cy = 0.5 * AG_RENDER_H
+        self._camera._intrinsics = np.array([
+            [self._camera.fx, 0.0, self._camera.cx],
+            [0.0, self._camera.fy, self._camera.cy],
+            [0.0, 0.0, 1.0]])
+
+    def _setup_camera_gsds(self):
+        """Forward-facing depth+RGB camera for gs_drone_sim students.
+
+        224x224 NATIVE render at 90 deg FOV, square pixels (fy == fx), no
+        pitch, mounted at body [0.1, 0, 0] -- matching GSDroneEnv's policy
+        observation camera (width=height=224, fov_deg=90, OpenCV pinhole with
+        the principal point at center). The student trained on native-224
+        gsplat renders, so we render at the net input size directly (no
+        high-res + downsample step). _publish_depth_gsds ships planar Z-depth
+        (compress=True) AND the same camera's RGB as JPEG (RgbPublisher)."""
+        self._camera = MonocularCamera("depth_cam", config={
+            "depth": True,
+            "position": np.array([0.10, 0.0, 0.0]),
+            "orientation": np.array([0.0, -GS_CAM_ANGLE_DEG, 180.0]),
+            "resolution": (GS_SIZE, GS_SIZE),
+            "frequency": 30,
+            "intrinsics": None,
+        })
+        self._camera.fov = GS_FOV_X_DEG
+        self._camera.fx = 0.5 * GS_SIZE / math.tan(0.5 * math.radians(GS_FOV_X_DEG))
+        self._camera.fy = self._camera.fx
+        self._camera.cx = 0.5 * GS_SIZE
+        self._camera.cy = 0.5 * GS_SIZE
         self._camera._intrinsics = np.array([
             [self._camera.fx, 0.0, self._camera.cx],
             [0.0, self._camera.fy, self._camera.cy],
@@ -708,9 +778,36 @@ class PegasusApp:
         arng = np.random.default_rng(self._seed + 12345) if use_assets else None
         n_asset = 0  # successfully spawned realistic assets
 
+        # Eval-albedo A/B surface (GSDS_OBSTACLE_ALBEDO=random): per-obstacle
+        # randomized primitive colors, deterministic per seed. The draw happens
+        # for EVERY obstacle index regardless of mode or asset fallback, so the
+        # color stream is index-stable and a fixed/random pair is exact.
+        # Unset/"fixed" keeps today's hard-coded colors (byte-identical scenes).
+        crng = np.random.default_rng(self._seed + 424242)
+        _albedo_random = _os.environ.get("GSDS_OBSTACLE_ALBEDO", "fixed") == "random"
+
+        def _albedo(default):
+            c = crng.uniform(0.05, 0.95, size=3)
+            return c if _albedo_random else (np.asarray(default) if default is not None else None)
+
+        # Takeoff-corridor protection: USD assets can be visually/physically
+        # LARGER than the analytic primitive they replace (tree canopies
+        # especially), so an asset near the spawn can obstruct the vertical
+        # climb even though the primitive field left it clear — observed
+        # 2026-07-28 (assets s12: 58 s climb, tumbling takeoff). Within
+        # GSDS_ASSET_SPAWN_CLEAR metres of the spawn XY, keep the primitive.
+        _clear_xy = getattr(self, "_asset_clear_xy", None)
+        _clear_r = float(_os.environ.get("GSDS_ASSET_SPAWN_CLEAR", "5.0"))
+
+        def _near_spawn(cx, cy):
+            return (_clear_xy is not None and
+                    (cx - _clear_xy[0]) ** 2 + (cy - _clear_xy[1]) ** 2
+                    < _clear_r ** 2)
+
         # Spheres -> rocks (uniform scale so they stay round).
         for i, (cx, cy, cz, r) in enumerate(fld.spheres):
-            if use_assets and self._spawn_asset(
+            col = _albedo([0.8, 0.3, 0.3])
+            if use_assets and not _near_spawn(cx, cy) and self._spawn_asset(
                     f"/World/obstacles/sphere_{i}", "rock", arng,
                     pos=(cx, cy, cz), full_size=(2 * r, 2 * r, 2 * r), uniform=True):
                 n_asset += 1
@@ -719,13 +816,14 @@ class PegasusApp:
                 prim_path=f"/World/obstacles/sphere_{i}",
                 position=np.array([cx, cy, cz]),
                 radius=float(r),
-                color=np.array([0.8, 0.3, 0.3]),
+                color=np.asarray(col, dtype=float),
             )
         # Boxes (voxels): half-extents -> full-size scale. DiffPhys boxes are
         # axis-aligned 6-tuples; DiffAero boxes are 9-tuples carrying an XYZ-euler
         # rotation (radians) for tilted pillars. Slender+tall boxes become "tall"
         # assets (trees/poles/buildings); the rest become "low" clutter.
         for i, box in enumerate(fld.boxes):
+            col = _albedo([0.3, 0.5, 0.8])
             cx, cy, cz, hx, hy, hz = box[:6]
             roll = pitch = yaw = 0.0
             orientation = None
@@ -733,7 +831,7 @@ class PegasusApp:
                 roll, pitch, yaw = box[6], box[7], box[8]
                 q = Rotation.from_euler("XYZ", [roll, pitch, yaw]).as_quat()  # [x,y,z,w]
                 orientation = np.array([q[3], q[0], q[1], q[2]])  # FixedCuboid wants [w,x,y,z]
-            if use_assets:
+            if use_assets and not _near_spawn(cx, cy):
                 cat = "tall" if hz >= 1.5 * max(hx, hy) else "low"
                 if self._spawn_asset(
                         f"/World/obstacles/box_{i}", cat, arng,
@@ -746,13 +844,14 @@ class PegasusApp:
                 position=np.array([cx, cy, cz]),
                 scale=np.array([2 * hx, 2 * hy, 2 * hz]),
                 orientation=orientation,
-                color=np.array([0.3, 0.5, 0.8]),
+                color=np.asarray(col, dtype=float),
             )
         # Vertical cylinders (axis = world Z), tall enough to span the flight
         # band -> "tall" assets (trees/poles), else a primitive cylinder.
         CYL_HEIGHT = 12.0
         for i, (cx, cy, r) in enumerate(fld.cyl_v):
-            if use_assets and self._spawn_asset(
+            col = _albedo(None)  # fixed mode: bare prim, no displayColor (byte-identical)
+            if use_assets and not _near_spawn(cx, cy) and self._spawn_asset(
                     f"/World/obstacles/cylv_{i}", "tall", arng,
                     pos=(cx, cy, CYL_HEIGHT / 2 - 1.0),
                     full_size=(2 * r, 2 * r, CYL_HEIGHT)):
@@ -760,33 +859,41 @@ class PegasusApp:
                 continue
             self._spawn_cylinder(f"/World/obstacles/cylv_{i}",
                                  pos=(cx, cy, CYL_HEIGHT / 2 - 1.0),
-                                 radius=float(r), height=CYL_HEIGHT, axis="Z")
+                                 radius=float(r), height=CYL_HEIGHT, axis="Z",
+                                 color=col)
         # Horizontal cylinders (2 minor ground obstacles). Stored (cx,cy,cz,r)
         # after the field rotation; spawn lying along world X. Kept as primitives.
         CYLH_LEN = 6.0
         for i, (cx, cy, cz, r) in enumerate(fld.cyl_h):
+            col = _albedo(None)
             self._spawn_cylinder(f"/World/obstacles/cylh_{i}",
                                  pos=(cx, cy, cz),
-                                 radius=float(r), height=CYLH_LEN, axis="X")
+                                 radius=float(r), height=CYLH_LEN, axis="X",
+                                 color=col)
 
         if use_assets:
             total = len(fld.spheres) + len(fld.boxes) + len(fld.cyl_v)
             print(f"[obstacle_assets] spawned {n_asset}/{total} realistic assets "
                   f"({total - n_asset} fell back to primitives)")
 
-    def _spawn_cylinder(self, path, pos, radius, height, axis="Z"):
+    def _spawn_cylinder(self, path, pos, radius, height, axis="Z", color=None):
         """Create a static USD Cylinder prim. UsdGeom.Cylinder is Z-axis by default;
-        for a world-X horizontal cylinder, rotate 90° about Y."""
+        for a world-X horizontal cylinder, rotate 90° about Y. color=None leaves
+        the prim bare (historical default-gray look)."""
         orientation = None
         if axis == "X":
             q = Rotation.from_euler("XYZ", [0.0, 90.0, 0.0], degrees=True).as_quat()  # [x,y,z,w]
             orientation = np.array([q[3], q[0], q[1], q[2]])  # create_prim wants [w,x,y,z]
-        prim_utils.create_prim(
+        prim = prim_utils.create_prim(
             path, "Cylinder",
             position=np.array([float(pos[0]), float(pos[1]), float(pos[2])]),
             orientation=orientation,
             attributes={"radius": float(radius), "height": float(height), "axis": "Z"},
         )
+        if color is not None:
+            from pxr import Gf, UsdGeom
+            UsdGeom.Gprim(prim).GetDisplayColorAttr().Set(
+                [Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
 
     def _publish_depth(self):
         if self.policy == "diffaero":
@@ -795,6 +902,8 @@ class PegasusApp:
             self._publish_depth_depthnav()
         elif self.policy == "agile":
             self._publish_depth_agile()
+        elif self.policy in ("gsds", "gsds_depth"):
+            self._publish_depth_gsds()
         else:
             self._publish_depth_diffphys()
 
@@ -939,6 +1048,51 @@ class PegasusApp:
         self._dump_depth_debug(depth)
         self._record_depth_video_frame(depth)
 
+    def _publish_depth_gsds(self):
+        """Publish the 224x224 planar metric depth + JPEG RGB for gsds students.
+
+        The camera renders natively at GS_SIZE so no resize is needed. Depth:
+        far/no-return pixels -> GS_FAR (100 m, the student's DEPTH_HI), shipped
+        zlib-u16-mm compressed (saturates at 65.535 m on the wire; the offboard
+        remaps >= 65 m back to 100 m before the net's log encoding). RGB: the
+        SAME camera's render product, shipped JPEG (RgbPublisher, port 15002).
+        Convention: row 0 = up, col 0 = left (as the other paths)."""
+        cam, full_set = self._camera_ready()
+        if cam is None or not full_set:
+            return
+        depth = cam.get_depth()
+        if depth is None:
+            return
+        depth = np.asarray(depth, dtype=np.float32)
+        if depth.size == 0:
+            return
+        depth = np.nan_to_num(depth, nan=GS_FAR, posinf=GS_FAR, neginf=GS_FAR)
+        depth = np.clip(depth, 0.0, GS_FAR)
+        if depth.shape != (GS_SIZE, GS_SIZE):
+            depth = cv2.resize(depth, (GS_SIZE, GS_SIZE),
+                               interpolation=cv2.INTER_LINEAR)
+        depth = np.ascontiguousarray(depth)
+        self._depth_pub.send(depth, compress=True)
+
+        if self._rgb_pub is not None:
+            try:
+                rgb = cam.get_rgb()
+            except Exception:
+                rgb = None
+            if rgb is not None:
+                rgb = np.asarray(rgb)
+                if rgb.ndim == 3 and rgb.shape[2] >= 3 and rgb.size:
+                    rgb = rgb[:, :, :3]
+                    if rgb.dtype != np.uint8:
+                        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                    if rgb.shape[:2] != (GS_SIZE, GS_SIZE):
+                        rgb = cv2.resize(rgb, (GS_SIZE, GS_SIZE),
+                                         interpolation=cv2.INTER_LINEAR)
+                    self._rgb_pub.send(rgb)
+
+        self._dump_depth_debug(depth)
+        self._record_depth_video_frame(depth)
+
     def _dump_depth_debug(self, depth):
         """Save the EXACT published depth array + the drone's RGB view to
         camera_debug.png (+ depth .npy) every N frames. RGB comes from the SAME
@@ -965,7 +1119,8 @@ class PegasusApp:
             ncols = 2 if rgb is not None else 1
             fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4.5), squeeze=False)
 
-            depth_vmax = {"diffaero": DA_MAX_DIST, "agile": AG_FAR}.get(self.policy, 24.0)
+            depth_vmax = {"diffaero": DA_MAX_DIST, "agile": AG_FAR,
+                          "gsds": 30.0, "gsds_depth": 30.0}.get(self.policy, 24.0)
             ax = axes[0][0]
             im = ax.imshow(depth, origin="upper", cmap="turbo", vmin=0.3, vmax=depth_vmax)
             fig.colorbar(im, ax=ax, label="range [m]" if self.policy == "diffaero" else "depth [m]")
@@ -1158,6 +1313,11 @@ class PegasusApp:
             # The net consumes the raw 224x224 planar depth (mm/80 encoding is
             # monotone in this grid), so this IS the policy's input view.
             return np.clip(depth, 0.0, AG_FAR), AG_FAR
+        if self.policy in ("gsds", "gsds_depth"):
+            # The net consumes the 224x224 planar depth log-encoded to
+            # [0.3, 100]; vmax 30 keeps near-field obstacle structure visible
+            # in the colormap (100 would flatten everything interesting).
+            return np.clip(depth, 0.0, 30.0), 30.0
         d = np.clip(depth, 0.3, 24.0)
         d = d.reshape(RENDER_H // 4, 4, RENDER_W // 4, 4).min(axis=(1, 3))
         return d, 24.0
@@ -1203,9 +1363,16 @@ class PegasusApp:
             carb.log_warn(f"rgb video frame failed: {e}")
 
     def _close_videos(self):
-        for writer in (self._depth_video, self._rgb_video):
-            if writer is not None:
-                writer.close()
+        # release() (the moov-atom-writing step) MUST run for every writer
+        # before any writer's cosmetic h264 re-encode, so a re-encode failure
+        # on one video (e.g. depth) can never leave another (e.g. rgb)
+        # un-finalized -- that previously produced "moov atom not found"
+        # files for whichever writer closed after the one that failed.
+        writers = [w for w in (self._depth_video, self._rgb_video) if w is not None]
+        for writer in writers:
+            writer.release()
+        for writer in writers:
+            writer._reencode_h264()
 
     def _log_pose(self, t):
         """Append (t, pos_enu(3), vel_enu(3)) from the drone's ground-truth state.
@@ -1260,6 +1427,18 @@ class PegasusApp:
                                  if fld.cyl_v else np.zeros((0, 3), dtype=np.float64))
                 data["cyl_h"] = (np.asarray(fld.cyl_h, dtype=np.float64).reshape(-1, 4)
                                  if fld.cyl_h else np.zeros((0, 4), dtype=np.float64))
+            # With --obstacle-assets the spawned USD meshes are NOT the analytic
+            # primitives: each asset is bbox-matched to the primitive it replaces,
+            # so a tree standing in for a cylinder has a thin trunk and a wide
+            # canopy. Scoring against the primitive then calls solid a volume the
+            # drone can legally fly through (and misses canopy it cannot), biasing
+            # exactly the clearance/collision numbers the comparison turns on.
+            # Log the geometry that was actually spawned so metrics.py can score
+            # that instead (sampling happens AFTER the baseline npz write below:
+            # instancer-foliage assets take a while to expand+sample, and the
+            # harness's post-stop grace kill must never cost us the trajectory —
+            # that exact loss masked the s5/s7/s12 stuck-in-canopy result, see
+            # ATTEMPTS 2026-07-29).
             if self._goal_xyz is not None:
                 g = np.asarray(self._goal_xyz, dtype=np.float64).reshape(-1)
                 if g.size == 2:  # --goal X Y: fill Z from the spawn altitude
@@ -1271,6 +1450,28 @@ class PegasusApp:
             data["start"] = np.asarray(start, dtype=np.float64)
             np.savez(out, **data)
             print(f"[log-traj] saved {traj.shape[0]} poses -> {out}")
+            if getattr(self, "obstacle_assets", False):
+                try:
+                    _cmp = str(Path(__file__).resolve().parent / "compare")
+                    if _cmp not in sys.path:
+                        sys.path.insert(0, _cmp)
+                    from mesh_sampling import sample_subtree
+                    S, meta = sample_subtree(self.world.stage, "/World/obstacles",
+                                             sample_h=0.05)
+                    if S.shape[0]:
+                        data["obst_samples"] = S
+                        data["obst_sample_h"] = float(meta["sample_h"])
+                        np.savez(out, **data)   # re-save WITH samples
+                        print(f"[obstacle_assets] logged {S.shape[0]} surface samples "
+                              "of /World/obstacles for scoring")
+                    else:
+                        print("[obstacle_assets] WARNING: no mesh samples under "
+                              "/World/obstacles; scoring falls back to the analytic "
+                              "field, which does NOT match the spawned assets.",
+                              file=sys.stderr)
+                except Exception as e:
+                    print(f"[obstacle_assets] surface sampling failed ({e}); scoring "
+                          "falls back to the analytic field.", file=sys.stderr)
         except Exception as e:
             carb.log_warn(f"trajectory save failed: {e}")
 
@@ -1359,13 +1560,16 @@ def main():
     parser.add_argument("--spawn-yaw", type=float, default=0.0,
                         help="Spawn yaw [deg]. EKF heading is mag-locked in sim, so this "
                              "mainly affects the initial facing; the field is rotated instead.")
-    parser.add_argument("--policy", choices=["diffphys", "diffaero", "depthnav", "agile"],
+    parser.add_argument("--policy", choices=["diffphys", "diffaero", "depthnav", "agile",
+                                             "gsds", "gsds_depth"],
                         default="diffphys",
                         help="Which policy's camera/depth pipeline to configure: "
                              "diffphys (12x16, 78.6 deg, 24 m, planar, pitched 20 deg down), "
                              "diffaero (9x16, 86 deg, 5 m, Euclidean, forward), "
-                             "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward), or "
-                             "agile (640x480 render -> 224x224, 91 deg, 20 m, planar, forward).")
+                             "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward), "
+                             "agile (640x480 render -> 224x224, 91 deg, 20 m, planar, forward), or "
+                             "gsds/gsds_depth (gs_drone_sim students: 224x224 native, 90 deg, "
+                             "100 m, planar depth + JPEG RGB, forward).")
     parser.add_argument("--obstacles", choices=["diffphys", "diffaero", "none"], default="diffphys",
                         help="Obstacle-field distribution: diffphys, diffaero, or none "
                              "(scene geometry only, no procedural primitives).")

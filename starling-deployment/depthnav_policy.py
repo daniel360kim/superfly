@@ -11,7 +11,17 @@ Ground-truth config (saved logs/level1/level1.yaml for ckpt level1_4_iteration_1
   action_type=THRUST_YAW, inertial_frame=START, target_type=TARGET_VELOCITY_TARGET_DISTANCE
   output_activation=acceleration_bounded_yaw  -> action[:3]=thrust accel (gravity-INCLUSIVE),
                                                  action[3]=yaw in [-pi,pi]
-  depth 72x128, near 0.25, far 20.0 ; GRU hidden 192 ; 50 Hz ; target_speed in [1,5]
+  depth 72x128, near 0.25, far 20.0 ; GRU hidden 192 ; 50 Hz ; target_speed in [2,4]
+  (NOTE Uniform.generate spans mean +/- half/2, so the config's mean 3 / half 2
+   is [2,4] m/s, not the [1,5] previously documented here.)
+
+Velocity-command variant (action_mode="velocity", policy_cfg/small_yaw_vel.yaml):
+  action_type=VELOCITY_YAW, output_activation=velocity_bounded_yaw
+  -> action[:3]=velocity setpoint in m/s (START frame), action[3]=yaw
+  Trained for target_speed in [0.7, 1.5] m/s with bounds max_vel_xy=2.5,
+  max_vel_z=1.5. Send the raw output: unlike wrapper/diffaero_vel_core.py we do
+  NOT re-apply a client-side first-order lag, because the training sim already
+  models PX4's velocity loop explicitly.
 
 Frames: depthnav uses ENU (std frame). START = world-aligned at spawn, fixed thereafter.
 We capture R_ws (world<-start) once at policy handoff; state/target/thrust are START-frame.
@@ -24,8 +34,18 @@ import numpy as np
 import torch as th
 from scipy.spatial.transform import Rotation
 
-# depthnav package
-_DEPTHNAV = "/home/ubuntu/superfly/depthnav"
+# depthnav package. Overridable because the checkout path differs per machine;
+# the previous hardcoded /home/ubuntu path does not exist on every host and
+# broke both the import below and the default cfg_path.
+_DEPTHNAV = os.environ.get(
+    "DEPTHNAV_ROOT",
+    os.path.join(os.path.expanduser("~"), "superfly", "depthnav"),
+)
+if not os.path.isdir(_DEPTHNAV):
+    raise RuntimeError(
+        f"depthnav checkout not found at {_DEPTHNAV!r}. "
+        "Set DEPTHNAV_ROOT to the repository root."
+    )
 sys.path.insert(0, _DEPTHNAV)
 from gymnasium import spaces
 from depthnav.policies.multi_input_policy import MultiInputPolicy
@@ -42,6 +62,15 @@ DEFAULT_CKPT = os.path.join(
 # matches the docstring above. DepthNavPolicy only reads the `policy:` key.
 DEFAULT_CFG = os.path.join(
     _DEPTHNAV, "examples/navigation/policy_cfg/small_yaw.yaml")
+
+# Velocity-command policies (action_type=VELOCITY_YAW). action[:3] is a
+# velocity setpoint in m/s in the START frame rather than a thrust vector; the
+# yaw channel is unchanged. See depthnav/envs/dynamics.py.
+VELOCITY_CFG = os.path.join(
+    _DEPTHNAV, "examples/navigation/policy_cfg/small_yaw_vel.yaml")
+
+ACTION_THRUST = "thrust"
+ACTION_VELOCITY = "velocity"
 
 DEPTH_H, DEPTH_W = 72, 128
 DEPTH_NEAR, DEPTH_FAR = 0.25, 20.0
@@ -69,13 +98,39 @@ def _quat_wxyz_from_R(R: np.ndarray) -> np.ndarray:
 
 class DepthNavPolicy:
     def __init__(self, checkpoint_path: str = DEFAULT_CKPT,
-                 cfg_path: str = DEFAULT_CFG, target_speed: float = 3.0,
-                 device: str = None):
+                 cfg_path: str = None, target_speed: float = 3.0,
+                 action_mode: str = ACTION_THRUST, device: str = None):
+        if action_mode not in (ACTION_THRUST, ACTION_VELOCITY):
+            raise ValueError(f"action_mode must be thrust or velocity, got {action_mode!r}")
+        self.action_mode = action_mode
+        if cfg_path is None:
+            cfg_path = VELOCITY_CFG if action_mode == ACTION_VELOCITY else DEFAULT_CFG
+
         self.device = th.device(device or ("cuda" if th.cuda.is_available() else "cpu"))
         with open(cfg_path) as f:
             cfg = yaml.safe_load(f)
         policy_kwargs = dict(cfg["policy"])
         policy_kwargs["device"] = str(self.device)
+
+        # Cross-check the config against the requested mode. A mismatch is
+        # silent otherwise -- both heads are Linear(192, 4) and load cleanly --
+        # and the units would be wrong by an order of magnitude.
+        activation = str(policy_kwargs.get("output_activation_fn", ""))
+        expected = ("velocity_bounded_yaw" if action_mode == ACTION_VELOCITY
+                    else "acceleration_bounded_yaw")
+        if activation != expected:
+            raise ValueError(
+                f"action_mode={action_mode!r} expects output_activation_fn="
+                f"{expected!r}, but {cfg_path} has {activation!r}. "
+                "A velocity checkpoint loaded as thrust (or vice versa) flies "
+                "on commands that are wrong by ~10x."
+            )
+        env_kwargs = cfg.get("update_env_kwargs", {})
+        cfg_action_type = env_kwargs.get("action_type")
+        if action_mode == ACTION_VELOCITY and cfg_action_type != "VELOCITY_YAW":
+            raise ValueError(
+                f"{cfg_path} has action_type={cfg_action_type!r}, expected 'VELOCITY_YAW'"
+            )
 
         self.model = MultiInputPolicy(_build_obs_space(), **policy_kwargs)
         self.model.load(checkpoint_path)   # load_state_dict + to(device)
@@ -101,7 +156,12 @@ class DepthNavPolicy:
 
     @th.no_grad()
     def step(self, position_enu, velocity_enu, R_enu, goal_enu, depth_m=None):
-        """One control step. Returns (thrust_world(3) [m/s^2, gravity-incl], yaw_world).
+        """One control step. Returns (command_world(3), yaw_world).
+
+        command_world is a gravity-inclusive thrust acceleration in m/s^2 when
+        action_mode == "thrust", or a velocity setpoint in m/s (world ENU) when
+        action_mode == "velocity". In both cases it is the policy's START-frame
+        output rotated into the world frame -- only the units differ.
 
         position_enu, velocity_enu, R_enu: current drone state (ENU/FLU world frame).
         goal_enu: goal position (ENU). depth_m: (72,128) metric metres or None.
@@ -148,13 +208,15 @@ class DepthNavPolicy:
         action, self.latent = self.model(obs, self.latent)
         action = action.squeeze(0).cpu().numpy()
 
-        thrust_start = action[:3]               # gravity-inclusive thrust accel, START frame
+        # action[:3] is a thrust accel (m/s^2, gravity-inclusive) or a velocity
+        # setpoint (m/s) depending on action_mode; the rotation is the same.
+        cmd_start = action[:3]
         yaw_start = float(action[3])            # desired yaw in START frame [-pi,pi]
-        thrust_world = R_ws @ thrust_start
+        cmd_world = R_ws @ cmd_start
 
         # world yaw = start_yaw + policy yaw; start_yaw = heading of START frame x-axis
         start_fwd = R_ws[:, 0]
         start_yaw = float(np.arctan2(start_fwd[1], start_fwd[0]))
         yaw_world = start_yaw + yaw_start
 
-        return thrust_world, yaw_world
+        return cmd_world, yaw_world

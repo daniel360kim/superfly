@@ -12,7 +12,13 @@ reports -- all pure NumPy, no Isaac/torch, so it runs anywhere and is unit-testa
                        comment) AND never collided
   - collision/clear  : collided (clearance < 0 at any tick) + minimum clearance,
                        clearance = (distance from drone centre to nearest obstacle
-                       surface) - drone_radius, via per-shape signed-distance fns
+                       surface) - drone_radius, via per-shape signed-distance fns.
+                       Scored over the POLICY flight segment (handoff -> first
+                       goal hit / policy end) in EVERY branch -- analytic field,
+                       obstacle samples, and scene mesh alike; the scripted
+                       climb-out and post-goal landing are excluded from the
+                       headline, with the whole-log numbers preserved as
+                       min_clearance_incl_climb_m / collided_incl_climb
   - time & speed     : time-to-goal (POLICY flight only: policy handoff ->
                        horizontal arrival over the goal, excluding the scripted
                        takeoff/climb/yaw AND the terminal descent/landing that a
@@ -249,7 +255,14 @@ def takeoff_index(t, speed):
             search_from = j
             break
         i = j
-    sustained = np.convolve(moving[search_from:].astype(int),
+    seg = moving[search_from:]
+    if seg.size < TAKEOFF_HOLD_N:
+        # Degenerate log: the parked stretch ran to (or almost to) the end,
+        # so there is no post-settling window left to search (search_from can
+        # be n itself, making the segment EMPTY -- np.convolve would raise).
+        # A drone with no sustained motion after settling never took off.
+        return None
+    sustained = np.convolve(seg.astype(int),
                             np.ones(TAKEOFF_HOLD_N, dtype=int), "valid") == TAKEOFF_HOLD_N
     if not sustained.any():
         return None
@@ -279,6 +292,8 @@ def policy_start_index(t, P, V, tko, climb_alt):
         return None
     frm = tko + int(gated[0])
     moving = np.linalg.norm(V[frm:, :2], axis=1) > POLICY_HSPEED_MPS
+    if moving.size < TAKEOFF_HOLD_N:
+        return None   # gate hit only at the very end of the log; no window left
     sustained = np.convolve(moving.astype(int),
                             np.ones(TAKEOFF_HOLD_N, dtype=int), "valid") == TAKEOFF_HOLD_N
     if not sustained.any():
@@ -308,9 +323,13 @@ def score_trajectory(npz_path, drone_radius=0.2, goal_radius=1.0, scene_mesh=Non
                      climb_alt=DEFAULT_CLIMB_ALT):
     """Score one logged flight. Returns a flat dict of metrics (JSON-friendly).
 
-    scene_mesh: optional path to an extract_scene_mesh.py .npz; used for
-    clearance/collision when the log carries no analytic obstacle field
-    (USD-scene scenarios). Ignored when the analytic field is present.
+    Clearance geometry, in priority order:
+      1. `obst_samples` in the log -- surface samples of the /World/obstacles
+         prims actually spawned (written by run_px4_sim on --obstacle-assets
+         runs, where the analytic primitives were replaced by USD meshes).
+      2. the analytic obstacle field, when logged.
+      3. `scene_mesh` -- an extract_scene_mesh.py .npz, for USD-scene scenarios
+         that carry no analytic field. Ignored when 1 or 2 applies.
     climb_alt: the scenario's scripted climb height [m], used only by the
     heuristic policy-start detection on logs without phase timestamps."""
     z = _load(npz_path)
@@ -403,14 +422,56 @@ def score_trajectory(npz_path, drone_radius=0.2, goal_radius=1.0, scene_mesh=Non
         res["time_to_goal_s"] = None
 
     # --- collision / clearance (only if a field was logged) ---
+    # ALL clearance branches score the POLICY flight segment: policy handoff
+    # (falling back to takeoff when the handoff is unknown) -> first 3D goal
+    # hit (or the policy->landing handoff / log end if the goal was never
+    # reached). The scripted climb-out is EXCLUDED from the headline number:
+    # it happens at the spawn under harness (not policy) control, and the
+    # field generator can leave an obstacle inside the climb corridor
+    # (observed 2026-07-30: diffaero seed 10 / scale 6.5 leaves a sphere
+    # surface 0.31 m from the spawn; the scripted climb drifted into it and
+    # the trial was charged with a collision although its policy flight was
+    # clean by +0.66 m). The full-trajectory numbers are preserved separately
+    # as min_clearance_incl_climb_m / collided_incl_climb so nothing is lost.
+    seg0 = p_start if p_start is not None else tko
+    if first_hit is not None:
+        seg_end = first_hit + 1
+    elif p_end is not None:
+        seg_end = min(p_end + 1, P.shape[0])
+    else:
+        seg_end = P.shape[0]
+    have_seg = seg0 is not None and seg0 < seg_end
+
+    def _windowed_clearance(clr_full):
+        """Fill the clearance fields from a full-trajectory clearance array:
+        headline = policy segment (full traj when the window is unknown),
+        *_incl_climb = whole log."""
+        res["min_clearance_incl_climb_m"] = float(np.min(clr_full))
+        res["collided_incl_climb"] = bool(np.any(clr_full < 0.0))
+        clr = clr_full[seg0:seg_end] if have_seg else clr_full
+        res["min_clearance_m"] = float(np.min(clr))
+        res["collided"] = bool(np.any(clr < 0.0))
+        res["clearance_seg_s"] = ([float(t[seg0] - t[0]), float(t[seg_end - 1] - t[0])]
+                                  if have_seg else None)
+
     have_field = all(k in z for k in ("spheres", "boxes", "cyl_v", "cyl_h"))
-    if have_field:
+    have_obst_samples = "obst_samples" in z and np.asarray(z["obst_samples"]).size > 0
+    if have_obst_samples:
+        # --obstacle-assets run: the analytic field IS logged, but it describes
+        # primitives that were replaced at spawn time by bbox-matched USD meshes
+        # (a cylinder becomes a tree: thin trunk, wide canopy). Scoring the
+        # primitive would judge the drone against geometry that was never in the
+        # scene, so the sampled spawned surfaces win over the analytic field.
+        samples = np.asarray(z["obst_samples"], dtype=np.float64).reshape(-1, 3)
+        _windowed_clearance(_nearest_sample_dist(P, samples) - drone_radius)
+        res["clearance_source"] = "obstacle_samples"
+        res["obst_sample_h"] = float(z["obst_sample_h"]) if "obst_sample_h" in z else None
+        res["obst_n_samples"] = int(samples.shape[0])
+    elif have_field:
         field = {k: np.asarray(z[k], float).reshape(-1, n)
                  for k, n in (("spheres", 4), ("boxes", z["boxes"].shape[1] if z["boxes"].size else 6),
                               ("cyl_v", 3), ("cyl_h", 4))}
-        clr = clearance_along_traj(P, field) - drone_radius
-        res["min_clearance_m"] = float(np.min(clr))
-        res["collided"] = bool(np.any(clr < 0.0))
+        _windowed_clearance(clearance_along_traj(P, field) - drone_radius)
         res["clearance_source"] = "analytic_field"
     elif scene_mesh is not None:
         # USD-scene scenario: score against the extracted scene geometry over
@@ -424,18 +485,8 @@ def score_trajectory(npz_path, drone_radius=0.2, goal_radius=1.0, scene_mesh=Non
         # clearance -0.10 m against ground-adjacent samples on an otherwise
         # clean flight).
         samples, mesh_meta = load_scene_mesh(scene_mesh)
-        seg0 = p_start if p_start is not None else tko
-        if first_hit is not None:
-            end = first_hit + 1
-        elif p_end is not None:
-            end = min(p_end + 1, P.shape[0])
-        else:
-            end = P.shape[0]
-        if seg0 is not None and seg0 < end and samples.shape[0]:
-            clr = _nearest_sample_dist(P[seg0:end], samples) - drone_radius
-            res["min_clearance_m"] = float(np.min(clr))
-            res["collided"] = bool(np.any(clr < 0.0))
-            res["clearance_seg_s"] = [float(t[seg0] - t[0]), float(t[end - 1] - t[0])]
+        if have_seg and samples.shape[0]:
+            _windowed_clearance(_nearest_sample_dist(P, samples) - drone_radius)
         else:
             res["min_clearance_m"] = None
             res["collided"] = False
@@ -444,9 +495,9 @@ def score_trajectory(npz_path, drone_radius=0.2, goal_radius=1.0, scene_mesh=Non
         # The mesh is cropped to the planned flight corridor; if the drone
         # strayed within 10 m of (or past) the crop faces, clearance near
         # those samples may be against missing geometry -- flag it.
-        if mesh_meta.get("bounds") and seg0 is not None and seg0 < end:
+        if mesh_meta.get("bounds") and have_seg:
             b = np.asarray(mesh_meta["bounds"], float)
-            outside = np.any((P[seg0:end] < b[:3] + 10.0) | (P[seg0:end] > b[3:] - 10.0),
+            outside = np.any((P[seg0:seg_end] < b[:3] + 10.0) | (P[seg0:seg_end] > b[3:] - 10.0),
                              axis=1)
             res["clearance_bounds_exceeded"] = bool(outside.any())
     else:

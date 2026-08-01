@@ -1,0 +1,56 @@
+[
+  {
+    "name": "diffaero_field_s6",
+    "obstacles": "diffaero",
+    "seed": 6,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_field_s7",
+    "obstacles": "diffaero",
+    "seed": 7,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_field_s8",
+    "obstacles": "diffaero",
+    "seed": 8,
+    "scale": 5.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_dense_s10",
+    "obstacles": "diffaero",
+    "seed": 10,
+    "scale": 6.5,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 150,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_dense_s11",
+    "obstacles": "diffaero",
+    "seed": 11,
+    "scale": 6.5,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 150,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffaero_sparse_s12",
+    "obstacles": "diffaero",
+    "seed": 12,
+    "scale": 4.0,
+    "goal": [-3.0, 50.0, 2.0],
+    "timeout": 120,
+    "climb_alt": 5
+  }
+]

@@ -68,6 +68,13 @@ DA_RANDPOS_STD = (6.0, 7.0)               # (min, max) perpendicular std along t
 DA_SAFETY_RANGE = 1.7
 DA_HEIGHT_SCALE = 0.25                     # vertical std = std * height_scale
 DA_GROUND_Z = 0.0                          # Isaac Box Room ground plane (ENU z up)
+# Spawn/goal keep-out guarantee (see generate_diffaero): minimum TRUE surface
+# distance [m] every obstacle must keep from the vertical climb/descent columns
+# at the spawn and goal, and the z band [m] those columns span (climb_alt 5 +1).
+# 1.0 m covers the honest prop-tip radius (0.354 m) plus the EKF drift observed
+# during the scripted climb (~0.45 m) with margin.
+DA_KEEPOUT_M = 1.0
+DA_KEEPOUT_ZBAND = 6.0
 
 
 def _euler_xyz_matrix(roll, pitch, yaw):
@@ -237,6 +244,56 @@ def generate_diffaero(seed: int = 0, scale: float = 5.0, heading_deg: float = 90
         perp = relpos2target_axis_xy[tooclose]
         perp_n = perp / np.clip(np.linalg.norm(perp, axis=-1, keepdims=True), 1e-6, None)
         relpos2drone_xy[tooclose] += perp_n * DA_SAFETY_RANGE
+
+    # --- spawn/goal keep-out GUARANTEE (added 2026-07-30) --------------------
+    # The nudge above replicates diffaero's randomize_obstacles_positions:
+    # it pushes once by DA_SAFETY_RANGE and never re-checks, so when the
+    # violation exceeds one step the obstacle STAYS inside the radius
+    # (observed: seed 10 / scale 6.5 left a 1.8 m sphere's surface 0.31 m
+    # from the spawn; the scripted climb-out drifted into it -> collision
+    # charged to the policy). Note the radius above is also a 3D BOUNDING
+    # radius (a 13 m pillar gets a ~7 m "radius"), so simply iterating that
+    # push would relocate obstacles in nearly every historical seed and break
+    # layout compatibility. Instead, guarantee the physically meaningful
+    # invariant: the TRUE surface distance of every obstacle from the spawn
+    # and goal climb columns (a vertical line over z in [0, DA_KEEPOUT_ZBAND],
+    # the scripted climb/descent path) must be >= DA_KEEPOUT_M. Only actual
+    # violators are pushed (same fixed perpendicular direction, same step
+    # size, no RNG), so every previously compliant layout is bit-identical.
+    def _surface_dist_to_column(idx, center_xy):
+        """Min surface distance from obstacle idx (0-8 spheres, 9+ cubes) to
+        the vertical column at center_xy spanning z in [0, DA_KEEPOUT_ZBAND]."""
+        cx, cy = obstacle_xy_cur[idx]
+        if idx < n_spheres:
+            r = float(r_spheres[idx])
+            # grounded sphere center z = r, inside the column's z band
+            return math.hypot(cx - center_xy[0], cy - center_xy[1]) - r
+        j = idx - n_spheres
+        hx, hy, hz = lwh[j] / 2.0
+        rr, pp, yy = rpy[j]
+        cz = _grounded_box_cz(float(hx), float(hy), float(hz),
+                              float(rr), float(pp), float(yy))
+        rot = _euler_xyz_matrix(float(rr), float(pp), float(yy))
+        zs = np.arange(0.0, DA_KEEPOUT_ZBAND + 1e-6, 0.25)
+        pts = np.stack([np.full_like(zs, center_xy[0]),
+                        np.full_like(zs, center_xy[1]), zs], axis=1)
+        q = (pts - np.array([cx, cy, cz])) @ rot          # world -> box frame
+        d = np.abs(q) - np.array([hx, hy, hz])
+        outside = np.linalg.norm(np.maximum(d, 0.0), axis=1)
+        inside = np.minimum(np.max(d, axis=1), 0.0)
+        return float(np.min(outside + inside))
+
+    perp_all = relpos2target_axis_xy
+    perp_all_n = perp_all / np.clip(np.linalg.norm(perp_all, axis=-1, keepdims=True),
+                                    1e-6, None)
+    for _ in range(32):
+        obstacle_xy_cur = p_init_xy + relpos2drone_xy
+        bad = [i for i in range(n)
+               if min(_surface_dist_to_column(i, p_init_xy),
+                      _surface_dist_to_column(i, p_target_xy)) < DA_KEEPOUT_M]
+        if not bad:
+            break
+        relpos2drone_xy[bad] += perp_all_n[bad] * DA_SAFETY_RANGE
 
     obstacle_xy = p_init_xy + relpos2drone_xy                           # (n,2)
 

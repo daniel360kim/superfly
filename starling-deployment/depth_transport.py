@@ -43,11 +43,14 @@ import zlib
 import numpy as np
 
 DEPTH_PORT = 15001            # local UDP port for depth frames
+RGB_PORT = 15002              # local UDP port for RGB frames (gsds policy)
 RENDER_H, RENDER_W = 48, 64   # resolution the policy expects BEFORE 4x4 pooling
 
 CODEC_RAW_F32 = 0
 CODEC_ZLIB_U16_MM = 1
 CODEC_ZLIB_U16_MM_FRAG = 2
+CODEC_JPEG_RGB = 3            # cv2 JPEG-encoded 3-channel RGB (uint8)
+CODEC_JPEG_RGB_FRAG = 4       # fragmented codec 3 (same header as codec 2)
 
 _HEADER = struct.Struct("<IIII")       # seq, height, width, codec
 _FRAG_HEADER = struct.Struct("<IIIIII")  # seq, height, width, codec, part, n_parts
@@ -172,4 +175,116 @@ class DepthSubscriber:
             except (zlib.error, ValueError):
                 continue
             self._last = frame.reshape(h, w)
+        return self._last
+
+
+class RgbPublisher:
+    """Sends JPEG-compressed RGB frames over UDP from the sim process.
+
+    Mirrors DepthPublisher's contract: send() never raises on transport
+    errors, frames that exceed one datagram are fragmented. cv2 is imported
+    lazily so processes that only use depth never need it."""
+
+    def __init__(self, host="127.0.0.1", port=RGB_PORT, quality=92):
+        import cv2  # noqa: F401 (lazy: only the RGB paths need it)
+        self._cv2 = cv2
+        self._addr = (host, port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._seq = 0
+        self._quality = int(quality)
+        self._send_errors = 0
+
+    def send(self, rgb_u8: np.ndarray):
+        """rgb_u8: (H, W, 3) uint8 RGB, row 0 = top/up, col 0 = left."""
+        rgb_u8 = np.ascontiguousarray(rgb_u8[:, :, :3], dtype=np.uint8)
+        h, w = rgb_u8.shape[:2]
+        ok, buf = self._cv2.imencode(
+            ".jpg", rgb_u8[:, :, ::-1],  # cv2 encodes BGR
+            [int(self._cv2.IMWRITE_JPEG_QUALITY), self._quality])
+        if not ok:
+            return
+        body = buf.tobytes()
+        if len(body) <= _CHUNK:
+            packets = [_HEADER.pack(self._seq, h, w, CODEC_JPEG_RGB) + body]
+        else:
+            n_parts = -(-len(body) // _CHUNK)
+            packets = [
+                _FRAG_HEADER.pack(self._seq, h, w, CODEC_JPEG_RGB_FRAG,
+                                  i, n_parts)
+                + body[i * _CHUNK:(i + 1) * _CHUNK]
+                for i in range(n_parts)
+            ]
+        try:
+            for pkt in packets:
+                self._sock.sendto(pkt, self._addr)
+        except OSError as e:
+            self._send_errors += 1
+            if self._send_errors < 3 or self._send_errors % 100 == 0:
+                print(f"[rgb_transport] send failed ({e}); "
+                      f"{self._send_errors} frames dropped so far.",
+                      file=sys.stderr, flush=True)
+        self._seq += 1
+
+
+class RgbSubscriber:
+    """Receives the latest RGB frame in the policy process (non-blocking).
+    latest() returns (H, W, 3) uint8 RGB or None."""
+
+    def __init__(self, host="127.0.0.1", port=RGB_PORT):
+        import cv2
+        self._cv2 = cv2
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind((host, port))
+        self._sock.setblocking(False)
+        self._last = None
+        self._frag_seq = None
+        self._frag_parts = {}
+        self._frag_n = 0
+
+    def _decode_jpeg(self, body, h, w):
+        img = self._cv2.imdecode(np.frombuffer(body, dtype=np.uint8),
+                                 self._cv2.IMREAD_COLOR)
+        if img is None or img.shape[:2] != (h, w):
+            return None
+        return img[:, :, ::-1].copy()   # BGR -> RGB
+
+    def latest(self):
+        while True:
+            try:
+                data = self._sock.recv(1 << 20)
+            except BlockingIOError:
+                break
+            if len(data) < _HEADER.size:
+                continue
+            seq, h, w, codec = _HEADER.unpack_from(data, 0)
+            body = data[_HEADER.size:]
+            try:
+                if codec == CODEC_JPEG_RGB:
+                    frame = self._decode_jpeg(body, h, w)
+                    if frame is None:
+                        continue
+                elif codec == CODEC_JPEG_RGB_FRAG:
+                    if len(data) < _FRAG_HEADER.size:
+                        continue
+                    seq, h, w, codec, part, n_parts = _FRAG_HEADER.unpack_from(data, 0)
+                    if n_parts == 0 or part >= n_parts:
+                        continue
+                    if seq != self._frag_seq:
+                        self._frag_seq = seq
+                        self._frag_parts = {}
+                        self._frag_n = n_parts
+                    self._frag_parts[part] = data[_FRAG_HEADER.size:]
+                    if len(self._frag_parts) < self._frag_n:
+                        continue
+                    frame = self._decode_jpeg(
+                        b"".join(self._frag_parts[i] for i in range(self._frag_n)),
+                        h, w)
+                    self._frag_seq, self._frag_parts = None, {}
+                    if frame is None:
+                        continue
+                else:
+                    continue
+            except (ValueError, self._cv2.error):
+                continue
+            self._last = frame
         return self._last

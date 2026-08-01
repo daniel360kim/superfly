@@ -310,6 +310,28 @@ def main():
     parser.add_argument("--keepout", action="store_true",
                         help="Enable depth-derived obstacle-memory keep-out constraints "
                              "in the MPC (not used upstream).")
+    parser.add_argument("--obs-r", type=float, default=None,
+                        help="Keep-out cell radius [m] (default 0.45 = agile_core.OBS_R). "
+                             "Sets AGILE_OBS_R. Only meaningful with --keepout.")
+    parser.add_argument("--obs-margin", type=float, default=None,
+                        help="MPC keep-out stand-off added to each cell radius [m] "
+                             "(default 0.7). Sets AGILE_MPC_OBS_MARGIN before the acados "
+                             "solver is built (baked into the generated constraint code). "
+                             "Only meaningful with --keepout.")
+    parser.add_argument("--depth-inflate-px", type=int, default=0,
+                        help="Minimum-filter kernel size [px] applied to the 224x224 "
+                             "depth fed to the NET only (obstacle inflation in input "
+                             "space; the keep-out obstacle memory sees the raw frame). "
+                             "0/1 = off. 2026-07-30 margin-campaign knob.")
+    parser.add_argument("--alt-follow", action="store_true",
+                        help="Follow the net's vertical plan through the MPC reference "
+                             "(upstream behaviour) instead of locking z to the cruise "
+                             "alt; the altitude thrust PD tracks the stage-1 reference z, "
+                             "band-limited to [1.0, cruise+3.0] m.")
+    parser.add_argument("--net-thread", action="store_true",
+                        help="Run the ~61 ms CPU net forward pass in a worker thread so "
+                             "it no longer blocks the control/MPC/attitude loop "
+                             "(restores ~15 Hz upstream-parity effective net rate).")
     parser.add_argument("--att-lookahead-s", type=float, default=None,
                         help="How far ahead [s] to sample the MPC attitude setpoint "
                              "streamed to PX4. Default = control period (1/control_hz); "
@@ -365,6 +387,10 @@ def main():
         os.environ["AGILE_MPC_MAX_BODYRATE_XY"] = str(args.max_bodyrate_xy)
     if args.max_bodyrate_z is not None:
         os.environ["AGILE_MPC_MAX_BODYRATE_Z"] = str(args.max_bodyrate_z)
+    if args.obs_r is not None:
+        os.environ["AGILE_OBS_R"] = str(args.obs_r)
+    if args.obs_margin is not None:
+        os.environ["AGILE_MPC_OBS_MARGIN"] = str(args.obs_margin)
 
     goal_xy = np.array(args.goal) if args.goal is not None else None
 
@@ -410,6 +436,9 @@ def main():
         ref_lookahead_s=args.ref_lookahead_s,
         use_keepout=args.keepout,
         att_lookahead_s=args.att_lookahead_s,
+        depth_inflate_px=args.depth_inflate_px,
+        alt_follow=args.alt_follow,
+        net_thread=args.net_thread,
     )
     debug_pub = None if args.no_debug_viz else AgileDebugPublisher()
     if debug_pub is not None:

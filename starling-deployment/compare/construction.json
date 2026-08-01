@@ -7,7 +7,7 @@
     "goal": [53.006, -11.739, 2.00],
     "climb_alt": 3,
     "timeout": 300,
-    "pre_policy_timeout": 240
+    "pre_policy_timeout": 600
   }
 ]
 

@@ -19,10 +19,13 @@ State encoding matches upstream PlannerBase.update_input_queues:
 from __future__ import annotations
 
 import math
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.ndimage import minimum_filter
 from scipy.spatial.transform import Rotation
 
 from wrapper.agile_model import LoquercioModelConfig, TensorFlowLoquercioBackend
@@ -113,7 +116,9 @@ class AgilePolicy:
                  hover_thrust: float = G / 20.0, control_hz: float = 30.0,
                  net_every: int = 2, max_tilt_deg: float = 90.0,
                  att_lp: float = 1.0, ref_lookahead_s: float = REF_LOOKAHEAD_S,
-                 use_keepout: bool = False, att_lookahead_s: float | None = None):
+                 use_keepout: bool = False, att_lookahead_s: float | None = None,
+                 depth_inflate_px: int = 0, alt_follow: bool = False,
+                 net_thread: bool = False):
         self.config = LoquercioModelConfig()
         print(f"[agile] loading PlaNet checkpoint from {checkpoint_path} ...", flush=True)
         self.net = TensorFlowLoquercioBackend(checkpoint_path, self.config)
@@ -130,10 +135,31 @@ class AgilePolicy:
         self.att_lp = float(att_lp)
         self.ref_lookahead_s = float(ref_lookahead_s)
         self.use_keepout = bool(use_keepout)
+        # 2026-07-30 margin-tuning campaign knobs (see notes/robust_2026-07/
+        # agile_diagnosis.md in gs_drone_sim):
+        #  - depth_inflate_px: odd minimum-filter kernel on the 224x224 depth fed
+        #    to the NET ONLY (obstacle memory keeps the raw frame). Makes every
+        #    obstacle look wider/closer so the thin-margin net dodges wider.
+        #  - alt_follow: follow the net's z through the MPC reference (upstream
+        #    behaviour) instead of locking z to cruise_alt; the altitude-hold
+        #    thrust PD is slaved to the stage-1 reference z.
+        #  - net_thread: run the ~61 ms CPU net forward pass in a worker thread
+        #    so it no longer blocks the control/MPC/attitude loop.
+        self.depth_inflate_px = int(depth_inflate_px)
+        self.alt_follow = bool(alt_follow)
+        self.net_thread = bool(net_thread)
+        # Keep-out cell radius, env-overridable for the campaign sweep.
+        self.OBS_R = float(os.environ.get("AGILE_OBS_R", self.OBS_R))
         # Sample the MPC attitude at the control period by default (not the 0.1 s
         # stage-1 node) so the setpoint doesn't over-anticipate at control_hz.
         self.att_lookahead_s = (self.control_dt if att_lookahead_s is None
                                 else float(att_lookahead_s))
+        # net-thread machinery (started lazily on the first compute() call)
+        self._net_lock = threading.Lock()
+        self._net_req = None          # latest pending (depth_in, state_in, pos, R)
+        self._net_res = None          # latest finished (alphas, trajs, pos, R)
+        self._net_event = threading.Event()
+        self._net_worker = None
 
         # altitude-hold thrust PD + slow integrator. The I-term matters: the
         # nominal hover_thrust (g/20) is below the Iris's true hover point, and
@@ -171,6 +197,11 @@ class AgilePolicy:
         self._obs_cells: dict[tuple[int, int], float] = {}   # (ix,iy) -> last-seen ts
         self._alt_i = 0.0                    # altitude integrator [m/s^2]
         self.mpc._warmed = False             # re-converge the first solve
+        if getattr(self, "_net_lock", None) is not None:     # drop stale net i/o
+            with self._net_lock:
+                self._net_req = None
+                self._net_res = None
+                self._net_event.clear()
 
     # ------------------------------------------------------------------ #
     # Net input encoding
@@ -181,6 +212,13 @@ class AgilePolicy:
         else:
             depth_m = np.asarray(depth_hw, dtype=np.float32)
             depth_m = np.nan_to_num(depth_m, nan=AGILE_FAR, posinf=AGILE_FAR, neginf=0.0)
+        if self.depth_inflate_px > 1:
+            # Obstacle inflation in INPUT space: grey-morphology erosion keeps
+            # the nearest return within a KxK window, widening every obstacle by
+            # ~(K//2) px per side (~d*(K//2)/110 m at distance d, fx=110 px).
+            # Net input only -- the keep-out obstacle memory sees the raw frame.
+            depth_m = minimum_filter(depth_m, size=self.depth_inflate_px,
+                                     mode="nearest")
         depth_mm = np.clip(depth_m * 1000.0, 0.0, AGILE_FAR * 1000.0)
         # The sim already bilinear-downsamples to the net's 224x224 input (matching
         # Loquercio's training loader), so no resize here in the common case. Keep a
@@ -286,6 +324,71 @@ class AgilePolicy:
                 for ix, iy in self._obs_cells]
 
     # ------------------------------------------------------------------ #
+    # Net plan adoption + optional worker thread (--net-thread)
+    # ------------------------------------------------------------------ #
+    def _adopt_plan(self, alphas, trajectories, pos, R_enu, depth_hw):
+        """Turn a net output into the cached world-frame plan. pos/R_enu must be
+        the SNAPSHOT the net input was built from (matters in threaded mode)."""
+        local_per_mode = [t.reshape(self.config.state_dim, self.config.out_seq_len)
+                          for t in trajectories]
+        self._mode_idx = self._select_mode(local_per_mode, depth_hw)
+        per_mode = []
+        for local_xyz in local_per_mode:
+            local_xyz = self._scale_body_plan(local_xyz)
+            per_mode.append(pos[None, :] + (R_enu @ local_xyz).T)
+        self._world_points_per_mode = np.stack(per_mode, axis=0)  # (modes, T, 3)
+        self._world_points = self._world_points_per_mode[self._mode_idx]
+        self._alphas = alphas
+
+    def _net_worker_loop(self):
+        """Latest-only inference worker: always consumes the freshest snapshot,
+        so the effective net rate saturates at 1/forward-time (~16 Hz on this
+        CPU) instead of being gated AND blocked by the control loop."""
+        while True:
+            self._net_event.wait()
+            with self._net_lock:
+                req = self._net_req
+                self._net_req = None
+                self._net_event.clear()
+            if req is None:
+                continue
+            depth_in, state_in, pos, R_enu, depth_hw = req
+            try:
+                alphas, trajs = self.net.infer(depth_in, state_in)
+            except Exception as exc:      # never kill the worker
+                print(f"[agile] net worker infer failed: {exc}", flush=True)
+                continue
+            with self._net_lock:
+                self._net_res = (alphas, trajs, pos, R_enu, depth_hw)
+
+    def _net_tick_threaded(self, obs, pos, R_enu, vel, goal_dir):
+        """Submit the freshest observation, adopt the latest finished plan.
+        Blocks only on the very first call (no plan exists yet)."""
+        if self._net_worker is None:
+            self._net_worker = threading.Thread(target=self._net_worker_loop,
+                                                daemon=True)
+            self._net_worker.start()
+        depth_in = self._depth_to_model_input(obs.depth)
+        state_in = self._state_to_model_input(
+            pos, R_enu, vel, obs.angular_rate_body, goal_dir)
+        with self._net_lock:
+            self._net_req = (depth_in, state_in, pos.copy(), R_enu.copy(), obs.depth)
+            self._net_event.set()
+            res, self._net_res = self._net_res, None
+        if res is not None:
+            self._adopt_plan(*res)
+        elif self._world_points is None:
+            t0 = time.time()
+            while self._world_points is None and time.time() - t0 < 3.0:
+                time.sleep(0.005)
+                with self._net_lock:
+                    res, self._net_res = self._net_res, None
+                if res is not None:
+                    self._adopt_plan(*res)
+            if self._world_points is None:
+                raise RuntimeError("[agile] net worker produced no plan within 3 s")
+
+    # ------------------------------------------------------------------ #
     # Main entry point
     # ------------------------------------------------------------------ #
     def compute(self, obs: AgileObs) -> AgileCmd:
@@ -306,35 +409,29 @@ class AgilePolicy:
         if self.use_keepout:
             self._update_obstacles(obs.depth, R_enu, pos, now)
 
-        # --- net inference (decimated) ---
-        if self._world_points is None or (self._tick % self.net_every) == 0:
+        # --- net inference (decimated; optionally off-loop in a worker thread) ---
+        if self.net_thread:
+            self._net_tick_threaded(obs, pos, R_enu, vel, goal_dir)
+        elif self._world_points is None or (self._tick % self.net_every) == 0:
             depth_in = self._depth_to_model_input(obs.depth)
             state_in = self._state_to_model_input(
                 pos, R_enu, vel, obs.angular_rate_body, goal_dir)
             alphas, trajectories = self.net.infer(depth_in, state_in)
-            local_per_mode = [t.reshape(self.config.state_dim, self.config.out_seq_len)
-                              for t in trajectories]
-            self._mode_idx = self._select_mode(local_per_mode, obs.depth)
-            per_mode = []
-            for local_xyz in local_per_mode:
-                local_xyz = self._scale_body_plan(local_xyz)
-                per_mode.append(pos[None, :] + (R_enu @ local_xyz).T)
-            self._world_points_per_mode = np.stack(per_mode, axis=0)  # (modes, T, 3)
-            self._world_points = self._world_points_per_mode[self._mode_idx]
-            self._alphas = alphas
+            self._adopt_plan(alphas, trajectories, pos, R_enu, obs.depth)
 
         world_points = self._world_points
 
         # --- MPC tracking (every tick) ---
         attitude_q = None
         tracker = "pd"
+        alt_target = self._cruise_alt
         keepout = self._keepout_list() if self.use_keepout else None
         x0 = state_x0(pos, R_enu, vel)
         try:
             _u0, status, minfo = self.mpc.compute(
                 x0, world_points.astype(np.float64), self._cruise_alt, yaw_des,
                 dt_wp=WAYPOINT_DT, max_vel=self.max_vel,
-                obstacles_xy_r=keepout, alt_hold=True,
+                obstacles_xy_r=keepout, alt_hold=not self.alt_follow,
                 att_lookahead_s=self.att_lookahead_s)
             if status in (0, 2):
                 attitude_q = np.asarray(minfo["q_pred"], dtype=np.float64)
@@ -343,6 +440,12 @@ class AgilePolicy:
                         clamp_attitude_tilt(attitude_q, self.max_tilt_deg, yaw_des),
                         dtype=np.float64)
                 tracker = "mpc"
+                if self.alt_follow:
+                    # Slave the altitude-hold thrust PD to the stage-1 reference
+                    # z (the net's clamped vertical plan) so cyl_h obstacles can
+                    # be over/under-flown; band-limited around the cruise alt.
+                    alt_target = float(np.clip(minfo["p_ref1"][2], 1.0,
+                                               self._cruise_alt + 3.0))
         except Exception as exc:
             if self._tick < 3 or self._tick % 300 == 0:
                 print(f"[agile] MPC solve raised ({exc}); PD fallback this tick.",
@@ -380,7 +483,7 @@ class AgilePolicy:
         # net's unreliable vertical plan).
         R_cmd = Rotation.from_quat(
             [attitude_q[1], attitude_q[2], attitude_q[3], attitude_q[0]]).as_matrix()
-        alt_err = self._cruise_alt - float(pos[2])
+        alt_err = alt_target - float(pos[2])
         self._alt_i = float(np.clip(self._alt_i + self.ki_alt * alt_err * self.control_dt,
                                     -2.0, 2.0))
         az = float(np.clip(

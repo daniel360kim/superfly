@@ -63,69 +63,32 @@ args = parser.parse_args()
 from isaacsim import SimulationApp                     # noqa: E402
 simulation_app = SimulationApp({"headless": True})
 
+# Optional non-interactive Nucleus auth via an Omniverse Navigator API token
+# (OMNI_API_TOKEN env var) -- no-op if unset, so existing username/password /
+# interactive-login paths are untouched.
+import os                                              # noqa: E402
+_omni_api_token = os.environ.get("OMNI_API_TOKEN")
+if _omni_api_token:
+    import omni.client                                 # noqa: E402
+    omni.client.register_authentication_callback(lambda prefix: ("$omni-api-token", _omni_api_token))
+
 import numpy as np                                     # noqa: E402
 from pxr import Usd, UsdGeom, Gf                       # noqa: E402
 
-EXTRACTOR_VERSION = 1
+# v2: PointInstancer prototypes are expanded (mesh_sampling) -- EnglishCollege
+# tree canopy was invisible to v1 clearance scoring (ATTEMPTS 2026-07-29).
+EXTRACTOR_VERSION = 2
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mesh_sampling                                   # noqa: E402
 
 
 def gather_world_triangles(stage):
     """All triangles of visible, default/render-purpose UsdGeom.Mesh prims, in
-    the stage's composed world frame (instance proxies included so instanced
-    vegetation/props are captured). Returns (V (N,3) float64, F (M,3) int64)."""
-    verts, faces, v_off = [], [], 0
-    n_mesh = n_skipped = n_instancers = 0
-    it = iter(Usd.PrimRange.Stage(
-        stage, Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)))
-    for prim in it:
-        if prim.IsA(UsdGeom.PointInstancer):
-            n_instancers += 1
-        if not prim.IsA(UsdGeom.Mesh):
-            continue
-        img = UsdGeom.Imageable(prim)
-        if img.ComputeVisibility() == UsdGeom.Tokens.invisible:
-            n_skipped += 1
-            continue
-        if img.ComputePurpose() not in (UsdGeom.Tokens.default_, UsdGeom.Tokens.render):
-            n_skipped += 1
-            continue
-        mesh = UsdGeom.Mesh(prim)
-        pts = mesh.GetPointsAttr().Get()
-        counts = mesh.GetFaceVertexCountsAttr().Get()
-        idx = mesh.GetFaceVertexIndicesAttr().Get()
-        if not pts or not counts or not idx:
-            continue
-        P = np.asarray(pts, dtype=np.float64)
-        # Gf matrices are row-vector convention: p_world = p_local @ M[:3,:3] + M[3,:3]
-        M = np.asarray(
-            UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()),
-            dtype=np.float64)
-        P = P @ M[:3, :3] + M[3, :3]
-
-        # Fan-triangulate each polygon.
-        counts = np.asarray(counts, dtype=np.int64)
-        idx = np.asarray(idx, dtype=np.int64)
-        tri = []
-        pos = 0
-        for c in counts:
-            if c >= 3:
-                fan = idx[pos:pos + c]
-                for k in range(1, c - 1):
-                    tri.append((fan[0], fan[k], fan[k + 1]))
-            pos += c
-        if tri:
-            verts.append(P)
-            faces.append(np.asarray(tri, dtype=np.int64) + v_off)
-            v_off += P.shape[0]
-            n_mesh += 1
-    if n_instancers:
-        print(f"[extract] WARNING: {n_instancers} PointInstancer prim(s) present; "
-              "their instanced geometry is NOT extracted.", file=sys.stderr)
-    print(f"[extract] {n_mesh} mesh prims used, {n_skipped} skipped "
-          "(invisible/guide/proxy).")
-    if not verts:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
-    return np.concatenate(verts), np.concatenate(faces)
+    the stage's composed world frame (instance proxies traversed AND
+    PointInstancer prototypes expanded per instance, so instanced vegetation
+    is captured). Returns (V (N,3) float64, F (M,3) int64)."""
+    return mesh_sampling.gather_triangles(stage, root_path=None, verbose=True)
 
 
 def triangle_normals_areas(V, F):
@@ -249,7 +212,14 @@ def main():
 
 
 if __name__ == "__main__":
+    # simulation_app.close() may os._exit before an exception propagates to the
+    # default excepthook, silently eating tracebacks -- print them first.
     try:
         main()
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
     finally:
         simulation_app.close()

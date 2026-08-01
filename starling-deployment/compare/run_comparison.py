@@ -62,6 +62,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -89,7 +90,10 @@ VIDEO_FPS = 15.0          # --record-video MP4 frame rate
 VIDEO_SCALE = 4           # min upscale for the depth-grid frames
 PX4_MODEL = "none_iris"   # PX4 SITL vehicle model
 PX4_BOOT_TIMEOUT = 60.0   # seconds to wait for PX4 to reach a ready state
-SIM_GRACE = 30.0          # seconds for the sim to auto-stop after offboard ends
+SIM_GRACE = 180.0         # seconds for the sim to auto-stop after offboard ends;
+                          # asset trials sample the spawned meshes (incl.
+                          # instancer foliage, v2) into the traj npz on exit —
+                          # 30 s killed the save mid-sampling (ATTEMPTS 2026-07-29)
 
 # Scene-mesh clearance for USD environments (see extract_scene_mesh.py):
 # extracted once per (usd, env_scale, params) into MESH_CACHE_DIR and reused
@@ -126,6 +130,20 @@ def effective_agile_max_speed(args) -> float:
     if float(args.max_speed) != DEFAULT_MAX_SPEED:
         return float(args.max_speed)
     return DEFAULT_AGILE_MAX_SPEED
+
+
+# gs_drone_sim students: MH-labeler references are 1.5 m/s (realized ~1.9);
+# the S1 speed study found 3.0 m/s labels free but 5.0 breaking. Cap the
+# tracked reference at 2.0 m/s unless the user explicitly overrides.
+DEFAULT_GSDS_MAX_SPEED = 2.0
+
+
+def effective_gsds_max_speed(args) -> float:
+    """gsds reference-velocity cap: --max-speed when changed from the default,
+    else the students' in-distribution cruise speed."""
+    if float(args.max_speed) != DEFAULT_MAX_SPEED:
+        return float(args.max_speed)
+    return DEFAULT_GSDS_MAX_SPEED
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +205,27 @@ def method_registry():
             checkpoint=_REPO / "checkpoints" / "DepthNav" / "level1_4_iteration_13500.pth",
             speed_args=lambda a: ["--target-speed", str(a.max_speed)],
         ),
+        # Velocity-command DepthNav: same network and same sim depth camera as
+        # "depthnav", but the policy emits a velocity setpoint that goes to
+        # PX4's velocity loop (SET_POSITION_TARGET_LOCAL_NED) rather than a
+        # thrust vector to the attitude loop. Trained for 0.7-1.5 m/s, so
+        # --max-speed should sit in that band. Unlike "depthnav", this offboard
+        # writes the "end" phase marker on goal-reach, so policy_reported_reached
+        # behaves the same way it does for the other methods.
+        "depthnav_vel": dict(
+            policy="depthnav",               # same sim depth camera + UDP transport
+            offboard="depthnav_vel_offboard.py",
+            control_hz=50.0,
+            goal_argc=3,
+            python=_REPO / "depthnav" / ".venv" / "bin" / "python",
+            checkpoint=_REPO / "checkpoints" / "DepthNav" / "level1_vel.pth",
+            speed_args=lambda a: [
+                "--target-speed", str(a.max_speed),
+                # keep PX4's saturation aligned with VelocityBoundedYaw's bounds
+                "--max-vel-xy", str(max(2.5, a.max_speed * 1.7)),
+                "--max-vel-z", str(max(1.5, a.max_speed)),
+            ],
+        ),
         "agile": dict(
             policy="agile",
             offboard="agile_offboard.py",
@@ -205,7 +244,53 @@ def method_registry():
                 "--att-lp", "1.0",
                 "--control-hz", str(AGILE_CONTROL_HZ),
                 "--q-att", str(AGILE_MPC_Q_ATT),
-            ],
+                # 2026-07-30 margin-tuning campaign hook: per-leg agile knobs
+                # (e.g. "--keepout --obs-r 0.25") injected via the environment
+                # so campaign scripts never edit this file. Recorded in each
+                # trial's metrics.json "commands" like every other arg.
+            ] + shlex.split(os.environ.get("AGILE_EXTRA_ARGS", "")),
+        ),
+        # gs_drone_sim multi-hypothesis trajectory students (this repo's 4th
+        # method family). Same offboard for both; the checkpoint's config
+        # decides the obs modality (gsds = RGB student, gsds_depth = depth
+        # student) and the sim --policy name keeps their results separate in
+        # aggregation. Interpreter = the gs_drone_sim venv (torch cu128 +
+        # pymavlink); the wrapper imports the model class from that repo.
+        "gsds": dict(
+            policy="gsds",
+            offboard="gsds_offboard.py",
+            control_hz=50.0,
+            goal_argc=2,                     # gsds --goal takes X Y (like agile)
+            python=Path("/home/danielkim/gs_drone_sim/.venv/bin/python"),
+            # RGB tube-augmented student (B8 tube8_4k, best known)
+            checkpoint=_REPO / "checkpoints" / "GSDroneSim" / "il_b8_tube8_4k.pt",
+            # --alt-mode hold: the students' body-frame vertical plans re-anchor
+            # at the current pose every replan, so an OOD downward bias
+            # integrates into a steady descent (observed: 4.5 m -> ground in
+            # 13 s on diffaero_field, 2026-07-27). Absolute altitude hold at
+            # the climb altitude is the same guard agile uses.
+            # Campaign hook (mirrors AGILE_EXTRA_ARGS): per-leg gsds offboard
+            # knobs (e.g. "--depth-repulsion 0.5") via the explicit
+            # --gsds-extra-args CLI flag (preferred: immune to ancestor-shell
+            # env fiddling) or the $GSDS_EXTRA_ARGS environment variable;
+            # recorded in each trial's metrics.json "commands.offboard".
+            speed_args=lambda a: ["--max-vel", str(effective_gsds_max_speed(a)),
+                                  "--alt-mode", "hold"]
+            + shlex.split(getattr(a, "gsds_extra_args", None)
+                          or os.environ.get("GSDS_EXTRA_ARGS", "")),
+        ),
+        "gsds_depth": dict(
+            policy="gsds_depth",
+            offboard="gsds_offboard.py",
+            control_hz=50.0,
+            goal_argc=2,
+            python=Path("/home/danielkim/gs_drone_sim/.venv/bin/python"),
+            # depth-observation student (il_depth_v2b)
+            checkpoint=_REPO / "checkpoints" / "GSDroneSim" / "il_depth_v2b.pt",
+            speed_args=lambda a: ["--max-vel", str(effective_gsds_max_speed(a)),
+                                  "--alt-mode", "hold"]
+            + shlex.split(getattr(a, "gsds_extra_args", None)
+                          or os.environ.get("GSDS_EXTRA_ARGS", "")),
         ),
     }
 
@@ -305,7 +390,8 @@ def stop_px4():
     _px4_proc = None
 
     try:
-        out = subprocess.run(["pgrep", "-f", "bin/px4"], capture_output=True, text=True)
+        out = subprocess.run(["pgrep", "-u", str(os.getuid()), "-f", "bin/px4"],
+                             capture_output=True, text=True)
         pids = [int(p) for p in out.stdout.split()]
         for pid in pids:
             try:
@@ -314,7 +400,11 @@ def stop_px4():
                 pass
         if pids:
             time.sleep(2.0)
-            subprocess.run(["pkill", "-9", "-f", "bin/px4"])
+            for pid in pids:   # by PID, this user only -- never a bare pkill
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
     except FileNotFoundError:
         pass  # pgrep/pkill unavailable; best effort only
 
@@ -430,27 +520,44 @@ def restart_px4(px4_dir: Path, model: str, boot_timeout: float, log_path: Path):
           "to connect on TCP 4560.")
 
 
+# Every process pattern a crashed/abandoned trial can leave behind. run_px4_sim
+# holds TCP 4560 (simulator + MAVLink tcpin); a stale *_offboard.py holds its
+# MAVLink UDP port (14550) -- either one poisons the next trial with
+# 'OSError: [Errno 98] Address already in use'.
+STALE_PATTERNS = ("run_px4_sim.py", "gsds_offboard.py", "depthnav_offboard.py",
+                  "diffaero_offboard.py", "diffphys_offboard.py", "agile_offboard.py")
+
+
 def stop_stale_sims():
-    """Kill any leftover run_px4_sim.py (a manual run or a crashed trial that
-    outlived its harness). A stale sim keeps the TCP 4560 simulator port and
-    the MAVLink 4560/tcpin bind, so the next trial's PX4MavlinkBackend dies
-    with 'OSError: [Errno 98] Address already in use' and the trial hangs."""
-    try:
-        out = subprocess.run(["pgrep", "-f", "run_px4_sim.py"],
-                             capture_output=True, text=True)
-        pids = [int(p) for p in out.stdout.split()]
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        if pids:
-            print(f"  [cleanup] killed {len(pids)} stale run_px4_sim.py process(es) "
-                  "holding the simulator ports.")
+    """Kill any leftover sim/offboard process from a manual run or a crashed
+    trial that outlived its harness (see STALE_PATTERNS for why each matters).
+    Only THIS user's processes are touched (shared GPU box: another user's
+    jobs must never be killed), and the kill is by explicit PID from pgrep --
+    never a bare pkill of a pattern that could match someone else's command
+    line (or a compound shell command containing the pattern itself)."""
+    me = str(os.getuid())
+    for pattern in STALE_PATTERNS:
+        try:
+            out = subprocess.run(["pgrep", "-u", me, "-f", pattern],
+                                 capture_output=True, text=True)
+            pids = [int(p) for p in out.stdout.split() if int(p) != os.getpid()]
+            if not pids:
+                continue
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            print(f"  [cleanup] SIGTERMed {len(pids)} stale {pattern} process(es): "
+                  f"{pids}")
             time.sleep(2.0)
-            subprocess.run(["pkill", "-9", "-f", "run_px4_sim.py"])
-    except FileNotFoundError:
-        pass  # pgrep/pkill unavailable; best effort only
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass   # already gone after SIGTERM -- the normal case
+        except FileNotFoundError:
+            pass  # pgrep unavailable; best effort only
 
 
 # --------------------------------------------------------------------------- #
@@ -474,7 +581,7 @@ def scene_mesh_path(usd, env_scale, bounds):
     """Cache file for one (usd, env_scale, corridor, extraction-params) combo."""
     bkey = ",".join(f"{b:.1f}" for b in bounds)
     key = hashlib.sha1(f"{usd}|{env_scale}|{bkey}|{SCENE_MESH_SAMPLE_H}|"
-                       f"{SCENE_MESH_GROUND_DEG}|v1".encode()).hexdigest()[:10]
+                       f"{SCENE_MESH_GROUND_DEG}|v2".encode()).hexdigest()[:10]
     stem = Path(str(usd)).stem.replace(".stage", "") or "scene"
     return MESH_CACHE_DIR / f"{stem}_{key}.npz"
 
@@ -574,6 +681,7 @@ def load_scenarios(path):
             seed=int(entry.get("seed", 0)),
             scale=float(entry.get("scale", 5.0)),
             climb_alt=entry.get("climb_alt"),
+            obstacle_assets=bool(entry.get("obstacle_assets", False)),
             timeout=entry.get("timeout"),
             pre_policy_timeout=entry.get("pre_policy_timeout"),
             landing_timeout=entry.get("landing_timeout"),
@@ -625,6 +733,8 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
                     "--record-rgb-video", str(video_dir / "rgb.mp4"),
                     "--record-video-fps", str(VIDEO_FPS),
                     "--record-video-scale", str(VIDEO_SCALE)]
+    if scenario.get("obstacle_assets"):
+        sim_cmd += ["--obstacle-assets"]
     if scenario["usd_environment"]:
         sim_cmd += ["--usd-environment", scenario["usd_environment"],
                     "--env-scale", str(scenario["env_scale"])]
@@ -681,6 +791,21 @@ def run_trial(method, cfg, args, scenario):
     trial_dir = results / label / method
     trial_dir.mkdir(parents=True, exist_ok=True)
 
+    # --resume: a trial that already produced a valid (error-free) metrics.json
+    # in this results dir is done -- skip it, so a crashed/killed campaign can
+    # be relaunched with the same --results-dir and pick up where it stopped.
+    mfile = trial_dir / "metrics.json"
+    if getattr(args, "resume", False) and mfile.exists():
+        try:
+            prev = json.loads(mfile.read_text())
+        except (json.JSONDecodeError, OSError):
+            prev = None
+        if prev is not None and not prev.get("error"):
+            print(f"\n=== {method}  {label}  [resume] valid metrics.json exists; skipping ===")
+            return prev
+        print(f"\n=== {method}  {label}  [resume] previous attempt failed "
+              f"({(prev or {}).get('error', 'unreadable metrics.json')}); re-flying ===")
+
     npz_path = trial_dir / "traj.npz"
     sim_cmd, off_cmd = build_commands(method, cfg, args, scenario, npz_path,
                                       video_dir=trial_dir if args.record_video else None)
@@ -704,6 +829,7 @@ def run_trial(method, cfg, args, scenario):
     Path(OFFBOARD_DONE_FILE).unlink(missing_ok=True)
     Path(POLICY_PHASE_FILE).unlink(missing_ok=True)
     sim = subprocess.Popen(sim_cmd, cwd=str(_DEPLOY))
+    off = None
     try:
         print(f"  [warmup] giving Isaac {args.warmup:.0f}s to boot before offboard ...")
         _sleep_or_die(sim, args.warmup, "sim exited during warmup")
@@ -718,8 +844,10 @@ def run_trial(method, cfg, args, scenario):
             print("  [cleanup] sim still running after grace; terminating.")
             sim.terminate()
     finally:
-        for p in (sim,):
-            if p.poll() is None:
+        # Reap BOTH children -- a leaked offboard keeps its MAVLink UDP port
+        # bound and poisons the next trial with 'Errno 98 Address in use'.
+        for p in (sim, off):
+            if p is not None and p.poll() is None:
                 p.kill()
 
     if not npz_path.exists():
@@ -731,18 +859,32 @@ def run_trial(method, cfg, args, scenario):
         # collision are scored against the extracted scene geometry instead
         # (cached per scene; extraction runs AFTER the flight so its Kit boot
         # never competes with the trial's own Isaac instance).
-        scene_mesh = ensure_scene_mesh(scenario["usd_environment"],
-                                       scenario["env_scale"],
-                                       scenario["start"], scenario["goal"],
-                                       args.sim_python)
-        res = metrics.score_trajectory(str(npz_path), drone_radius=args.drone_radius,
-                                       goal_radius=args.goal_radius,
-                                       scene_mesh=str(scene_mesh) if scene_mesh else None,
-                                       climb_alt=(scenario["climb_alt"]
-                                                  if scenario["climb_alt"] is not None
-                                                  else args.climb_alt))
-        if scene_mesh is not None:
-            res["scene_mesh"] = str(scene_mesh)
+        # Scoring is fenced: one degenerate trajectory (e.g. offboard crashed
+        # on import and the drone never left the spawn) must record a failed
+        # trial and let the campaign continue, not kill all remaining trials.
+        try:
+            scene_mesh = ensure_scene_mesh(scenario["usd_environment"],
+                                           scenario["env_scale"],
+                                           scenario["start"], scenario["goal"],
+                                           args.sim_python)
+            res = metrics.score_trajectory(str(npz_path), drone_radius=args.drone_radius,
+                                           goal_radius=args.goal_radius,
+                                           scene_mesh=str(scene_mesh) if scene_mesh else None,
+                                           climb_alt=(scenario["climb_alt"]
+                                                      if scenario["climb_alt"] is not None
+                                                      else args.climb_alt))
+            if scene_mesh is not None:
+                res["scene_mesh"] = str(scene_mesh)
+        except Exception as e:
+            traceback.print_exc()
+            print(f"  [warn] scoring {npz_path} failed ({type(e).__name__}: {e}); "
+                  "recording as failed trial and continuing.")
+            res = dict(method=method, success=False, reached=False, collided=False,
+                       error=f"scoring failed: {type(e).__name__}: {e}")
+            try:
+                res["n_poses"] = int(np.load(npz_path)["traj"].shape[0])
+            except Exception:
+                res["n_poses"] = None
     # The offboard hands off to LANDING only once inside its own goal threshold,
     # so a logged "end" event is the policy reporting goal-reached (in its EKF
     # frame). Count it toward success alongside the ground-truth radius check
@@ -763,6 +905,8 @@ def run_trial(method, cfg, args, scenario):
         connect=args.connect)
     if method == "agile":
         res["hyperparams"]["agile_max_speed"] = effective_agile_max_speed(args)
+    if method in ("gsds", "gsds_depth"):
+        res["hyperparams"]["gsds_max_speed"] = effective_gsds_max_speed(args)
     res["scenario"] = {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                        for k, v in scenario.items()}
     res["commands"] = dict(sim=" ".join(sim_cmd), offboard=" ".join(off_cmd))
@@ -927,9 +1071,10 @@ def main():
     ap.add_argument("--methods", nargs="+",
                     default=["diffphys", "diffaero", "depthnav", "agile"],
                     choices=["diffphys", "diffaero", "diffaero_vel", "diffaero_vel_planar",
-                             "depthnav", "agile"],
+                             "depthnav", "agile", "gsds", "gsds_depth"],
                     help="Methods to compare (default: all four; add diffaero_vel "
-                         "or diffaero_vel_planar for velocity-command DiffAero).")
+                         "or diffaero_vel_planar for velocity-command DiffAero, "
+                         "gsds/gsds_depth for the gs_drone_sim RGB/depth students).")
     ap.add_argument("--climb-alt", type=float, default=2.0,
                     help="Default climb height [m] ABOVE the spawn altitude before the "
                          "policy takes over (PX4 local frame, so it works unchanged on "
@@ -957,7 +1102,7 @@ def main():
                     help="Interpreter for run_px4_sim.py (Isaac's python). "
                          "Default $ISAAC_PYTHON or 'python'.")
     for m in ("diffphys", "diffaero", "diffaero_vel", "diffaero_vel_planar",
-              "depthnav", "agile"):
+              "depthnav", "agile", "gsds", "gsds_depth"):
         ap.add_argument(f"--{m}-python", default=None, help=f"Interpreter for {m} offboard.")
         ap.add_argument(f"--{m}-checkpoint", default=None, help=f"Checkpoint override for {m}.")
     ap.add_argument("--warmup", type=float, default=45.0,
@@ -981,6 +1126,12 @@ def main():
     ap.add_argument("--no-px4-manage", action="store_true",
                     help="Don't launch/restart PX4 SITL -- assume you're managing it "
                          "yourself in another terminal (the old workflow).")
+    ap.add_argument("--gsds-extra-args", default=None,
+                    help="Extra args appended verbatim to the gsds/gsds_depth "
+                         "offboard command line (e.g. \"--depth-repulsion 0.5\"). "
+                         "Explicit CLI variant of the $GSDS_EXTRA_ARGS campaign "
+                         "hook; takes precedence over the env var. Recorded in "
+                         "each trial's metrics.json commands.offboard.")
     ap.add_argument("--results-dir", default=None,
                     help="Directory for outputs. Default: a new folder named "
                          "results/<YYYYMMDD_HHMMSS> is created for every run so "
@@ -988,6 +1139,18 @@ def main():
                          "reuse a dir (required with --report-only).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the commands for each trial without launching anything.")
+    ap.add_argument("--resume", action="store_true",
+                    help="With an explicit --results-dir: skip any trial that already "
+                         "has a valid (error-free) metrics.json there, so a killed or "
+                         "crashed campaign can be relaunched and continue. Trials whose "
+                         "metrics.json records an error are re-flown.")
+    ap.add_argument("--cell-major", action="store_true",
+                    help="Fly every method on one scenario before moving to the "
+                         "next, instead of one method across all scenarios. An "
+                         "interrupted campaign then leaves a complete, comparable "
+                         "table over the scenarios it reached, rather than one "
+                         "finished method and nothing for the rest. Pair with "
+                         "--resume when the run may be cut short.")
     ap.add_argument("--report", action="store_true",
                     help="Aggregate into a summary table + summary.csv after running.")
     ap.add_argument("--report-only", action="store_true",
@@ -1042,17 +1205,34 @@ def main():
 
     registry = method_registry()
     ran_any = False
+
+    # Methods whose checkpoint actually resolves. Computed up front so the skip
+    # notice prints once, not once per scenario in --cell-major.
+    ready = []
+    for method in args.methods:
+        cfg = registry[method]
+        ckpt = Path(getattr(args, f"{method}_checkpoint") or cfg["checkpoint"])
+        if not args.dry_run and not checkpoint_ready(method, ckpt):
+            print(f"\n[skip] {method}: checkpoint not found at {ckpt} "
+                  f"-- skipping (provide one or --{method}-checkpoint).")
+            continue
+        ready.append((method, cfg))
+
+    # Trial order. Default (method-major) finishes one method across every
+    # scenario before starting the next, so an interrupted campaign yields one
+    # complete method and nothing for the others -- no comparison at all.
+    # --cell-major flies every method on a scenario before moving on, so any
+    # prefix of the run is a complete, comparable table over the scenarios
+    # reached. Use it whenever the campaign might be cut short.
+    if args.cell_major:
+        order = [(m, cfg, s) for s in scenarios for (m, cfg) in ready]
+    else:
+        order = [(m, cfg, s) for (m, cfg) in ready for s in scenarios]
+
     try:
-        for method in args.methods:
-            cfg = registry[method]
-            ckpt = Path(getattr(args, f"{method}_checkpoint") or cfg["checkpoint"])
-            if not args.dry_run and not checkpoint_ready(method, ckpt):
-                print(f"\n[skip] {method}: checkpoint not found at {ckpt} "
-                      f"-- skipping (provide one or --{method}-checkpoint).")
-                continue
-            for scenario in scenarios:
-                run_trial(method, cfg, args, scenario)
-                ran_any = True
+        for method, cfg, scenario in order:
+            run_trial(method, cfg, args, scenario)
+            ran_any = True
     finally:
         if not args.no_px4_manage:
             stop_px4()

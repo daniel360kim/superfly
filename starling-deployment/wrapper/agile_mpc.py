@@ -40,8 +40,15 @@ MAX_REF_ACCEL_XY = 6.0
 # Obstacle avoidance as MPC constraints: the K nearest pillars are online parameters; the
 # drone must stay outside (radius + OBS_MARGIN) of each. Soft (slacked) so the QP never
 # goes infeasible. OBS_MARGIN covers the drone's rotor span + a safety gap.
+# Env-overridable (AGILE_MPC_OBS_MARGIN / agile_offboard --obs-margin) for the
+# 2026-07-30 margin-tuning campaign; read at solver-build time inside _model()
+# (it is baked into the generated constraint C code -> ~2 s codegen rebuild).
 K_OBS = 6
-OBS_MARGIN = 0.7
+OBS_MARGIN_DEFAULT = 0.7
+
+
+def _obs_margin() -> float:
+    return float(os.environ.get("AGILE_MPC_OBS_MARGIN", str(OBS_MARGIN_DEFAULT)))
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +82,9 @@ def _model():
     # Obstacle-avoidance path constraints: p = [ox,oy,r] x K_OBS (online params).
     # h_k = (px-ox)^2 + (py-oy)^2 - (r+margin)^2 >= 0 -> drone stays clear of each pillar.
     p = ca.SX.sym('p', 3 * K_OBS)
+    margin = _obs_margin()
     h = ca.vertcat(*[(px - p[3 * k]) ** 2 + (py - p[3 * k + 1]) ** 2
-                     - (p[3 * k + 2] + OBS_MARGIN) ** 2 for k in range(K_OBS)])
+                     - (p[3 * k + 2] + margin) ** 2 for k in range(K_OBS)])
     m.p = p
     m.con_h_expr = h
     return m
@@ -364,7 +372,10 @@ class MPC:
         # 0.1 s stage-1 node) avoids the over-anticipation limit cycle at 30 Hz.
         q_pred = self._attitude_at(att_lookahead_s)  # wxyz, ENU body->world
         info = {"q_ref0": q0, "T_ref0": float(yref_stages[0][10]), "status": status,
-                "q_pred": q_pred, "u0": np.asarray(u0, dtype=np.float64)}
+                "q_pred": q_pred, "u0": np.asarray(u0, dtype=np.float64),
+                # stage-1 position reference (used by agile_core's --alt-follow to
+                # slave the altitude-hold thrust PD to the reference z).
+                "p_ref1": np.asarray(yref_stages[min(1, N - 1)][:3], dtype=np.float64)}
         return np.asarray(u0, dtype=np.float64), status, info
 
 
