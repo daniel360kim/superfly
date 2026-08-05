@@ -1,0 +1,129 @@
+[
+ {
+  "name": "warmup_sacrificial",
+  "obstacles": "diffaero",
+  "seed": 0,
+  "scale": 5.0,
+  "goal": [
+   -3.0,
+   50.0,
+   2.0
+  ],
+  "timeout": 120,
+  "climb_alt": 5
+ },
+ {
+  "name": "trainyard_mined_01",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/Trainyard/Trainyard.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   49.125,
+   129.0,
+   3.082
+  ],
+  "goal": [
+   65.125,
+   89.0,
+   2.837
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "trainyard_mined_06",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/Trainyard/Trainyard.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   -80.875,
+   -139.0,
+   2.218
+  ],
+  "goal": [
+   -44.875,
+   -139.0,
+   2.218
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "retro_neighborhood_mined_01",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/RetroNeighborhood/RetroNeighborhood.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   19.193,
+   -65.963,
+   1.89
+  ],
+  "goal": [
+   63.193,
+   -61.963,
+   2.592
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "retro_neighborhood_mined_05",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/RetroNeighborhood/RetroNeighborhood.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   -116.807,
+   -61.963,
+   1.8
+  ],
+  "goal": [
+   -82.807,
+   -75.963,
+   6.094
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "western_desert_town_mined_01",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/WesternDesertTown/WesternDesertTown.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   167.007,
+   33.001,
+   -140.979
+  ],
+  "goal": [
+   169.007,
+   -10.999,
+   -128.663
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "western_desert_town_mined_07",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/WesternDesertTown/WesternDesertTown.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   89.007,
+   -100.999,
+   -77.591
+  ],
+  "goal": [
+   131.007,
+   -108.999,
+   -93.168
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ }
+]

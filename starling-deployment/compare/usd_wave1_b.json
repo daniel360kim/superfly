@@ -1,0 +1,129 @@
+[
+ {
+  "name": "warmup_sacrificial",
+  "obstacles": "diffaero",
+  "seed": 0,
+  "scale": 5.0,
+  "goal": [
+   -3.0,
+   50.0,
+   2.0
+  ],
+  "timeout": 120,
+  "climb_alt": 5
+ },
+ {
+  "name": "city_park_mined_01",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/CityPark/CityPark.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   58.0,
+   104.3,
+   19.394
+  ],
+  "goal": [
+   74.0,
+   62.3,
+   13.725
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "city_park_mined_06",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/CityPark/CityPark.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   2.0,
+   78.3,
+   12.688
+  ],
+  "goal": [
+   46.0,
+   72.3,
+   17.819
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "bazaar_mined_01",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/Bazaar/Bazaar.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   67.648,
+   -23.092,
+   31.826
+  ],
+  "goal": [
+   107.648,
+   -5.092,
+   18.166
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "bazaar_mined_02",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/Bazaar/Bazaar.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   345.648,
+   -87.092,
+   51.78
+  ],
+  "goal": [
+   351.648,
+   -127.092,
+   50.88
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "chemical_plant_mined_09",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ChemicalPlant/Map_ChemicalPlant_2.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   77.179,
+   57.036,
+   -125.605
+  ],
+  "goal": [
+   89.179,
+   19.036,
+   -125.784
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ },
+ {
+  "name": "chemical_plant_mined_10",
+  "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ChemicalPlant/Map_ChemicalPlant_2.stage.usd",
+  "env_scale": 0.01,
+  "obstacles": "none",
+  "start": [
+   227.179,
+   49.036,
+   -126.452
+  ],
+  "goal": [
+   269.179,
+   65.036,
+   -126.133
+  ],
+  "climb_alt": 3,
+  "timeout": 300,
+  "pre_policy_timeout": 600
+ }
+]
