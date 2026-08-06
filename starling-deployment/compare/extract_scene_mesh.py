@@ -201,13 +201,33 @@ def main():
     print(f"[extract] {samples.shape[0]} surface samples at h={h:.3f} m "
           f"({n_raw} before voxel dedupe)")
 
+    # Ground channel (2026-08-06): the dropped ground-like faces, sampled at
+    # a coarser spacing into a SEPARATE array. Clearance/mining consumers of
+    # `samples` are unchanged; ground-aware consumers (corridor
+    # qualification ESDF, true-AGL checks) opt in by reading
+    # `ground_samples`. Rooftops/ceilings are ground-like too — the
+    # consumer decides how to treat them.
+    ground_keep = ok & ground_like
+    ground_samples = np.zeros((0, 3), dtype=np.float32)
+    gh = max(h * 2.0, 0.2)
+    if ground_keep.any():
+        g_est = estimated_samples(V, F[ground_keep], gh)
+        if g_est > args.max_samples // 2:
+            gh = gh * float(np.sqrt(g_est / (args.max_samples // 2)))
+        ground_samples = dedupe_samples(
+            sample_surface(V, F[ground_keep], gh), gh / 2.0
+        ).astype(np.float32)
+    print(f"[extract] {ground_samples.shape[0]} ground samples at "
+          f"gh={gh:.3f} m")
+
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     meta = dict(usd=args.usd, env_scale=args.env_scale, sample_h=h,
                 requested_sample_h=args.sample_h, ground_deg=args.ground_deg,
-                bounds=args.bounds,
+                bounds=args.bounds, ground_sample_h=gh,
                 n_triangles=int(F.shape[0]), n_obstacle_triangles=int(keep.sum()),
                 extractor_version=EXTRACTOR_VERSION)
-    np.savez_compressed(args.out, samples=samples, meta=json.dumps(meta))
+    np.savez_compressed(args.out, samples=samples,
+                        ground_samples=ground_samples, meta=json.dumps(meta))
     print(f"[extract] saved {args.out}")
 
 
