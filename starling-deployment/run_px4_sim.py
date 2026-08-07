@@ -673,6 +673,19 @@ class PegasusApp:
             "/World/lighting/sky", "DomeLight",
             attributes={"inputs:intensity": 1000.0, "inputs:color": (0.8, 0.85, 1.0)},
         )
+        # Interiors (station halls, sewer tunnels) receive neither sun nor
+        # dome; RGB renders pitch black there (probe3 videos, 2026-08-07).
+        # GSDS_CAMERA_LIGHT=1 parents an omnidirectional 'headlamp' to the
+        # vehicle so the camera always sees. Opt-in: it changes appearance,
+        # so it must never silently apply to benchmark scenes.
+        if os.environ.get("GSDS_CAMERA_LIGHT") == "1":
+            prim_utils.create_prim(
+                "/World/quadrotor/headlamp", "SphereLight",
+                translation=np.array([0.0, 0.0, 0.05]),
+                attributes={"inputs:intensity": 60000.0,
+                            "inputs:radius": 0.05,
+                            "inputs:color": (1.0, 1.0, 1.0)},
+            )
 
     def _add_colliders(self, root: str = "/World/layout", approximation: str = "none",
                        verbose: bool = True):
@@ -686,6 +699,20 @@ class PegasusApp:
         root_prim = self.world.stage.GetPrimAtPath(root)
         if not root_prim or not root_prim.IsValid():
             return
+        # UE-exported stages (TrainStation, Sewerage, Dmytro scenes, ...) are
+        # built from INSTANCED meshes; Usd.PrimRange does not descend into
+        # instance proxies and APIs cannot be applied to them, so those
+        # stages silently got zero colliders and the drone fell through the
+        # world (probe3 freefalls, 2026-08-07). De-instance under the layout
+        # root first; repeat for nested instancing.
+        for _ in range(4):
+            inst = [p for p in Usd.PrimRange(root_prim) if p.IsInstance()]
+            if not inst:
+                break
+            for p in inst:
+                p.SetInstanceable(False)
+        if inst := sum(1 for p in Usd.PrimRange(root_prim) if p.IsInstance()):
+            carb.log_warn(f"{inst} instance prims remain after de-instancing")
         n = 0
         for prim in Usd.PrimRange(root_prim):
             try:
