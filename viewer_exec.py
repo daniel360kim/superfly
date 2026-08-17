@@ -20,7 +20,31 @@ timeline = omni.timeline.get_timeline_interface()
 pg = PegasusInterface()
 pg._world = World(**pg._world_settings)
 world = pg.world
+
+# ROOT CAUSE (confirmed by reading simulation_context.py directly): its
+# __init__ has a class-level singleton guard --
+# `if SimulationContext._sim_context_initialized: return` -- and the "Full
+# Streaming" app already constructs one during its own boot, before this
+# --exec script ever runs. So World(**pg._world_settings) above returned
+# instantly without ever calling _init_stage(), which is the method that
+# actually creates _physics_context. Neither reset() nor reset_async() nor
+# any amount of app.update() pumping fixes this (all three tried and
+# confirmed failing) because they all assume _init_stage() already ran.
+# Call it directly ourselves, bypassing the blocked constructor.
+world._init_stage(**pg._world_settings)
+
+import omni.kit.app
+from omni.isaac.core.utils.stage import is_stage_loading
+_app = omni.kit.app.get_app()
+
 pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
+while is_stage_loading():
+    _app.update()
+
+world.reset()
+for _ in range(10):
+    _app.update()
+print(f"[viewer_exec] physics_context={world._physics_context!r}", flush=True)
 
 config = MultirotorConfig()
 config.backends = []  # no PX4, no policy -- bare vehicle, physics only

@@ -50,10 +50,16 @@ workflow:
         [ -f $REPO/methods/diffaero/script/train.py ] || {
           echo "DIFFAERO_SUBMODULE_MISSING_ABORT (Phase 1 not staged)"; exit 1; }
 
-        # Blackwell (sm_120) needs cu128 wheels; the base image torch is fine
-        # (cu130), diffaero's own requirements ride on top.
-        pip install --no-cache-dir -q -r $REPO/methods/diffaero/requirements.txt \
-          || echo "WARN: no requirements.txt; relying on the base image"
+        # Blackwell (sm_120) needs cu128+ kernels; the base image torch (cu130)
+        # is fine and MUST NOT be replaced -- so pytorch3d is excluded from the
+        # bulk install (its sdist build pulls torch pins) and built separately
+        # against the image torch. Only its pure-PyTorch `transforms` module is
+        # used, so a CPU-ops-only build (FORCE_CUDA=0) suffices and is faster.
+        grep -v "^pytorch3d" $REPO/methods/diffaero/requirements.txt > /tmp/req.txt
+        pip install --no-cache-dir -q -r /tmp/req.txt
+        FORCE_CUDA=0 pip install --no-cache-dir -q --no-build-isolation pytorch3d
+        # make `import diffaero` + `import superfly` work everywhere
+        pip install --no-cache-dir -q --no-deps -e $REPO/methods/diffaero
         pip install --no-cache-dir -q --no-deps -e $REPO
 
         OUT=$REPO/checkpoints/DiffAero/{{ tag }}

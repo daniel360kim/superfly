@@ -1,0 +1,62 @@
+# ModalAI Starling 2 Max — measured vehicle constants.
+#
+# Source: AirLab sys-ID campaign (Neelay Joglekar),
+# https://airlab.slite.com/app/docs/dj1982T35dt0qG ("Starling 2 Max Sys ID
+# Results", 2026-06). USD with these already applied:
+# omniverse://airlab-nucleus.andrew.cmu.edu/Library/Assets/ModalAI/starling_2_max/starling2max.usd
+#
+# This file is the repo's single source of truth: training overrides,
+# the Pegasus vehicle config, and MPC bounds all derive from it. The sys-ID
+# CAD frame is X-left / Y-up / Z-forward; everything below is already
+# converted to body FLU (x forward, y left, z up).
+
+mass_kg: 0.557
+
+# Diagonal inertia about the CoM [kg m^2], FLU axes. CAD->FLU mapping:
+# roll (about fwd) = CAD Z, pitch (about left) = CAD X, yaw (about up) = CAD Y.
+inertia_flu:
+  ixx_roll: 2.9434089e-3
+  iyy_pitch: 1.8574305e-3
+  izz_yaw: 4.6494552e-3
+
+# Center of mass offset (FLU, metres): essentially centered; 7.41 mm up.
+com_offset_flu_m: [0.00102, 0.000016, 0.00741]
+
+rotor:
+  # F = k_T * omega^2  [N per (rad/s)^2]
+  thrust_constant: 3.964738e-6
+  # tau_rotor = k_M * omega^2  [Nm per (rad/s)^2]
+  rolling_moment_coefficient: 5.38697e-8
+  # k_M / k_T [m] -- diffaero's c_tau; sys-ID gives 0.013587
+  torque_to_thrust_ratio: 0.013587
+  # First-order motor lag [s]: ~55 ms spin-up / ~85 ms spin-down,
+  # 72 +/- 2.5 ms under agile throttle changes (frequency response).
+  time_constant_s: 0.072
+  time_constant_up_s: 0.055
+  time_constant_down_s: 0.085
+
+# NOT in the sys-ID doc: max prop speed / max thrust. ASSUMED thrust-to-weight
+# = 2.0 (decision 2026-08-17; matches the harness's long-standing
+# MAX_ACCEL = 20 m/s^2 deploy convention within 2%). Everything below derives
+# from that assumption — retighten when a measured number lands.
+assumed:
+  thrust_to_weight: 2.0
+  max_thrust_total_n: 10.929         # 2.0 * m * g
+  max_thrust_accel_mps2: 19.62       # 2.0 * g
+  # box clamp for point-mass trainers: z = full vertical thrust accel;
+  # xy = horizontal component at full thrust with 1 g held vertically
+  # (= g * sqrt(T/W^2 - 1) = g*sqrt(3))
+  max_acc_z_mps2: 19.6
+  max_acc_xy_mps2: 17.0
+  # per-rotor: omega_max = sqrt((max_thrust_total/4) / k_T)
+  max_rotor_velocity_rad_s: 830.0
+  hover_rotor_velocity_rad_s: 587.0  # sqrt((m*g/4)/k_T)
+  hover_throttle: 0.5                # g / max_thrust_accel
+
+# diffaero pmc mapping (see dynamics/pointmass.py):
+#   a_dot = ((1-exp(-lmbda*dt))/dt) * (a_cmd - a)  =>  lmbda ~= 1/tau_motor.
+#   lmbda default 13.9 (tau 72 ms), randomized [11.8, 18.2] (tau 85..55 ms).
+diffaero_pmc:
+  lmbda_default: 13.9
+  lmbda_min: 11.8
+  lmbda_max: 18.2

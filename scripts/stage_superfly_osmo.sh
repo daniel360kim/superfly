@@ -16,24 +16,39 @@
 #   * PX4 flight logs -- build/px4_sitl_default/rootfs/log is GBs of past SITL
 #                       runs; the job needs the binary + etc/ (~43 MB).
 #
-# Usage:  scripts/stage_superfly_osmo.sh [tag]      (default tag: date +%m%d)
+# Usage:  scripts/stage_superfly_osmo.sh [tag] [--code-only]
+#         (default tag: date +%m%d)
+# --code-only: stage just the superfly repo (code + checkpoints + submodule
+# working trees) -- all a TRAINING job needs. The eval extras (PX4 binary,
+# Pegasus, USD stages, acados) are skipped, so it runs on boxes without
+# them (gs2).
 set -euo pipefail
 
-TAG="${1:-$(date +%m%d)}"
+CODE_ONLY=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --code-only) CODE_ONLY=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+TAG="${ARGS[0]:-$(date +%m%d)}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # superfly/
 PEGASUS="${PEGASUS_DIR:-$HOME/PegasusSimulator}"
 PX4="${PX4_DIR:-$HOME/PX4-Autopilot}"
 ACADOS="${ACADOS_DIR:-$HOME/acados}"
 USD_STAGES="${SUPERFLY_USD_STAGES:-$REPO/usd_stages}"
 
-for d in "$PEGASUS" "$PX4"; do
-  [ -d "$d" ] || { echo "MISSING_INPUT_ABORT $d"; exit 1; }
-done
+if [ "$CODE_ONLY" = 0 ]; then
+  for d in "$PEGASUS" "$PX4"; do
+    [ -d "$d" ] || { echo "MISSING_INPUT_ABORT $d"; exit 1; }
+  done
 
-PX4_BIN="$PX4/build/px4_sitl_default/bin/px4"
-PX4_ETC="$PX4/build/px4_sitl_default/etc"
-[ -x "$PX4_BIN" ] || { echo "PX4_NOT_BUILT_ABORT $PX4_BIN (run: make px4_sitl none_iris)"; exit 1; }
-[ -d "$PX4_ETC" ] || { echo "PX4_ETC_MISSING_ABORT $PX4_ETC"; exit 1; }
+  PX4_BIN="$PX4/build/px4_sitl_default/bin/px4"
+  PX4_ETC="$PX4/build/px4_sitl_default/etc"
+  [ -x "$PX4_BIN" ] || { echo "PX4_NOT_BUILT_ABORT $PX4_BIN (run: make px4_sitl none_iris)"; exit 1; }
+  [ -d "$PX4_ETC" ] || { echo "PX4_ETC_MISSING_ABORT $PX4_ETC"; exit 1; }
+fi
 
 STAGE="$(mktemp -d)/superfly_stage"
 trap 'rm -rf "$(dirname "$STAGE")"' EXIT
@@ -50,6 +65,20 @@ rsync -a \
 if [ -d "$REPO/results/mesh_cache" ]; then
   mkdir -p "$STAGE/superfly/results"
   rsync -a "$REPO/results/mesh_cache" "$STAGE/superfly/results"/
+fi
+
+if [ "$CODE_ONLY" = 1 ]; then
+  TAR="superfly_stage_${TAG}.tar"
+  OUT="${SUPERFLY_TAR_DIR:-${TMPDIR:-/tmp}}/$TAR"
+  echo "== building $OUT (code-only) =="
+  tar -C "$(dirname "$STAGE")" -cf "$OUT" superfly_stage
+  ls -lh "$OUT"
+  echo "== uploading to s3://superfly/tmp_data/$TAR =="
+  [ -n "${SUPERFLY_S3_KEY_ID:-}${GSDS_S3_KEY_ID:-}" ] || { [ -f ~/.s3env ] && . ~/.s3env; }
+  PYTHONPATH="$REPO/src" "${SUPERFLY_PYTHON:-python3}" -m superfly.remote_store upload "$OUT" "tmp_data/$TAR"
+  rm -f "$OUT"
+  echo "STAGED $TAR (code-only)"
+  exit 0
 fi
 
 echo "== staging Pegasus extension =="
@@ -118,7 +147,7 @@ ls -lh "$OUT"
 
 echo "== uploading to s3://superfly/tmp_data/$TAR =="
 [ -n "${SUPERFLY_S3_KEY_ID:-}${GSDS_S3_KEY_ID:-}" ] || { [ -f ~/.s3env ] && . ~/.s3env; }
-PYTHONPATH="$REPO/src" python3 -m superfly.remote_store upload "$OUT" "tmp_data/$TAR"
+PYTHONPATH="$REPO/src" "${SUPERFLY_PYTHON:-python3}" -m superfly.remote_store upload "$OUT" "tmp_data/$TAR"
 # The S3 copy is the one OSMO reads -- the local one is pure scratch, so drop
 # it as soon as the upload succeeds (tarballs have filled / mid-build before).
 rm -f "$OUT"

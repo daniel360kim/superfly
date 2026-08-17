@@ -77,6 +77,18 @@ class DiffAeroPolicy:
         self.module = torch.jit.load(str(pt2_path), map_location=self.device)
         self.module.eval()
 
+        # The exported actor rescales its tanh output with the min/max_action
+        # tensors passed at CALL time, so these must equal the bounds the run
+        # was trained with. Read them from the run's own hydra config when the
+        # checkpoint is a run dir (nominal = the randomizer 'default'); the
+        # ctor args remain the fallback for bare .pt2 files. A Starling-spec
+        # run (max_acc 17/19.6) would be silently mis-scaled by the legacy
+        # 20/40 defaults otherwise.
+        cfg_acc = self._ckpt_max_acc(checkpoint_path)
+        if cfg_acc is not None:
+            max_acc_xy, max_acc_z = cfg_acc
+            print(f"DiffAero action bounds from checkpoint config: "
+                  f"xy={max_acc_xy:g} z={max_acc_z:g} m/s^2")
         self.min_action = torch.tensor(
             [[-max_acc_xy, -max_acc_xy, 0.0]], dtype=torch.float32, device=self.device
         )
@@ -91,6 +103,33 @@ class DiffAeroPolicy:
 
         self.perception_builder = PerceptionBuilder(intrinsics, grid=grid, flip_lr=flip_lr, flip_ud=flip_ud)
         self._up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+
+    @staticmethod
+    def _ckpt_max_acc(checkpoint_path: str):
+        """(max_acc_xy, max_acc_z) nominal bounds from the run dir's hydra
+        config, or None when unavailable (bare .pt2 checkpoint, no yaml)."""
+        import yaml
+        root = Path(checkpoint_path)
+        if root.is_file():          # a bare exported_actor.pt2
+            root = root.parent.parent
+        for d in (".hydra", "hydra"):   # committed runs carry either name
+            cfg_path = root / d / "config.yaml"
+            if cfg_path.is_file():
+                break
+        else:
+            return None
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text())
+            acc = cfg["dynamics"]["max_acc"]
+
+            def nominal(v):
+                return float(v["default"] if isinstance(v, dict) else v)
+
+            return nominal(acc["xy"]), nominal(acc["z"])
+        except Exception as e:
+            print(f"[diffaero] could not read action bounds from {cfg_path} "
+                  f"({e}); using constructor defaults.")
+            return None
 
     def reset(self) -> None:
         """Clear the velocity EMA accumulated from the previous episode."""
