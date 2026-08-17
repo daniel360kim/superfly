@@ -4,6 +4,39 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-08-17 — pmv (velocity-command) dynamics re-implemented in the fork — SHIPPED
+
+Goal shift: deployments now want **PX4 velocity setpoints, planar at
+0.8–1.5 m/s on the Starling 2 Max** (not attitude+thrust). The pre-reorg
+`velocity_pointmass` (pmv) dynamics + planar option existed only in the dead
+checkout; re-implemented in `methods/diffaero` @ `dfbb935` schema-matched to
+the surviving `sha2c_vel_cmd*` hydra configs and to what `DiffAeroVelPolicy`
+reads: first-order velocity lag `alpha=1-exp(-lmbda*dt)` (identical to the
+deploy-side `_apply_velocity_lag`), level attitude with rate-limited yaw
+slew toward the vel EMA (deploy `slew_yaw_ned_cmd`), planar = 2-dim [vx,vy]
+action with vz≡0, targets flattened to spawn altitude (with a reachable
+planar min-init-dist — the 3-D half-diagonal is NOT reachable same-altitude
+from a centered spawn), episodes start goal-facing (deploy YAW phase).
+`cfg/dynamics/pmv_planar.yaml` is the Starling low-speed config (action
+clamp 2.0 m/s, rand 1.5–2.5; cruise band set by env target vels). Verified
+on gs2 CPU: tiny sha2c train + jit/onnx export for pmv_planar AND pmv, and
+the exported planar actor loaded + stepped through `DiffAeroVelPolicy`
+(planar flag, clamps, vz==0, yaw bridge all exercised). Registry entry
+`diffaero_vel_planar` -> `checkpoints/DiffAero/pmv_planar_starling_v1`;
+eval suite `suites/planar_lowvel_v1.json` (diffphys+diffaero fields,
+climb_alt 2, budgets sized for ~1 m/s). NOTE: fork push to GitHub was
+blocked in-session — `daniel360kim/diffaero` main is ahead of origin
+locally; push before relying on GitHub state.
+
+## 2026-08-17 — diffaero requirements.txt was missing einops — ESTABLISHED-NEGATIVE
+
+`import diffaero.algo` pulls `dreamerv3` → `einops`, but einops was never in
+`requirements.txt`, so ANY fresh-venv training job (incl. OSMO
+superfly-train-diffaero-4, cancelled) dies at import after a clean deps
+install. Fixed in the same fork commit (also added `onnxscript`, required by
+torch>=2.13 ONNX export). If a diffaero job fails at import, check the
+requirements install log before suspecting the code.
+
 ## 2026-08-17 — DiffAero planar checkpoints are unrecoverable — ESTABLISHED-NEGATIVE
 
 `checkpoints/DiffAero/planar_{cnn,mlp,rcnn}_sr0.9*` were committed as
