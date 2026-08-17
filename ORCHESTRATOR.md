@@ -33,16 +33,20 @@ The 2026-08-17 reorganization (`reorg` branch) landed: installable
 checkpoints, `superfly-*` OSMO workflows, this doc set. What remains, in
 dependency order:
 
-1. **Method forks (BLOCKED on user)**: create GitHub forks of `depthnav`,
-   `diffaero`, and `uzh-rpg/agile_autonomy` (WITH `planner_learning/`), then
-   `git submodule add` each under `methods/` and fill `methods/README.md`.
-   No baseline source survives on gs2 — see ATTEMPTS.md.
+1. ~~Method forks~~ **DONE 2026-08-17**: submodules live under `methods/`
+   (`daniel360kim/{depthnav,diffaero,agile_autonomy}`, the last WITH
+   `planner_learning/`) — see `methods/README.md` for the per-fork notes.
+   Method venvs still need building per machine (`methods/<name>/.venv`).
 2. **S3 (BLOCKED on user, one-time)**: create the `superfly` bucket
-   (`python -m superfly.remote_store create-bucket` with `~/.s3env`
-   sourced), register the credential with OSMO for `s3://superfly`, and
-   optionally add `SUPERFLY_S3_*` names to `~/.s3env`.
-3. **Training pipelines (Phase 3)**: `scripts/train_diffaero.py` exists
-   (untested until the submodule lands); `train_depthnav.py`,
+   (`source ~/.s3env && PYTHONPATH=<repo>/src <python-with-boto3> -m
+   superfly.remote_store create-bucket`), register the credential with OSMO
+   for `s3://superfly`, and optionally add `SUPERFLY_S3_*` names to
+   `~/.s3env`.
+3. **Training pipelines (Phase 3)**: `scripts/train_diffaero.py` is written
+   and its train/export interface verified against the submodule source
+   (still needs one GPU run). `train_depthnav.py` (entry:
+   `examples/navigation/run_nav_level1.py`; the vel variant also needs
+   `policy_cfg/small_yaw_vel.yaml` recreated — it exists nowhere),
    `train_agile.py` + `build_agile_dataset.py` still to write. The agile
    labels come from `superfly_expert_sampler` on airstation03; the one
    genuine gap is depth-image rendering for its rollouts (see ATTEMPTS.md

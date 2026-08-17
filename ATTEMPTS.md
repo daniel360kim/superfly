@@ -38,12 +38,18 @@ submodule in history, `mapnav`, is stranded on `main` (not an ancestor of
 `triage`). The only surviving local copy is `/home/ubuntu/aa_build/agile_autonomy`
 (non-git, missing `planner_learning/`). Recovery path: fork upstream repos on
 GitHub (user action; `gh` absent on gs2) and add as `methods/` submodules.
+**RESOLVED 2026-08-17**: `daniel360kim/{depthnav,diffaero,agile_autonomy}`
+added as submodules; agile_autonomy's fork includes `planner_learning/`.
 
 ## 2026-08-17 — depthnav_vel checkpoint — PENDING
 
 `depthnav_vel` has ALWAYS pointed at `level1_vel.pth`, which was never
 produced by anyone; it is checkpoint-gated out of the harness until Phase 3
-delivers it. (An earlier draft of this entry also claimed
+delivers it. 2026-08-17 update: the fork also lacks
+`examples/navigation/policy_cfg/small_yaw_vel.yaml` (the config
+`superfly.policies.depthnav` VELOCITY_CFG points at) — it existed only in
+the lost checkout, so Phase 3 must recreate the config too (the docstring in
+`policies/depthnav.py` records its known training parameters). (An earlier draft of this entry also claimed
 `sha2c_vel_cmd_oa` lacked its `exported_actor.pt2` — false, a truncated
 directory listing; the artifact is committed and `diffaero_vel` is ready.)
 

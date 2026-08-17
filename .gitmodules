@@ -1,0 +1,9 @@
+[submodule "methods/depthnav"]
+	path = methods/depthnav
+	url = https://github.com/daniel360kim/depthnav.git
+[submodule "methods/diffaero"]
+	path = methods/diffaero
+	url = https://github.com/daniel360kim/diffaero.git
+[submodule "methods/agile_autonomy"]
+	path = methods/agile_autonomy
+	url = https://github.com/daniel360kim/agile_autonomy.git

@@ -12,13 +12,19 @@ that produced the committed sha2c runs was
 checkpoints/exported_actor.pt2 (the self-contained TorchScript actor that
 checkpoint_ready() tests for and the offboard loads).
 
+Interface verified against the submodule source (2026-08-17):
+  * train.py writes final weights to <hydra.run.dir>/checkpoints/actor.pth
+    (utils/runner.py) and hydra drops .hydra/config.yaml in the run dir.
+  * export.py wants checkpoint=<run>/checkpoints -- the DIRECTORY holding
+    actor.pth: agent.load() joins "actor.pth" onto it, the run config is
+    read from <run>/.hydra/config.yaml (ckpt_path.parent/.hydra), and
+    PolicyExporter writes exported_actor.pt2/.onnx INTO that directory --
+    exactly the committed checkpoints/DiffAero/<run>/ layout.
+
 Runs under the method venv: methods/diffaero/.venv/bin/python. GPU required
 (train on OSMO via osmo/superfly-train-diffaero.yaml or on airstation03 via
-scripts/airstation_train.sh) -- never on gs2.
-
-STATUS: written against the documented interface; not yet exercised end to
-end (methods/diffaero submodule pending). It fails loudly if the trainer or
-the expected artifact is missing rather than guessing.
+scripts/airstation_train.sh) -- never on gs2. Not yet exercised end to end
+(needs a GPU box); it fails loudly if the expected artifact is missing.
 """
 
 import argparse
@@ -66,8 +72,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     sh([py, "script/train.py", *args.config, f"hydra.run.dir={out}"], cwd=DIFFAERO)
-    # Export the deployable TorchScript actor into <out>/checkpoints/.
-    sh([py, "script/export.py", f"hydra.run.dir={out}"], cwd=DIFFAERO)
+    # Export the deployable TorchScript actor into <out>/checkpoints/
+    # (export.py reads <out>/.hydra/config.yaml via checkpoint dir's parent).
+    sh([py, "script/export.py", f"checkpoint={out / 'checkpoints'}"], cwd=DIFFAERO)
 
     artifact = out / "checkpoints" / "exported_actor.pt2"
     if not artifact.exists():
