@@ -1,0 +1,241 @@
+# Interactive Isaac Sim + Pegasus session, viewable live over WebRTC from the
+# native "Isaac Sim WebRTC Streaming Client" desktop app on your Mac. Spawns
+# a single bare "Iris" quadrotor (no PX4, no policy) sitting in Isaac's
+# "Curved Gridroom" environment -- this is purely to validate the streaming
+# pipeline, not to fly anything. For the real PX4 SITL + policy comparison
+# harness see osmo/superfly.yaml instead.
+#
+# Isaac Sim 5.1.0 (matches the pinned version already proven working in
+# osmo/superfly.yaml) + PegasusSimulator's matching v5.1.0 tag, installed
+# fresh in-container -- no S3 staging tarball needed for this bare scene.
+#
+# --- Client ---
+# There is NO browser-based client here -- that requires NVIDIA's Docker
+# Compose bundle (a separate bundled web-viewer service on port 8210), which
+# we don't run. The plain standalone-script launch we use only supports the
+# native desktop client: download "Isaac Sim WebRTC Streaming Client" (macOS
+# arm64 build) from https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html,
+# install, and connect it to 127.0.0.1 once the ports below are forwarded.
+#
+# --- Networking ---
+# OSMO has no public ingress; `osmo workflow port-forward` tunnels fixed
+# Isaac Sim ports out to whichever machine runs it. Isaac Sim 5.1's WebRTC
+# livestream ports are NOT configurable (confirmed via NVIDIA docs/forums):
+#   TCP 49100  - WebRTC signaling
+#   UDP 47998  - WebRTC media (RTP)
+#
+# KNOWN BUG, WORKED AROUND: osmo CLI 6.3.1's `port-forward --udp` crashes on
+# Python 3.11+ (TypeError: Passing coroutines is forbidden -- fixed upstream
+# in NVIDIA/OSMO PR #1291, merged 2026-08-12, but not in any tagged release
+# yet). Plain TCP port-forward works fine, so a `socat` relay inside the
+# container converts the UDP media stream to a TCP stream on port 58998;
+# forward THAT normally, then un-convert it back to local UDP with `socat`
+# on the client side. See the container command below for the relay itself.
+#
+# All ports/relays must run on the SAME machine that opens the client
+# (WebRTC's ICE negotiation is sensitive to extra hops -- do this directly on
+# your Mac, not relayed through gs2). One-time prerequisites on your Mac:
+#   curl -fsSL https://raw.githubusercontent.com/NVIDIA/OSMO/refs/heads/main/install.sh | bash
+#   osmo login https://airlab-share-01.andrew.cmu.edu
+#   brew install socat
+#
+# --- Usage ---
+#   osmo workflow submit osmo/isaac_webrtc_viewer.yaml --pool default
+#   # note the workflow ID it prints, e.g. aa-isaac-webrtc-viewer-1
+#   osmo workflow port-forward <workflow_id> viewer --port 49100 &
+#   osmo workflow port-forward <workflow_id> viewer --port 58998 &
+#   socat UDP-LISTEN:47998,fork TCP:127.0.0.1:58998 &
+#   # then open the native client app and connect to server: 127.0.0.1
+#
+# Self-terminates after 8h wall-clock as a shared-GPU safety net (holds 1 GPU
+# the whole time it's up, unlike short batch jobs) -- run
+# `osmo workflow cancel <workflow_id>` yourself once you're done, well before
+# that.
+#
+# Verified live 2026-08-17 (aa-isaac-webrtc-viewer-1): "omni.kit.livestream.webrtc"
+# is the correct extension name on this build and starts cleanly.
+version: 2
+workflow:
+  name: aa-isaac-webrtc-viewer
+  groups:
+  - name: viewer-group
+    tasks:
+    - name: viewer
+      lead: true
+      image: pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel
+      resource: gpu_resource
+      command:
+      - bash
+      - -c
+      - |
+        set -ex
+        export OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive
+
+        # ---- system libs Kit's RTX plugin dlopens (proven recipe, superfly.yaml) ----
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends \
+          libgl1 libglu1-mesa libegl1 libglx0 libopengl0 libvulkan1 \
+          libxrandr2 libxinerama1 libxcursor1 libxi6 libxt6 libxfixes3 \
+          libxrender1 libxkbcommon0 libsm6 libice6 libfontconfig1 \
+          libgomp1 libatomic1 libnss3 libasound2 ffmpeg git socat > /dev/null
+        ldconfig -p | grep -q 'libGL\.so\.1' || { echo "LIBGL_MISSING_ABORT"; exit 1; }
+
+        # ---- UDP->TCP relay working around osmo CLI's broken --udp port-forward
+        # (see header comment) -- runs for the life of the container, doesn't
+        # need to wait for Isaac Sim to actually bind 47998 first since UDP is
+        # connectionless; started early so it's ready the moment Isaac Sim is. ----
+        socat TCP-LISTEN:58998,fork,reuseaddr UDP:127.0.0.1:47998 &
+        echo "[relay] socat UDP 47998 <-> TCP 58998 started, pid $!"
+
+        # ---- Isaac Sim + Pegasus, pinned matching-version pair ----
+        pip install --no-cache-dir "isaacsim[all,extscache]==5.1.0" \
+          --extra-index-url https://pypi.nvidia.com > /dev/null
+        # Pegasus's setup.py hard-requires ISAACSIM_PATH (its own installation
+        # docs) -- the pip-installed isaacsim package still ships the same
+        # exts/apps/kit layout a traditional extracted install has, just under
+        # site-packages, so that directory IS the ISAACSIM_PATH.
+        export ISAACSIM_PATH=$(python -c "import isaacsim, os; print(os.path.dirname(isaacsim.__file__))")
+        git clone --quiet --depth 1 --branch v5.1.0 \
+          https://github.com/PegasusSimulator/PegasusSimulator.git /opt/PegasusSimulator
+        # Official docs (pegasussimulator.github.io/.../installation.html) say to
+        # `pip install --editable` the extension itself rather than just adding it
+        # to PYTHONPATH -- this properly resolves its declared deps (pymavlink
+        # etc.) instead of chasing missing imports one crash at a time.
+        pip install --no-cache-dir --editable \
+          /opt/PegasusSimulator/extensions/pegasus.simulator > /dev/null
+        # Belt-and-suspenders: pegasus.simulator's __init__ unconditionally
+        # imports its PX4 mavlink backend even though we never use it here, and
+        # superfly.yaml already had to special-case this exact import chain --
+        # keep this even if the editable install above already covers it.
+        pip install --no-cache-dir pymavlink > /dev/null
+
+        # ---- carb-before-isaacsim import fix (see superfly.yaml for the full story:
+        # `import carb` before `from isaacsim import SimulationApp` only works if
+        # isaacsim's own package init has already run once to put carb/omni on
+        # sys.path -- true when launched via isaacsim/python.sh, not for a bare
+        # `python script.py`) ----
+        SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+        cat > $SITE/sitecustomize.py <<'PYEOF'
+        try:
+            import isaacsim  # noqa: F401  (puts carb/omni on sys.path)
+        except Exception:
+            pass
+        PYEOF
+
+        # ---- non-root user (matches superfly.yaml -- avoids OSMO's stale-proc
+        # sweep SIGTERMing the job's own PID-1, and Kit's portable install needs
+        # a writable HOME it owns for its shader/data caches) ----
+        useradd -m -d /home/flyer -s /bin/bash flyer
+        chown -R flyer:flyer /opt/PegasusSimulator
+        mkdir -p /home/flyer/.cache && chown -R flyer:flyer /home/flyer
+        chown -R flyer:flyer "$ISAACSIM_PATH"
+
+        # ---- the viewer script ----
+        mkdir -p /opt/viewer
+        cat > /opt/viewer/viewer.py <<'PYEOF'
+        import sys
+
+        # Isaac Sim 5.1's WebRTC livestream ports are fixed (8211 client page,
+        # 49100 TCP signal, 47998 UDP media) and NOT actually overridable as of
+        # 5.0/5.1 per NVIDIA docs/forums -- publicIp is what matters here, set to
+        # 127.0.0.1 since the browser connects through a local
+        # `osmo workflow port-forward` tunnel, not a real public address.
+        sys.argv += [
+            "--/exts/omni.kit.livestream.app/primaryStream/publicIp=127.0.0.1",
+            "--/exts/omni.kit.livestream.app/primaryStream/signalPort=49100",
+            "--/exts/omni.kit.livestream.app/primaryStream/streamPort=47998",
+        ]
+
+        import carb
+        from isaacsim import SimulationApp
+        # hide_ui=False matches NVIDIA's own official standalone livestream
+        # example (source/standalone_examples/api/isaacsim.simulation_app/
+        # livestream.py) -- our first attempt left the default headless
+        # hide_ui behavior in place, which likely meant nothing was ever
+        # composited for the stream to actually capture (black screen,
+        # connection otherwise succeeded).
+        simulation_app = SimulationApp({
+            "headless": True,
+            "hide_ui": False,
+            "width": 1280,
+            "height": 720,
+            "display_options": 3286,
+        })
+        simulation_app.set_setting("/app/window/drawMouse", True)
+
+        # "omni.kit.livestream.app" is what NVIDIA's own official example
+        # enables (not "omni.kit.livestream.webrtc", which is what our first
+        # attempt used because it didn't immediately error -- but it was
+        # mid-syncing with an extension registry when that run crashed from
+        # the separate pymavlink bug, so we never actually saw whether it
+        # would resolve). Enable both: .app per the proven recipe, .webrtc as
+        # a fallback since it's confirmed to at least start a signaling
+        # server on its own.
+        from omni.isaac.core.utils.extensions import enable_extension
+        for _ext in ("omni.kit.livestream.app", "omni.kit.livestream.webrtc"):
+            try:
+                enable_extension(_ext)
+                print(f"[viewer] enabled extension: {_ext}", flush=True)
+            except Exception as _e:
+                print(f"[viewer] could not enable {_ext}: {_e!r}", flush=True)
+
+        import omni.timeline
+        from omni.isaac.core.world import World
+        from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
+        from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
+        from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
+
+        timeline = omni.timeline.get_timeline_interface()
+        pg = PegasusInterface()
+        pg._world = World(**pg._world_settings)
+        world = pg.world
+        pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
+
+        config = MultirotorConfig()
+        config.backends = []  # no PX4, no policy -- bare vehicle, physics only
+        Multirotor(
+            "/World/quadrotor1",
+            ROBOTS["Iris"],
+            0,
+            [0.0, 0.0, 0.3],
+            [0.0, 0.0, 0.0, 1.0],  # identity quaternion (x, y, z, w)
+            config=config,
+        )
+        world.reset()
+
+        print("[viewer] scene ready, entering render loop", flush=True)
+        timeline.play()
+        while simulation_app.is_running():
+            world.step(render=True)
+
+        timeline.stop()
+        simulation_app.close()
+        PYEOF
+
+        # ---- run as non-root, self-terminate after 8h as a shared-GPU safety net ----
+        cat > /tmp/run_viewer.sh <<'RUNEOF'
+        set -x
+        export HOME=/home/flyer
+        export OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y
+        export PYTHONPATH=/opt/PegasusSimulator/extensions/pegasus.simulator
+        export ISAACSIM_PATH=$(python -c "import isaacsim, os; print(os.path.dirname(isaacsim.__file__))")
+        timeout 8h python /opt/viewer/viewer.py
+        RUNEOF
+        chmod +x /tmp/run_viewer.sh
+        if command -v setpriv > /dev/null; then
+          setpriv --reuid=$(id -u flyer) --regid=$(id -g flyer) --init-groups \
+            bash /tmp/run_viewer.sh
+        else
+          su flyer -c "bash /tmp/run_viewer.sh"
+        fi
+        echo "VIEWER_EXITED rc=$?"
+  resources:
+    gpu_resource:
+      # cpu/mem per INFRASTRUCTURE_OSMO.md's right-sizing rule. storage
+      # generous because Isaac's extscache + shader cache land on container
+      # scratch (matches osmo/superfly.yaml's sizing).
+      cpu: 8
+      gpu: 1
+      memory: 32Gi
+      platform: default
+      storage: 150Gi
