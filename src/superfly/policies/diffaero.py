@@ -4,7 +4,20 @@ from scipy.spatial.transform import Rotation
 from pathlib import Path
 import torch
 
-from wrapper.perception_builder import PerceptionBuilder, Intrinsics, PerceptionGrid
+from superfly.perception.builder import PerceptionBuilder, Intrinsics, PerceptionGrid
+
+# DiffAero training camera intrinsics (diffaero/cfg/sensor/camera.yaml):
+# 64x36 render for the 16x9 perception grid, hfov 86 deg, DiffAero's
+# angle-linear vfov = hfov * H/W = 48.375 deg. Previously copied verbatim
+# into both diffaero offboard scripts.
+import math as _math
+
+DA_INTRINSICS = Intrinsics(
+    fx=0.5 * 64 / _math.tan(0.5 * _math.radians(86.0)),
+    fy=0.5 * 36 / _math.tan(0.5 * _math.radians(48.375)),
+    cx=32.0, cy=18.0,
+    H=36, W=64,
+)
 
 @dataclass
 class DiffAeroObs:

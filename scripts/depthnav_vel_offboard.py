@@ -40,24 +40,28 @@ Run with the depthnav venv (torch + depthnav + pymavlink):
 
 import argparse
 import math
+import sys
 import time
 import threading
 from pathlib import Path
 
 import numpy as np
+
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 from pymavlink import mavutil
 
-# Reuse the proven MAVLink + state-machine infrastructure. Deliberately NOT
-# imported from diffaero_vel_offboard, which pulls in the DiffAero wrapper
-# (and its deps) at module import time.
-from diffdrone_offboard import (
-    HEARTBEAT_HZ, OFFBOARD_DONE_FILE,
-    DroneState,
-    wait_for_heartbeat, set_offboard_mode, arm,
-    send_position_target_ned, send_heartbeat, set_param_float, receive_loop,
-    retry_offboard_arm, _mark_policy_phase,
+from superfly.common.frames import enu_vel_to_ned, wrap_pi, yaw_enu_to_ned
+from superfly.common.px4_offboard import (
+    HEARTBEAT_HZ,
+    DroneState, wait_for_heartbeat, wait_for_position, set_offboard_mode, arm,
+    send_position_target_ned, send_velocity_target_ned, send_land_command,
+    send_heartbeat, set_param_float, receive_loop, retry_offboard_arm,
 )
-from depthnav_policy import DepthNavPolicy, ACTION_VELOCITY
+from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
+from superfly.policies.depthnav import DepthNavPolicy, ACTION_VELOCITY
 
 CONTROL_HZ = 50.0   # depthnav ctrl_dt = 0.02
 
@@ -67,51 +71,6 @@ DEFAULT_MAX_VEL_Z = 1.5     # VelocityBoundedYaw max_vel_z
 DEFAULT_TARGET_SPEED = 1.1  # centre of the trained [0.7, 1.5] band
 DEFAULT_ACC_HOR = 3.0       # must match dynamics_kwargs.vel_setpoint_slew
 DEFAULT_MAX_YAW_RATE_DEG = 60.0
-
-
-def send_velocity_target_ned(mav, vx_n: float, vy_e: float, vz_d: float, yaw: float):
-    """Velocity + yaw setpoint (SET_POSITION_TARGET_LOCAL_NED, msg id 84).
-
-    Position, acceleration and yaw-rate fields are masked off, so PX4 runs its
-    velocity controller on (vx, vy, vz) and its yaw controller on `yaw`.
-    Identical mask to diffaero_vel_offboard.send_velocity_target_ned.
-    """
-    IGNORE_POS = 1 | 2 | 4
-    IGNORE_ACC = 64 | 128 | 256
-    IGNORE_YAW_RATE = 2048
-    type_mask = IGNORE_POS | IGNORE_ACC | IGNORE_YAW_RATE
-    mav.mav.set_position_target_local_ned_send(
-        int(time.time() * 1000) & 0xFFFFFFFF,
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        type_mask,
-        0.0, 0.0, 0.0,
-        float(vx_n), float(vy_e), float(vz_d),
-        0.0, 0.0, 0.0,
-        float(yaw), 0.0,
-    )
-
-
-def send_land_command(mav):
-    mav.mav.command_long_send(
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_LAND,
-        0, 0, 0, 0, 0, 0, 0, 0,
-    )
-
-
-def enu_vel_to_ned(vel_enu: np.ndarray):
-    """ENU velocity -> NED (vx=North, vy=East, vz=Down)."""
-    return float(vel_enu[1]), float(vel_enu[0]), float(-vel_enu[2])
-
-
-def wrap_pi(a: float) -> float:
-    return math.atan2(math.sin(a), math.cos(a))
-
-
-def yaw_enu_to_ned(yaw_enu: float) -> float:
-    """ENU heading (CCW from East) -> NED heading (CW from North)."""
-    return wrap_pi(math.pi / 2.0 - yaw_enu)
 
 
 def slew_yaw(yaw_cmd_ned: float, yaw_target_ned: float,
@@ -125,18 +84,6 @@ def slew_yaw(yaw_cmd_ned: float, yaw_target_ned: float,
     err = wrap_pi(yaw_target_ned - yaw_cmd_ned)
     max_step = math.radians(max_rate_deg) * dt
     return wrap_pi(yaw_cmd_ned + max(-max_step, min(max_step, err)))
-
-
-def wait_for_position(state: DroneState, timeout: float = 30.0):
-    """Block until the EKF has produced a local position estimate."""
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        pos, _, _, _ = state.get()
-        if np.any(pos != 0.0):
-            return True
-        time.sleep(0.1)
-    print("WARNING: no position estimate before timeout; continuing anyway.")
-    return False
 
 
 def main():
@@ -175,7 +122,7 @@ def main():
 
     depth_sub = None
     if args.depth:
-        from depth_transport import DepthSubscriber
+        from superfly.common.transport import DepthSubscriber
         depth_sub = DepthSubscriber()
         print("Depth subscriber listening for frames over UDP.")
 
@@ -298,7 +245,7 @@ def main():
                     policy.reset(R_enu)   # capture the START frame, now goal-facing
                     yaw_ned_cmd = yaw_cur_ned
                     phase = "POLICY"
-                    _mark_policy_phase("start")
+                    mark_policy_phase("start")
                     print(f"\n>>> HANDOFF to velocity policy at "
                           f"yaw={math.degrees(yaw_cur_ned):.1f} deg; START frame captured <<<\n")
                 if verbose:
@@ -318,7 +265,7 @@ def main():
                 dist = float(np.linalg.norm(goal_enu - pos))
                 if dist < args.goal_tol:
                     phase = "LANDING"
-                    _mark_policy_phase("end")
+                    mark_policy_phase("end")
                     print(f"\n>>> Goal reached at pos={pos.round(2)} "
                           f"(dist={dist:.2f} m); landing <<<\n")
                 if verbose:
@@ -359,10 +306,7 @@ def main():
             0, 0, 0, 0, 0, 0, 0, 0,
         )
         # run_comparison.py polls this to know the run finished.
-        try:
-            Path(OFFBOARD_DONE_FILE).write_text(str(time.time()))
-        except Exception:
-            pass
+        mark_offboard_done()
 
 
 if __name__ == "__main__":

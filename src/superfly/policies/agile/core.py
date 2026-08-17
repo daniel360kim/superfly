@@ -28,8 +28,8 @@ import numpy as np
 from scipy.ndimage import minimum_filter
 from scipy.spatial.transform import Rotation
 
-from wrapper.agile_model import LoquercioModelConfig, TensorFlowLoquercioBackend
-from wrapper.agile_mpc import (
+from superfly.policies.agile.model import LoquercioModelConfig, TensorFlowLoquercioBackend
+from superfly.policies.agile.mpc import (
     MPC, state_x0, clamp_attitude_tilt, flatness_attitude, G,
 )
 

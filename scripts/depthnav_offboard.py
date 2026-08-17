@@ -13,29 +13,36 @@ Key differences from DiffPhysDrone:
   - Explicit yaw command from the policy (APPLIED, not yaw-hold).
   - Depth: raw 72x128 metric metres (subscriber resizes/forwards).
 
-Run with the depthnav venv (has torch + depthnav + pymavlink):
-  /home/dtc-system/superfly/depthnav/.venv/bin/python depthnav_offboard.py \
+Run with the depthnav venv (torch + depthnav + pymavlink):
+  methods/depthnav/.venv/bin/python scripts/depthnav_offboard.py \
       --depth --climb-alt 2 --goal -3 40 1 --target-speed 3
 """
 
 import argparse
 import math
+import sys
 import time
 import threading
+from pathlib import Path
 
 import numpy as np
+
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
 
-# Reuse the proven MAVLink + state-machine infrastructure.
-from diffdrone_offboard import (
+from superfly.common.frames import quat_ENU_FLU_to_NED_FRD
+from superfly.common.px4_offboard import (
     MASS_KG, MAX_ACCEL, HEARTBEAT_HZ,
-    DroneState, quat_ENU_FLU_to_NED_FRD,
-    wait_for_heartbeat, set_offboard_mode, arm, send_attitude_target,
-    send_position_target_ned, send_heartbeat, set_param_float, receive_loop,
-    retry_offboard_arm, _mark_policy_phase,
+    DroneState, wait_for_heartbeat, set_offboard_mode, arm,
+    send_attitude_target, send_position_target_ned, send_heartbeat,
+    set_param_float, receive_loop, retry_offboard_arm,
 )
-from depthnav_policy import DepthNavPolicy
+from superfly.common.sentinels import mark_policy_phase
+from superfly.policies.depthnav import DepthNavPolicy
 
 CONTROL_HZ = 50.0   # depthnav ctrl_dt = 0.02
 
@@ -102,7 +109,7 @@ def main():
 
     depth_sub = None
     if args.depth:
-        from depth_transport import DepthSubscriber
+        from superfly.common.transport import DepthSubscriber
         depth_sub = DepthSubscriber()
         print("Depth subscriber listening for frames over UDP.")
 
@@ -154,7 +161,6 @@ def main():
     step_count = 0
 
     phase = "CLIMB"
-    handed_off = False
     print(f"CLIMB: position-holding to {args.climb_alt:.1f} m ...")
 
     try:
@@ -185,9 +191,8 @@ def main():
                         # Capture the START frame at handoff (the drone's current
                         # world attitude defines depthnav's fixed START frame).
                         policy.reset(R_enu)
-                        handed_off = True
                         phase = "POLICY"
-                        _mark_policy_phase("start")
+                        mark_policy_phase("start")
                         print(f"\n>>> HANDOFF at alt={alt:.2f} m, speed={speed:.2f} m/s; "
                               f"START frame captured <<<\n")
                     if verbose:

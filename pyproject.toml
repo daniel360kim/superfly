@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superfly"
+version = "0.1.0"
+description = "Baseline drone-nav methods + Isaac Sim / PX4 SITL comparison harness"
+requires-python = ">=3.9"
+# Base deps are deliberately minimal: superfly.common and superfly.compare are
+# imported inside THREE different method venvs (depthnav, diffaero, and the
+# acados-shimmed agile venv), so the shared layer must not drag in torch/TF.
+# Heavy per-method deps live in extras; each method venv already has its own
+# stack and installs this package with `pip install -e . --no-deps`.
+dependencies = [
+    "numpy",
+    "scipy",
+    "pymavlink",
+]
+
+[project.optional-dependencies]
+# Per-method extras: what each policy core needs BEYOND its method repo's own
+# requirements (methods/<repo> installs bring the real training stacks).
+depthnav = ["torch", "pyyaml", "gymnasium"]
+diffaero = ["torch", "pyyaml"]
+agile = ["tensorflow-cpu", "casadi"]  # + acados_template from $ACADOS_SOURCE_DIR
+viz = ["matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

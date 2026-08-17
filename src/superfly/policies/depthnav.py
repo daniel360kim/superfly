@@ -34,13 +34,15 @@ import numpy as np
 import torch as th
 from scipy.spatial.transform import Rotation
 
-# depthnav package. Overridable because the checkout path differs per machine;
-# the previous hardcoded /home/ubuntu path does not exist on every host and
-# broke both the import below and the default cfg_path.
+# depthnav package root: the methods/depthnav submodule three levels above
+# this file (src/superfly/policies/ -> repo root). DEPTHNAV_ROOT overrides for
+# machines that keep a separate checkout.
 _DEPTHNAV = os.environ.get(
     "DEPTHNAV_ROOT",
-    os.path.join(os.path.expanduser("~"), "superfly", "depthnav"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "..", "..", "..", "methods", "depthnav"),
 )
+_DEPTHNAV = os.path.abspath(_DEPTHNAV)
 if not os.path.isdir(_DEPTHNAV):
     raise RuntimeError(
         f"depthnav checkout not found at {_DEPTHNAV!r}. "

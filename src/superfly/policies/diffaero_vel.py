@@ -25,8 +25,8 @@ import numpy as np
 import torch
 import yaml
 
-from wrapper.diffaero_core import DiffAeroObs
-from wrapper.perception_builder import Intrinsics, PerceptionBuilder, PerceptionGrid
+from superfly.policies.diffaero import DiffAeroObs
+from superfly.perception.builder import Intrinsics, PerceptionBuilder, PerceptionGrid
 
 
 @dataclass

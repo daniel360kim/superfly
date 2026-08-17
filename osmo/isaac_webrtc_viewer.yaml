@@ -140,10 +140,17 @@ workflow:
         # 5.0/5.1 per NVIDIA docs/forums -- publicIp is what matters here, set to
         # 127.0.0.1 since the browser connects through a local
         # `osmo workflow port-forward` tunnel, not a real public address.
+        # Explicit lowercase override: SimulationApp's own hide_ui=False kwarg
+        # got translated to the literal CLI arg `--/app/window/hideUi=False`
+        # (capital-F Python bool stringified) in the previous attempt, which
+        # many Kit-side bool parsers treat as a truthy non-empty string
+        # rather than actually false. Appending our own lowercase copy after
+        # it should win since later-specified args take precedence.
         sys.argv += [
             "--/exts/omni.kit.livestream.app/primaryStream/publicIp=127.0.0.1",
             "--/exts/omni.kit.livestream.app/primaryStream/signalPort=49100",
             "--/exts/omni.kit.livestream.app/primaryStream/streamPort=47998",
+            "--/app/window/hideUi=false",
         ]
 
         import carb
@@ -203,10 +210,33 @@ workflow:
         )
         world.reset()
 
+        # Diagnostics + explicit camera positioning -- point the default
+        # viewport camera directly at the spawned vehicle rather than
+        # trusting whatever the default happens to be, and confirm a
+        # viewport actually exists / is enabled (if get_active_viewport()
+        # returns None here, that means --no-window genuinely prevents any
+        # viewport from existing at all, which would explain a black stream
+        # regardless of anything else).
+        from omni.isaac.core.utils.viewports import set_camera_view
+        set_camera_view(eye=[3.0, 3.0, 3.0], target=[0.0, 0.0, 0.3])
+        try:
+            from omni.kit.viewport.utility import get_active_viewport
+            _vp = get_active_viewport()
+            print(f"[viewer] active viewport: {_vp}", flush=True)
+            if _vp is not None:
+                _vp.updates_enabled = True
+                print(f"[viewer] viewport camera path: {_vp.camera_path}", flush=True)
+        except Exception as _e:
+            print(f"[viewer] viewport diagnostic failed: {_e!r}", flush=True)
+
         print("[viewer] scene ready, entering render loop", flush=True)
         timeline.play()
+        _frame = 0
         while simulation_app.is_running():
             world.step(render=True)
+            _frame += 1
+            if _frame % 300 == 0:
+                print(f"[viewer] frame {_frame}", flush=True)
 
         timeline.stop()
         simulation_app.close()

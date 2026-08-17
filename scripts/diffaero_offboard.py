@@ -42,52 +42,30 @@ import threading
 from pathlib import Path
 
 import numpy as np
-import torch
-from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
 
+# Run-from-checkout convenience: make `superfly` importable without an
+# installed package (method venvs should still `pip install -e . --no-deps`).
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-from wrapper.diffaero_core import DiffAeroPolicy, DiffAeroObs, DiffAeroCmd
-from wrapper.perception_builder import Intrinsics
+from pymavlink import mavutil
 
-DA_INTRINSICS = Intrinsics(
-    fx=0.5 * 64 / math.tan(0.5 * math.radians(86.0)),
-    fy=0.5 * 36 / math.tan(0.5 * math.radians(48.375)),
-    cx=32.0, cy=18.0,
-    H=36, W=64,
+from superfly.common.px4_offboard import (
+    HEARTBEAT_HZ, G,
+    DroneState, wait_for_heartbeat, set_offboard_mode, arm,
+    retry_offboard_arm, send_attitude_target, send_position_target_ned,
+    send_land_command, send_heartbeat, set_param_float, receive_loop,
 )
+from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
+from superfly.policies.diffaero import DiffAeroPolicy, DiffAeroObs, DA_INTRINSICS
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 CONTROL_HZ = 30.0          # DiffAero trained at dt=0.0333 s
-HEARTBEAT_HZ = 2.0
-G = 9.80665
-
-# Sentinel file this script touches on exit (any reason) so run_px4_sim.py
-# --auto-stop can detect "the offboard process ended" and exit its own loop
-# normally, instead of relying on a manual Ctrl-C.
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
-
-# Phase sentinel for compare/run_comparison.py: "start <ts>" is written the
-# moment control hands off to the POLICY phase and "end <ts>" is appended when
-# it hands off to LANDING, so the harness's --timeout can budget the policy
-# flight only (not arming/climb/landing). Harness deletes it before each trial.
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
-
-
-def _mark_policy_phase(event: str):
-    """Append '<event> <ts>' to POLICY_PHASE_FILE; never let it kill the loop."""
-    try:
-        with open(POLICY_PHASE_FILE, "a") as f:
-            f.write(f"{event} {time.time()}\n")
-    except Exception:
-        pass
-
-
-# PX4 custom mode for OFFBOARD
-PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
 
 # DiffAero perception (camera) shape: height x width.
 DEPTH_H, DEPTH_W = 9, 16
@@ -97,190 +75,6 @@ CAM_MAX_DIST = 5.0
 # DiffAero point-mass action limits (max_acc.xy / max_acc.z defaults).
 MAX_ACC_XY = 20.0
 MAX_ACC_Z = 40.0
-
-
-# ---------------------------------------------------------------------------
-# Frame conversion helpers (identical convention to diffdrone_offboard.py)
-# ---------------------------------------------------------------------------
-
-# ENU inertial -> NED inertial: same rotation Pegasus uses
-_rot_ENU_to_NED = Rotation.from_quat([0.70711, 0.70711, 0.0, 0.0])
-# FLU body -> FRD body: +PI around X
-_rot_FLU_to_FRD = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])
-
-
-def quat_ENU_FLU_to_NED_FRD(R_enu_flu: np.ndarray) -> np.ndarray:
-    """Return [w, x, y, z] quaternion in NED/FRD for a given ENU/FLU rotation matrix."""
-    rot = _rot_ENU_to_NED * Rotation.from_matrix(R_enu_flu) * _rot_FLU_to_FRD
-    q = rot.as_quat()  # [x, y, z, w] scipy convention
-    return np.array([q[3], q[0], q[1], q[2]])  # -> [w, x, y, z] MAVLink convention
-
-# ---------------------------------------------------------------------------
-# State container (updated by MAVLink receive thread)
-# ---------------------------------------------------------------------------
-
-class DroneState:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.position_enu = np.zeros(3)
-        self.velocity_enu = np.zeros(3)
-        self.R_enu = np.eye(3)
-        self.yaw = 0.0
-        self.armed = False
-        self.offboard = False
-        self.last_update = 0.0
-
-    def update_from_attitude(self, msg):
-        """Update from ATTITUDE_QUATERNION message (NED/FRD quaternion)."""
-        q_ned_frd = Rotation.from_quat([msg.q2, msg.q3, msg.q4, msg.q1])  # -> scipy [x,y,z,w]
-        rot_enu_flu = _rot_ENU_to_NED.inv() * q_ned_frd * _rot_FLU_to_FRD.inv()
-        with self._lock:
-            self.R_enu = rot_enu_flu.as_matrix()
-            fwd_enu = self.R_enu[:, 0]
-            self.yaw = math.atan2(fwd_enu[1], fwd_enu[0])
-        self.last_update = time.time()
-
-    def update_from_local_position(self, msg):
-        """Update from LOCAL_POSITION_NED message (NED -> ENU)."""
-        with self._lock:
-            self.position_enu = np.array([msg.y, msg.x, -msg.z])
-            self.velocity_enu = np.array([msg.vy, msg.vx, -msg.vz])
-
-    def update_from_heartbeat(self, msg):
-        with self._lock:
-            self.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-            custom_main = (msg.custom_mode >> 16) & 0xFF
-            self.offboard = (custom_main == PX4_CUSTOM_MAIN_MODE_OFFBOARD)
-
-    def get(self):
-        with self._lock:
-            return (
-                self.position_enu.copy(),
-                self.velocity_enu.copy(),
-                self.R_enu.copy(),
-                self.yaw,
-            )
-
-## MAVLINK helpers
-def wait_for_heartbeat(mav, timeout=120):
-    print("Waiting for heartbeat...")
-    mav.wait_heartbeat(timeout=timeout)
-    print(f"Heartbeat received from system {mav.target_system} component {mav.target_component}")
-
-
-def set_offboard_mode(mav):
-    mav.mav.command_long_send(
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        PX4_CUSTOM_MAIN_MODE_OFFBOARD, 0, 0, 0, 0, 0,
-    )
-
-
-def arm(mav):
-    mav.mav.command_long_send(
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
-        1, 0, 0, 0, 0, 0, 0,
-    )
-
-
-def retry_offboard_arm(mav, state, last_try_t, interval=2.0):
-    """Re-request OFFBOARD mode + arming until PX4 accepts both.
-
-    The one-shot mode/arm commands at startup are silently rejected if the EKF
-    hasn't converged yet (PX4 denies the command and only prints 'Ready for
-    takeoff!' seconds later) -- observed on big USD stages, where Isaac loads
-    long past the harness warmup and PX4's EKF settles well after the first
-    heartbeat, leaving the offboard streaming CLIMB setpoints disarmed forever.
-    Call every control tick during CLIMB: while not armed+offboard, the
-    commands are re-sent every `interval` seconds. Returns updated last_try_t."""
-    now = time.time()
-    if (state.armed and state.offboard) or now - last_try_t < interval:
-        return last_try_t
-    if not state.offboard:
-        set_offboard_mode(mav)
-    if not state.armed:
-        arm(mav)
-    print(f"[CLIMB] re-requesting OFFBOARD/arm "
-          f"(offboard={state.offboard} armed={state.armed}) ...")
-    return now
-
-
-def send_attitude_target(mav, q_wxyz: np.ndarray, thrust: float):
-    """Send SET_ATTITUDE_TARGET (msg id 82), ignoring body rates."""
-    mav.mav.set_attitude_target_send(
-        int(time.time() * 1000) & 0xFFFFFFFF,
-        mav.target_system, mav.target_component,
-        7,  # type_mask: ignore roll/pitch/yaw rate
-        [float(q_wxyz[0]), float(q_wxyz[1]), float(q_wxyz[2]), float(q_wxyz[3])],
-        0.0, 0.0, 0.0,
-        float(thrust),
-    )
-
-
-def send_position_target_ned(mav, x_n: float, y_e: float, z_d: float, yaw: float = 0.0):
-    """Send SET_POSITION_TARGET_LOCAL_NED (msg id 84), position + yaw only."""
-    IGNORE_VEL = 8 | 16 | 32
-    IGNORE_ACC = 64 | 128 | 256
-    IGNORE_YAW_RATE = 2048
-    type_mask = IGNORE_VEL | IGNORE_ACC | IGNORE_YAW_RATE
-    mav.mav.set_position_target_local_ned_send(
-        int(time.time() * 1000) & 0xFFFFFFFF,
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        type_mask,
-        float(x_n), float(y_e), float(z_d),
-        0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0,
-        float(yaw), 0.0,
-    )
-
-
-def send_land_command(mav):
-    """Command PX4 to land at current XY position via MAV_CMD_NAV_LAND."""
-    mav.mav.command_long_send(
-        mav.target_system, mav.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_LAND,
-        0,
-        0, 0, 0, float("nan"),  # abort_alt, precision_mode, empty, yaw (nan=keep)
-        0.0, 0.0, 0.0,           # lat, lon, alt (0 = current position)
-    )
-
-
-def send_heartbeat(mav):
-    mav.mav.heartbeat_send(
-        mavutil.mavlink.MAV_TYPE_GCS,
-        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-        0, 0, 0,
-    )
-
-
-def set_param_float(mav, param_id: str, value: float):
-    mav.mav.param_set_send(
-        mav.target_system, mav.target_component,
-        param_id.encode("utf-8"), value,
-        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
-    )
-    print(f"Set param {param_id} = {value}")
-
-
-# ---------------------------------------------------------------------------
-# MAVLink receive thread
-# ---------------------------------------------------------------------------
-
-def receive_loop(mav, state: DroneState, stop_event: threading.Event):
-    while not stop_event.is_set():
-        msg = mav.recv_match(blocking=True, timeout=0.1)
-        if msg is None:
-            continue
-        msg_type = msg.get_type()
-        if msg_type == "ATTITUDE_QUATERNION":
-            state.update_from_attitude(msg)
-        elif msg_type == "LOCAL_POSITION_NED":
-            state.update_from_local_position(msg)
-        elif msg_type == "HEARTBEAT" and msg.get_srcSystem() != 255:
-            state.update_from_heartbeat(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +116,7 @@ def main():
 
     depth_sub = None
     if args.depth:
-        from depth_transport import DepthSubscriber
+        from superfly.common.transport import DepthSubscriber
         depth_sub = DepthSubscriber()
         print("Depth subscriber listening for frames over UDP.")
 
@@ -445,7 +239,7 @@ def main():
                     yaw_err = math.atan2(math.sin(yaw_goal - yaw_cur_ned), math.cos(yaw_goal - yaw_cur_ned))
                     if abs(math.degrees(yaw_err)) < args.yaw_tol_deg and state.offboard:
                         phase = "POLICY"
-                        _mark_policy_phase("start")
+                        mark_policy_phase("start")
                         print(f"\n>>> HANDOFF to policy facing goal, "
                               f"yaw={math.degrees(yaw_cur_ned):.1f} deg <<<\n")
                     if verbose:
@@ -465,7 +259,7 @@ def main():
                     send_attitude_target(mav, cmd.attitude_ned_frd_wxyz, cmd.thrust_norm)
                     if np.linalg.norm(goal_enu - pos) < 0.5:
                         phase = "LANDING"
-                        _mark_policy_phase("end")
+                        mark_policy_phase("end")
                         print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
                     if verbose:
                         print(
@@ -504,14 +298,9 @@ def main():
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 0, 0, 0, 0, 0, 0, 0,
         )
-        # Tell run_px4_sim.py (if running with --auto-stop) that this offboard
-        # process is done -- however it ended (landed, Ctrl-C, crash) -- so it
-        # can exit through its normal loop instead of needing a manual Ctrl-C
-        # (which races Isaac's own SIGINT teardown; see run_px4_sim.py).
-        try:
-            Path(OFFBOARD_DONE_FILE).write_text(str(time.time()))
-        except Exception:
-            pass
+        # Tell run_px4_sim.py (--auto-stop) this offboard is done -- however
+        # it ended (landed, Ctrl-C, crash).
+        mark_offboard_done()
 
 
 if __name__ == "__main__":
