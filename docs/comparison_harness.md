@@ -1,35 +1,39 @@
 # Policy Comparison Harness
 
-Flies **DiffPhysDrone**, **DiffAero**, and **DepthNav** through the *same*
-Isaac-Sim + PX4-SITL scenarios and scores them on the same metrics, without
+Flies **DepthNav**, **DiffAero**, and **Agile Autonomy** (plus their
+velocity-command variants) through the *same* Isaac-Sim + PX4-SITL scenarios and scores them on the same metrics, without
 retraining or modifying any method. Each trial launches the shared simulator
-(`run_px4_sim.py --log-traj`) plus the method's own `*_offboard.py`, waits for
+(`scripts/run_px4_sim.py --log-traj`) plus the method's own
+`scripts/*_offboard.py`, waits for
 the flight to finish, and scores the logged ground-truth trajectory offline.
 
 ```
-compare/
-├── run_comparison.py      # the harness: trials, PX4 lifecycle, aggregation
+src/superfly/compare/
+├── runner.py              # the harness: trials, PX4 lifecycle, aggregation
+├── registry.py            # per-method launch config (interpreter, ckpt_kind)
 ├── metrics.py             # offline scoring of one logged flight (pure NumPy)
-├── extract_scene_mesh.py  # USD scene -> surface samples for clearance scoring
-├── mesh_cache/            # cached scene-mesh .npz files (per usd+scale)
-├── example_scenarios.json # scenario-file example
-└── results/<timestamp>/   # one folder per run (never overwritten)
+└── plot.py                # trajectory figures
+scripts/run_comparison.py  # launcher shim
+scripts/extract_scene_mesh.py  # USD scene -> surface samples for clearance
+configs/scenarios/{suites,probes}/   # scenario JSONs
+results/<timestamp>/       # one folder per run (never overwritten)
+results/mesh_cache/        # cached scene-mesh .npz files (per usd+scale)
 ```
 
 ## Quick start
 
 ```bash
 # Preview exactly what would run (no Isaac, no PX4 needed):
-python compare/run_comparison.py compare/example_scenarios.json --dry-run
+python scripts/run_comparison.py configs/scenarios/suites/example_scenarios.json --dry-run
 
-# Real headless run with per-trial videos + summary table:
-/home/ubuntu/isaacsim/kit/python/bin/python3 compare/run_comparison.py \
-    compare/my_scenarios.json --headless --record-video --report \
-    --sim-python /home/ubuntu/isaacsim/python.sh
+# Real headless run with per-trial videos + summary table (airstation03):
+<isaacsim>/kit/python/bin/python3 scripts/run_comparison.py \
+    configs/scenarios/suites/my_scenarios.json --headless --record-video --report \
+    --sim-python <isaacsim>/python.sh
 
 # Re-aggregate an existing run without flying anything:
-python compare/run_comparison.py --report-only \
-    --results-dir compare/results/20260703_134005
+python scripts/run_comparison.py --report-only \
+    --results-dir results/20260703_134005
 ```
 
 The harness itself needs NumPy (+ SciPy for scene-mesh clearance); running it
@@ -107,7 +111,7 @@ long parked prefix (Isaac warmup, arming) never pollutes time/speed numbers.
 
 | metric | meaning |
 |---|---|
-| `success` | reached the goal AND never collided. "Reached" = ground-truth position within `--goal-radius` (default 1 m) of the world goal, **or** the policy's own goal-reached handoff (`policy_reported_reached`, currently only diffaero reports one). |
+| `success` | reached the goal AND never collided. "Reached" = ground-truth position within `--goal-radius` (default 1 m) of the world goal, **or** the policy's own goal-reached handoff (`policy_reported_reached`; the thrust-variant depthnav never reports one — it has no landing phase). |
 | `collided` | clearance dropped below 0 at any scored tick |
 | `min_clearance_m` | min over the flight of (distance from drone centre to nearest obstacle surface) − `--drone-radius` (default 0.2 m) |
 | `time_to_goal_s` | takeoff → first sample inside the goal radius |
@@ -130,7 +134,7 @@ sources, recorded per trial as `clearance_source` in `metrics.json`:
   ground is not part of the field and is never counted.
 - **`scene_mesh`** — USD-environment scenarios. There is no analytic field,
   so after each trial the harness extracts the scene's geometry
-  (`extract_scene_mesh.py`, cached in `compare/mesh_cache/` keyed on
+  (`scripts/extract_scene_mesh.py`, cached in `results/mesh_cache/` keyed on
   usd + env_scale + flight corridor + extraction params) and scores clearance
   against a dense point-sampling of its surfaces. Details and caveats:
   - Extraction must run under **Isaac's python** (`--sim-python`): opening an
@@ -170,9 +174,9 @@ Rescore them in place (flights are not re-run; `traj.npz` is rescored and each
 `metrics.json` + `summary.csv` updated):
 
 ```bash
-python compare/run_comparison.py --report-only --rescore-clearance \
-    --results-dir compare/results/20260703_134005 \
-    --sim-python /home/ubuntu/isaacsim/python.sh
+python scripts/run_comparison.py --report-only --rescore-clearance \
+    --results-dir results/20260703_134005 \
+    --sim-python <isaacsim>/python.sh
 ```
 
 Note that `collided`/`success` may change: a trial that "succeeded" before
@@ -181,18 +185,16 @@ geometry.
 
 ## Interpreters & checkpoints
 
-Each method runs in its own venv; `run_px4_sim.py` needs Isaac's python. All
-are overridable:
+Each method runs in its own venv (`methods/<repo>/.venv`; agile via
+`scripts/agile_python.sh` -> the repo-root `.venv`); `run_px4_sim.py` needs
+Isaac's python. Defaults live in `superfly.compare.registry` (one data entry
+per method, `ckpt_kind` file/hydra_dir/tf_prefix) and every interpreter/
+checkpoint is overridable with `--<method>-python` / `--<method>-checkpoint`;
+`--sim-python` defaults to `$ISAACSIM_PYTHON`.
 
-| flag | default |
-|---|---|
-| `--sim-python` | `$ISAACSIM_PYTHON`, else `python` |
-| `--diffphys-python` / `--diffphys-checkpoint` | `DiffPhysDrone/.venv` / `checkpoints/DiffPhysDrone/checkpoint0004.pth` |
-| `--diffaero-python` / `--diffaero-checkpoint` | `diffaero/.venv` / `checkpoints/DiffAero/sha2c_pmc_lag_2026-06-22` (a *directory* containing `checkpoints/exported_actor.pt2`) |
-| `--depthnav-python` / `--depthnav-checkpoint` | `depthnav/.venv` / `checkpoints/DepthNav/level1_4_iteration_13500.pth` |
-
-Methods whose checkpoint is missing are skipped with a message. Select a
-subset with `--methods diffaero depthnav`.
+Methods whose checkpoint is missing are skipped with a message (see
+`checkpoints/README.md` for which artifacts exist today). Select a subset
+with `--methods diffaero depthnav`.
 
 ## Key options
 
