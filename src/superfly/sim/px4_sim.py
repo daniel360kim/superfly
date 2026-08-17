@@ -65,11 +65,12 @@ from isaacsim.core.api.objects import FixedCuboid, FixedSphere
 import isaacsim.core.utils.prims as prim_utils
 from scipy.spatial.transform import Rotation
 
-from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
+from pegasus.simulator.params import SIMULATION_ENVIRONMENTS
 from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
 from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
+from superfly.sim.vehicles import vehicle_usd_and_curve
 
 import sys
 import os
@@ -311,7 +312,8 @@ class PegasusApp:
                  record_rgb_video: str = None,
                  record_video_fps: float = 15.0, record_video_scale: int = 4,
                  agile_overhead_debug_path: str = None,
-                 agile_depth_flip: str = "none"):
+                 agile_depth_flip: str = "none",
+                 vehicle: str = "iris"):
         self.SPAWN_YAW_DEG = spawn_yaw_deg
         self.auto_stop = auto_stop
         self.debug_frames = debug_frames
@@ -435,6 +437,13 @@ class PegasusApp:
         })
         config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
+        # Which airframe this drone actually is (mass/inertia/CoM come from
+        # the vehicle USD; rotor constants + motor lag from the thrust curve).
+        # "iris" keeps the historical stock vehicle byte-identically.
+        vehicle_usd, thrust_curve, vehicle_label = vehicle_usd_and_curve(vehicle)
+        config_multirotor.thrust_curve = thrust_curve
+        print(f"[vehicle] {vehicle_label}")
+
         self._setup_camera()
         config_multirotor.graphical_sensors = [self._camera]
 
@@ -470,7 +479,7 @@ class PegasusApp:
         # +X, down the corridor). Flip sign if the log still shows yaw≈±90.
         self.drone = Multirotor(
             "/World/quadrotor",
-            ROBOTS['Iris'],
+            vehicle_usd,
             0,
             spawn_pos,
             Rotation.from_euler("XYZ", [0.0, 0.0, self.SPAWN_YAW_DEG], degrees=True).as_quat(),
@@ -1354,6 +1363,11 @@ def main():
                         help="Agile policy only: write the overhead trajectory/depth debug "
                              "PNG to PATH each sim frame. Can be used with --no-debug-frames "
                              "to avoid the heavier camera_debug/depth_debug outputs.")
+    parser.add_argument("--vehicle", choices=["iris", "starling2max"], default="iris",
+                        help="Airframe to fly: iris (Pegasus stock, historical default) or "
+                             "starling2max (AirLab sys-ID: lab USD mass/inertia, measured "
+                             "rotor constants, 55/85 ms first-order motor lag; USD source "
+                             "overridable via $SUPERFLY_VEHICLE_USD).")
     parser.add_argument("--agile-depth-flip", choices=["none", "both", "v", "h"],
                         default="none",
                         help="Agile policy only: flip the depth image before publishing. "
@@ -1415,6 +1429,7 @@ def main():
             else (None if args.no_debug_frames else "agile_overhead_debug.png")
         ),
         agile_depth_flip=args.agile_depth_flip,
+        vehicle=args.vehicle,
     )
     pg_app.run()
 

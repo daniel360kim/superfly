@@ -540,6 +540,7 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
     sim_python = args.sim_python or "python"
     sim_cmd = [sim_python, "run_px4_sim.py",
                "--policy", cfg["policy"],
+               "--vehicle", args.vehicle,
                "--obstacles", scenario["obstacles"],
                "--seed", str(scenario["seed"]),
                "--scale", str(scenario["scale"]),
@@ -721,6 +722,7 @@ def run_trial(method, cfg, args, scenario):
     # per-trial result file is self-describing without cross-referencing
     # run_manifest.json.
     res["hyperparams"] = dict(
+        vehicle=args.vehicle,
         max_speed=args.max_speed, drone_radius=args.drone_radius, goal_radius=args.goal_radius,
         climb_alt=(scenario["climb_alt"] if scenario["climb_alt"] is not None
                    else args.climb_alt),
@@ -907,6 +909,9 @@ def main():
                     help="Collision radius [m] for clearance scoring.")
     ap.add_argument("--goal-radius", type=float, default=1.0,
                     help="Distance [m] to goal that counts as reached.")
+    ap.add_argument("--vehicle", choices=["iris", "starling2max"], default="iris",
+                    help="Airframe for every trial (superfly.sim.vehicles): iris "
+                         "(historical stock default) or starling2max (sys-ID-matched).")
     ap.add_argument("--connect", default="udp:localhost:14550")
     ap.add_argument("--headless", action="store_true",
                     help="Run Isaac Sim without the GUI viewport (faster; recommended "
