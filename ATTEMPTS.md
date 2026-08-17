@@ -106,3 +106,33 @@ trial whose stage still composes empty.
 `sample_subtree` of PointInstancer foliage group-OOM-kills the 32Gi container
 (jobs 32/33) and has never produced usable samples anywhere; scoring always
 fell back to the analytic field. `GSDS_SKIP_OBST_SAMPLING=1` on OSMO, always.
+
+## 2026-08-17 — Starling 2 Max spec-matched training (diffaero first) — PENDING
+
+Source of truth: `configs/vehicles/starling2max.yaml` (from the AirLab
+sys-ID doc, Slite dj1982T35dt0qG). Key mappings, all derived there:
+- **Motor lag**: pmc's `lmbda` IS a first-order lag rate
+  (`a_dot = (1-exp(-lmbda*dt))/dt * (a_cmd - a)`, dynamics/pointmass.py), so
+  lmbda = 1/tau. Sys-ID tau 72 ms -> lmbda 13.9, randomized [11.8, 18.2]
+  (tau 85..55 ms, the measured down/up asymmetry). **The pmc default
+  lmbda=2.6 corresponds to tau ~385 ms — the baseline plant was ~5x more
+  sluggish than the real motors.**
+- **Accel box**: T/W ASSUMED = 2.0 (sys-ID has no max thrust; assumption
+  matches the harness's MAX_ACCEL=20 deploy convention within 2%). z-max
+  = 2g = 19.6, xy-max = g*sqrt(3) = 17.0 (horizontal component at full
+  thrust with 1 g held). Retighten when a measured max thrust lands.
+- **Deploy bounds**: the exported actor rescales by min/max_action passed at
+  call time; DiffAeroPolicy now reads them from the ckpt run dir's hydra
+  config (legacy ckpts: reads their own 20/40, byte-identical regression).
+- **Eval vehicle**: `--vehicle starling2max` (sim + harness) flies the lab
+  starling2max.usd with measured rotor constants and a NEW
+  FirstOrderQuadraticThrustCurve (55/85 ms asymmetric rotor lag; Pegasus
+  stock curve is instantaneous). Not yet flown — validate rotor order/spin
+  dirs + PX4 gains on airstation03 before any campaign.
+- Not spec-mapped (no sys-ID data): drag (kept pmc defaults), camera (kept
+  the method's own training sensor).
+
+Training run: OSMO `superfly-train-diffaero-3`, tag sha2c_pmc_starling2max_v1
+(=-2 failed instantly: pytorch3d has no PyPI distribution; fixed to the
+GitHub stable tag). depthnav/agile spec-matching deferred by scope decision
+(diffaero first).
