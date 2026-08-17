@@ -106,6 +106,25 @@ def method_registry():
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
+        # Planar velocity-command DiffAero for the Starling 2 Max low-speed
+        # deployment: the actor outputs horizontal [vx, vy] only (dynamics
+        # pmv_planar, trained for 0.8-1.5 m/s cruise -- run comparisons with
+        # --max-speed in that band); the offboard's altitude PID holds
+        # climb_alt. Checkpoint produced by scripts/train_diffaero.py
+        # --config "env=oa algo=sha2c dynamics=pmv_planar sensor=camera
+        # network=mlp env.max_target_vel=1.5 env.min_target_vel=0.8
+        # env.max_time=60" (the pre-reorg planar runs are unrecoverable,
+        # see ATTEMPTS.md 2026-08-17).
+        "diffaero_vel_planar": dict(
+            policy="diffaero",
+            offboard="diffaero_vel_offboard.py",
+            control_hz=30.0,
+            goal_argc=2,
+            python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "pmv_planar_starling_v1",
+            ckpt_kind="hydra_dir",
+            speed_args=lambda a: ["--max-vel", str(a.max_speed)],
+        ),
         "agile": dict(
             policy="agile",
             offboard="agile_offboard.py",
