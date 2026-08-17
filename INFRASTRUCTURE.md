@@ -45,19 +45,20 @@ it; repos live flat in `~` (`~/superfly`, `~/superfly-depthnav_vel`, ...).
 - Credentials: `SUPERFLY_S3_KEY_ID`/`SUPERFLY_S3_KEY` env, falling back to
   the `GSDS_*` pair in `~/.s3env` — the same Keystone EC2 credential covers
   every bucket in the account.
-- **One-time setup still pending (needs the user's creds):**
-  1. `source ~/.s3env && python -m superfly.remote_store create-bucket`
-  2. register the credential with OSMO for `s3://superfly` (until then
-     `osmo workflow validate` on the superfly YAMLs fails with "Could not
-     find s3://superfly credential"; the YAMLs are otherwise valid —
-     verified 2026-08-17 with a registered bucket substituted).
-  3. optionally append `SUPERFLY_S3_*` names to `~/.s3env`.
+- One-time setup **done 2026-08-17** on gs2: bucket created
+  (`python -m superfly.remote_store create-bucket`), OSMO DATA credential
+  `superfly` registered for `s3://superfly`
+  (`osmo credential set superfly --type DATA --payload access_key_id=...
+  access_key=... endpoint=s3://superfly override_url=... region=us-east-1`
+  — note the server rejects an `addressing_style` payload key), and
+  `SUPERFLY_S3_*` aliases appended to `~/.s3env`. Both superfly workflow
+  YAMLs pass `osmo workflow validate --pool default`.
 
 ## Checkpoints
 
 Committed in git, `checkpoints/<Method>/<run>/` + `run_meta.json` — layout,
-per-method artifact kinds, and the two known gaps (depthnav_vel's
-never-produced `.pth`, sha2c_vel_cmd_oa's missing export):
+per-method artifact kinds, and the one known gap (depthnav_vel's
+never-produced `.pth`):
 [`checkpoints/README.md`](checkpoints/README.md). The repo carries ~68 MB of
 weights; each new run adds permanently — prune superseded runs, never
 rewrite history.

@@ -37,11 +37,10 @@ dependency order:
    (`daniel360kim/{depthnav,diffaero,agile_autonomy}`, the last WITH
    `planner_learning/`) — see `methods/README.md` for the per-fork notes.
    Method venvs still need building per machine (`methods/<name>/.venv`).
-2. **S3 (BLOCKED on user, one-time)**: create the `superfly` bucket
-   (`source ~/.s3env && PYTHONPATH=<repo>/src <python-with-boto3> -m
-   superfly.remote_store create-bucket`), register the credential with OSMO
-   for `s3://superfly`, and optionally add `SUPERFLY_S3_*` names to
-   `~/.s3env`.
+2. ~~S3~~ **DONE 2026-08-17**: `s3://superfly` bucket created, OSMO DATA
+   credential `superfly` registered (`osmo credential list` shows it), both
+   superfly workflow YAMLs pass `osmo workflow validate`, `SUPERFLY_S3_*`
+   aliases added to `~/.s3env`.
 3. **Training pipelines (Phase 3)**: `scripts/train_diffaero.py` is written
    and its train/export interface verified against the submodule source
    (still needs one GPU run). `train_depthnav.py` (entry:
