@@ -34,6 +34,11 @@ it; repos live flat in `~` (`~/superfly`, `~/superfly-depthnav_vel`, ...).
 - Every venv: `pip install -e <repo> --no-deps` so `superfly.*` imports
   without PYTHONPATH/cwd tricks (the `scripts/` entrypoints also fall back
   to inserting `../src` themselves).
+- gs2's venvs (built 2026-08-17) are **deploy-grade, CPU wheels**
+  (`--index-url .../whl/cpu`; tensorflow-cpu + casadi for agile, no acados
+  on gs2 so the MPC solver can't build here): enough to load every
+  committed checkpoint and dry-run the harness. GPU boxes install CUDA
+  wheels + each method repo's own requirements for training.
 
 ## Storage / S3
 

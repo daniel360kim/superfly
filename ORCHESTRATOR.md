@@ -36,7 +36,10 @@ dependency order:
 1. ~~Method forks~~ **DONE 2026-08-17**: submodules live under `methods/`
    (`daniel360kim/{depthnav,diffaero,agile_autonomy}`, the last WITH
    `planner_learning/`) — see `methods/README.md` for the per-fork notes.
-   Method venvs still need building per machine (`methods/<name>/.venv`).
+   gs2 has deploy-grade CPU venvs built (2026-08-17; all three policy cores
+   load their committed checkpoints — a real forward/restore pass each).
+   airstation03 still needs its own venvs (CUDA wheels there, plus acados
+   for the agile MPC solver, which gs2 cannot build).
 2. ~~S3~~ **DONE 2026-08-17**: `s3://superfly` bucket created, OSMO DATA
    credential `superfly` registered (`osmo credential list` shows it), both
    superfly workflow YAMLs pass `osmo workflow validate`, `SUPERFLY_S3_*`
