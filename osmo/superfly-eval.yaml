@@ -283,6 +283,7 @@ workflow:
           --depthnav_vel-python /opt/policy/bin/python \
           --diffaero-python /opt/policy/bin/python \
           --diffaero_vel-python /opt/policy/bin/python \
+          --diffaero_vel_planar-python /opt/policy/bin/python \
           --sim-python $SIM_PY \
           --px4-dir $STAGE/px4 \
           --results-dir $RESULTS \
