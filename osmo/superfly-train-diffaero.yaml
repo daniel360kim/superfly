@@ -1,0 +1,74 @@
+# Train a DiffAero policy on OSMO and mirror the run dir (with its exported
+# deployable actor) to s3://superfly/runs/<tag>/.
+#
+# Unlike the eval job (osmo/superfly-eval.yaml), a TRAINING image likely
+# needs the per-project offline deps cache (deps/deps_cache_v1.tar,
+# INFRASTRUCTURE_OSMO.md): the eval job's apt set installs in ~25 s, but a
+# trainer that apt-installs anything heavier eats the measured 58-minute
+# apt tax. Build the cache with a one-time CPU job before relying on this
+# at scale; until then this job installs online and eats the tax if the apt
+# mirror is slow that day.
+#
+# PENDING (Phase 1): methods/diffaero must exist in the staged tarball --
+# stage_superfly_osmo.sh ships the repo INCLUDING submodule working trees
+# once they are cloned. Until then this workflow aborts at the preflight.
+#
+# Usage:
+#   scripts/stage_superfly_osmo.sh 0817
+#   osmo workflow submit osmo/superfly-train-diffaero.yaml --pool default \
+#     --set-env SUPERFLY_S3_KEY_ID=$S3ID SUPERFLY_S3_KEY=$S3KEY \
+#     --set-string data_tar=superfly_stage_0817.tar tag=sha2c_pmc_v2 \
+#       overrides="env=oa algo=sha2c dynamics=pmc sensor=camera"
+version: 2
+default-values:
+  data_tar: superfly_stage.tar
+  overrides: "env=oa algo=sha2c dynamics=pmc sensor=camera"
+  tag: diffaero_run
+workflow:
+  name: superfly-train-diffaero
+  groups:
+  - name: train-group
+    tasks:
+    - name: train
+      lead: true
+      image: pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel
+      resource: gpu_resource
+      inputs:
+      - url: s3://superfly/tmp_data/
+        regex: '{{ data_tar }}$'
+      command:
+      - bash
+      - -c
+      - |
+        set -ex
+        cd /osmo/run/workspace
+        tar -xf {{input:0}}/{{ data_tar }}
+        STAGE=/osmo/run/workspace/superfly_stage
+        REPO=$STAGE/superfly
+
+        # ---- preflight: the submodule must actually be in the tarball ----
+        [ -f $REPO/methods/diffaero/script/train.py ] || {
+          echo "DIFFAERO_SUBMODULE_MISSING_ABORT (Phase 1 not staged)"; exit 1; }
+
+        # Blackwell (sm_120) needs cu128 wheels; the base image torch is fine
+        # (cu130), diffaero's own requirements ride on top.
+        pip install --no-cache-dir -q -r $REPO/methods/diffaero/requirements.txt \
+          || echo "WARN: no requirements.txt; relying on the base image"
+        pip install --no-cache-dir -q --no-deps -e $REPO
+
+        OUT=$REPO/checkpoints/DiffAero/{{ tag }}
+        python $REPO/scripts/train_diffaero.py --out $OUT \
+          --python $(which python) --config {{ overrides }}
+
+        # ---- mirror the run dir out (container scratch vanishes on exit) ----
+        cd $REPO/checkpoints/DiffAero
+        tar -czf /tmp/{{ tag }}.tar.gz {{ tag }}
+        PYTHONPATH=$REPO/src python -m superfly.remote_store upload \
+          /tmp/{{ tag }}.tar.gz "runs/{{ tag }}/{{ tag }}.tar.gz"
+        echo "TRAIN_DONE"
+  resources:
+    gpu_resource:
+      cpu: 8
+      gpu: 1
+      memory: 32Gi
+      storage: 100Gi

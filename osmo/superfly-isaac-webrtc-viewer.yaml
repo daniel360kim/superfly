@@ -3,10 +3,10 @@
 # a single bare "Iris" quadrotor (no PX4, no policy) sitting in Isaac's
 # "Curved Gridroom" environment -- this is purely to validate the streaming
 # pipeline, not to fly anything. For the real PX4 SITL + policy comparison
-# harness see osmo/superfly.yaml instead.
+# harness see osmo/superfly-eval.yaml instead.
 #
 # Isaac Sim 5.1.0 (matches the pinned version already proven working in
-# osmo/superfly.yaml) + PegasusSimulator's matching v5.1.0 tag, installed
+# osmo/superfly-eval.yaml) + PegasusSimulator's matching v5.1.0 tag, installed
 # fresh in-container -- no S3 staging tarball needed for this bare scene.
 #
 # --- Client ---
@@ -40,8 +40,8 @@
 #   brew install socat
 #
 # --- Usage ---
-#   osmo workflow submit osmo/isaac_webrtc_viewer.yaml --pool default
-#   # note the workflow ID it prints, e.g. aa-isaac-webrtc-viewer-1
+#   osmo workflow submit osmo/superfly-isaac-webrtc-viewer.yaml --pool default
+#   # note the workflow ID it prints, e.g. superfly-isaac-webrtc-viewer-1
 #   osmo workflow port-forward <workflow_id> viewer --port 49100 &
 #   osmo workflow port-forward <workflow_id> viewer --port 58998 &
 #   socat UDP-LISTEN:47998,fork TCP:127.0.0.1:58998 &
@@ -56,7 +56,7 @@
 # is the correct extension name on this build and starts cleanly.
 version: 2
 workflow:
-  name: aa-isaac-webrtc-viewer
+  name: superfly-isaac-webrtc-viewer
   groups:
   - name: viewer-group
     tasks:
@@ -263,7 +263,7 @@ workflow:
     gpu_resource:
       # cpu/mem per INFRASTRUCTURE_OSMO.md's right-sizing rule. storage
       # generous because Isaac's extscache + shader cache land on container
-      # scratch (matches osmo/superfly.yaml's sizing).
+      # scratch (matches osmo/superfly-eval.yaml's sizing).
       cpu: 8
       gpu: 1
       memory: 32Gi

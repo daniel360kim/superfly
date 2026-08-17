@@ -1,4 +1,7 @@
 # Run the superfly comparison harness (Isaac Sim + PX4 SITL) on OSMO.
+# Successor to the pre-reorg osmo/superfly.yaml (workflow `gsds-superfly`):
+# same measured workarounds, gsds methods removed, superfly-* workflow name
+# (daily_log buckets OSMO activity by substring match on the name).
 #
 # Feasibility was established by probes gsds-isaacprobe-1 / isaacboot3-1 /
 # vkprobe-1 / renderprobe-1 (2026-07-29). Key measured facts those produced,
@@ -12,8 +15,9 @@
 #     Isaac's RTX renderer works. Do not be misled by that env var.
 #   * libGL.so.1 is NOT in the pytorch image; without it Kit loads but
 #     rtx.neuraylib fails and every frame comes back empty. apt is fast here
-#     (~25 s), so no offline .deb cache is needed -- unlike the 58 min
-#     apt tax documented in docs/OSMO_DEPS_CACHE.md for other images.
+#     (~25 s), so no offline .deb cache is needed for THIS eval image -- unlike
+#     the 58 min apt tax documented in INFRASTRUCTURE_OSMO.md for other images
+#     (a training image likely does need the deps cache).
 #   * `pip install isaacsim[all,extscache]` takes ~3m20s. It also DOWNGRADES
 #     torch to 2.7.0/cu126, which has no sm_120 kernels -- hence the separate
 #     /opt/policy venv on cu128 for the policies. Isaac keeps its own torch;
@@ -21,31 +25,35 @@
 #   * First render costs ~2 min of shader compilation. Submit WHOLE CAMPAIGNS
 #     per job, never one trial per job.
 #
+# Method coverage on OSMO, honestly stated:
+#   * diffaero -- READY: its exported_actor.pt2 is self-contained TorchScript,
+#     /opt/policy (torch cu128) is all it needs.
+#   * depthnav -- needs methods/depthnav staged (git submodule, Phase 1) so
+#     DEPTHNAV_ROOT resolves; /opt/policy covers its torch/gymnasium/yaml deps.
+#   * agile    -- NOT wired here yet: needs TF-cpu + casadi + an acados build
+#     in-container (the staged acados/lib is compiled for the workstation);
+#     never proven on OSMO. Run agile trials on airstation03 instead.
+#
 # Usage:
-#   scripts/stage_superfly_osmo.sh 0730
-#   osmo workflow submit osmo/superfly.yaml --pool default \
-#     --set-env GSDS_S3_KEY_ID=$S3ID GSDS_S3_KEY=$S3KEY \
-#     --set-string data_tar=superfly_stage_0730.tar tag=w8thin \
-#       scenarios=gsds_field_matrix.json methods=gsds \
-#       ckpt=il_w8_rgb_thin.pt extra_args="--max-speed 3.0"
+#   scripts/stage_superfly_osmo.sh 0817
+#   osmo workflow submit osmo/superfly-eval.yaml --pool default \
+#     --set-env SUPERFLY_S3_KEY_ID=$S3ID SUPERFLY_S3_KEY=$S3KEY \
+#     --set-string data_tar=superfly_stage_0817.tar tag=eval1 \
+#       scenarios=suites/poster_suite_v1.json methods="depthnav diffaero" \
+#       extra_args="--max-speed 3.0"
 version: 2
 default-values:
   data_tar: superfly_stage.tar
-  scenarios: gsds_field_matrix.json
-  methods: gsds
-  ckpt: il_w8_rgb_thin.pt
-  ckpt_depth: il_w8_depth_thin.pt
+  scenarios: suites/poster_suite_v1.json
+  methods: depthnav diffaero
   extra_args: "--max-speed 3.0"
   tag: run
   # eval-albedo A/B surface: "fixed" (default, byte-identical benchmark) or
   # "random" (per-seed deterministic per-obstacle colors). Exported inside
   # fly.sh because su/setpriv does not reliably pass --set-env through.
   albedo: fixed
-  # X15 deploy-side TTA: 0/unset = off (byte-identical); N>1 = average the
-  # policy over N jitter samples per tick (RGB-only-pure; see gsds_core.py).
-  tta: "0"
 workflow:
-  name: gsds-superfly
+  name: superfly-eval
   groups:
   - name: superfly-group
     tasks:
@@ -54,7 +62,7 @@ workflow:
       image: pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel
       resource: gpu_resource
       inputs:
-      - url: s3://gs-drone-sim/tmp_data/
+      - url: s3://superfly/tmp_data/
         regex: '{{ data_tar }}$'
       command:
       - bash
@@ -76,7 +84,7 @@ workflow:
         cd /osmo/run/workspace
         tar -xf {{input:0}}/{{ data_tar }}
         STAGE=/osmo/run/workspace/superfly_stage
-        export GSDS_REPO=$STAGE/gs_drone_sim
+        REPO=$STAGE/superfly
         export PYTHONPATH=$STAGE/PegasusSimulator/extensions/pegasus.simulator
 
         # PX4 expects to exec from its build tree; restore the bit rsync can't carry.
@@ -86,19 +94,19 @@ workflow:
         pip install --no-cache-dir "isaacsim[all,extscache]==5.1.0" \
           --extra-index-url https://pypi.nvidia.com > /dev/null
         # run_px4_sim.py imports pegasus ... px4_mavlink_backend under THIS
-        # interpreter, so pymavlink must exist here too, not just in /opt/policy.
-        pip install --no-cache-dir pymavlink > /dev/null
+        # interpreter, so pymavlink (+ scipy for superfly.common) must exist
+        # here too, not just in /opt/policy.
+        pip install --no-cache-dir pymavlink scipy > /dev/null
         SIM_PY=$(which python)
 
-        # run_px4_sim.py line 54 does `import carb` BEFORE line 55's
-        # `from isaacsim import SimulationApp`. carb lives in Isaac's kit kernel,
-        # which only lands on sys.path via the isaacsim package init -- locally
-        # that happens because the harness is launched through
-        # isaacsim/python.sh, but here --sim-python is /opt/conda/bin/python.
-        # A sitecustomize (auto-imported at interpreter startup) reproduces
-        # python.sh's path setup without editing the harness. It only adjusts
-        # sys.path; it does NOT boot Kit, so non-Isaac uses of this interpreter
-        # are unaffected.
+        # superfly.sim.px4_sim does `import carb` BEFORE `from isaacsim import
+        # SimulationApp`. carb lives in Isaac's kit kernel, which only lands on
+        # sys.path via the isaacsim package init -- locally that happens because
+        # the harness is launched through isaacsim/python.sh, but here
+        # --sim-python is /opt/conda/bin/python. A sitecustomize (auto-imported
+        # at interpreter startup) reproduces python.sh's path setup without
+        # editing the harness. It only adjusts sys.path; it does NOT boot Kit,
+        # so non-Isaac uses of this interpreter are unaffected.
         SITE=$(python -c "import site; print(site.getsitepackages()[0])")
         cat > $SITE/sitecustomize.py <<'PYEOF'
         try:
@@ -164,7 +172,7 @@ workflow:
                             s.set(f"/rtx/dataWindowNDC/{i}", v)
 
                     # Capture-on-play so world.step(render=True) after
-                    # timeline.play() (run_px4_sim.py:1464/1474) yields frames.
+                    # timeline.play() yields frames.
                     # Async rendering is left at its default ON -- see the
                     # _KIT_ARGS note above: disabling it costs ~2.6x throughput,
                     # which changes the flight itself in a non-lockstep sim.
@@ -174,14 +182,14 @@ workflow:
                     # Print what actually took effect -- these settings are the
                     # difference between real frames and silently-empty ones,
                     # so make it visible in the job log rather than inferred.
-                    print("[gsds-osmo] dataWindowNDC="
+                    print("[superfly-osmo] dataWindowNDC="
                           + str([s.get(f"/rtx/dataWindowNDC/{i}") for i in range(4)])
                           + " captureOnPlay="
                           + str(s.get("/omni/replicator/captureOnPlay"))
                           + " asyncRendering="
                           + str(s.get("/app/asyncRendering")), flush=True)
                 except Exception as _e:
-                    print("[gsds-osmo] settings patch FAILED:", repr(_e), flush=True)
+                    print("[superfly-osmo] settings patch FAILED:", repr(_e), flush=True)
 
             isaacsim.SimulationApp.__init__ = _init_with_datawindow
         PYEOF
@@ -191,15 +199,12 @@ workflow:
         # (no --system-site-packages: that is the default and the flag takes no value)
         python -m venv /opt/policy
         /opt/policy/bin/pip install --no-cache-dir -q --upgrade pip
-        # torchvision is REQUIRED: gs_drone_sim/policy/model.py imports
-        # mobilenet_v2 from it. Without it gsds_offboard.py dies at import, the
-        # drone never moves, and run_comparison.py STILL exits 0 with a summary
-        # reading "success 0.00" -- a dead policy looks exactly like a bad one
-        # (gsds-superfly-9). Kept on the same cu128 index as torch.
         /opt/policy/bin/pip install --no-cache-dir -q \
-          torch torchvision --index-url https://download.pytorch.org/whl/cu128
+          torch --index-url https://download.pytorch.org/whl/cu128
         /opt/policy/bin/pip install --no-cache-dir -q \
-          numpy scipy pymavlink opencv-python-headless "imageio[ffmpeg]"
+          numpy scipy pymavlink pyyaml gymnasium opencv-python-headless
+        # the superfly package itself (common layer + policy cores), no deps.
+        /opt/policy/bin/pip install --no-cache-dir -q --no-deps -e $REPO
         /opt/policy/bin/python -c "
         import torch
         print('policy torch', torch.__version__, 'cuda', torch.cuda.is_available())
@@ -231,48 +236,53 @@ workflow:
         # i.e. the renderer could not initialise its caches. Metadata-only op.
         chown -R flyer:flyer $SITE/isaacsim
 
-        # ---- pre-flight: the offboard must import, or the "results" are fiction ----
+        # ---- pre-flight: each method's policy core must import, or the
+        # "results" are fiction ----
         # run_comparison.py treats an offboard that dies at import as a completed
-        # trial (rc=0, success 0.00, speed 0.00). Fail loudly HERE instead of
-        # burning a campaign and reporting zeros as if they were flight outcomes.
-        cd $STAGE/starling-deployment
-        GSDS_REPO=$GSDS_REPO /opt/policy/bin/python -c "
-        import sys
-        sys.path.insert(0, '$STAGE/starling-deployment')
-        from wrapper.gsds_core import GsdsPolicy, GsdsObs  # noqa: F401
-        print('[gsds-osmo] offboard policy imports OK')
-        " || { echo "OFFBOARD_IMPORT_FAILED_ABORT"; exit 1; }
+        # trial (rc=0, success 0.00, speed 0.00) -- a dead policy looks exactly
+        # like a bad one (gsds-superfly-9). Fail loudly HERE instead of burning
+        # a campaign and reporting zeros as if they were flight outcomes.
+        for M in {{ methods }}; do
+          case $M in
+            diffaero*) IMP="superfly.policies.diffaero" ;;
+            depthnav*) IMP="superfly.policies.depthnav" ;;
+            agile)     echo "AGILE_NOT_WIRED_ON_OSMO_ABORT"; exit 1 ;;
+          esac
+          DEPTHNAV_ROOT=$REPO/methods/depthnav /opt/policy/bin/python -c "
+        import importlib; importlib.import_module('$IMP')
+        print('[superfly-osmo] $M policy imports OK')
+        " || { echo "OFFBOARD_IMPORT_FAILED_ABORT ($M)"; exit 1; }
+        done
 
         # ---- fly ----
-        RESULTS=$STAGE/starling-deployment/compare/results/{{ tag }}
+        RESULTS=$REPO/results/{{ tag }}
         cat > /tmp/fly.sh <<FLYEOF
         set -x
         export HOME=/home/flyer
         export OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y
-        export GSDS_REPO=$GSDS_REPO
         export PYTHONPATH=$PYTHONPATH
+        export DEPTHNAV_ROOT=$REPO/methods/depthnav
         export GSDS_OBSTACLE_ALBEDO={{ albedo }}
-        export GSDS_TTA_N={{ tta }}
         # asset surface sampling group-OOM-kills the 32Gi container (jobs
         # 32/33) and has never produced usable samples anywhere; scoring
         # falls back to the analytic field either way. Always skip on OSMO.
         export GSDS_SKIP_OBST_SAMPLING=1
-        # F2 (usd_osmo_diagnosis.md): omniverse:// Nucleus URLs cannot
-        # authenticate in the container, so the tarball ships the stages
-        # (usd_stages/) and run_comparison.py retargets the scenario JSONs'
-        # omniverse://.../Library/Stages/<X> refs to \$GSDS_USD_STAGE_ROOT/<X>
-        # at the point of use (JSONs + mesh-cache keys unchanged). The
-        # require-stage guard aborts a trial instead of silently flying an
-        # empty void if a stage still fails to compose (jobs 32/33).
+        # omniverse:// Nucleus URLs cannot authenticate in the container, so
+        # the tarball ships the stages (usd_stages/) and run_comparison.py
+        # retargets the scenario JSONs' omniverse://.../Library/Stages/<X>
+        # refs to \$GSDS_USD_STAGE_ROOT/<X> at the point of use (JSONs +
+        # mesh-cache keys unchanged). The require-stage guard aborts a trial
+        # instead of silently flying an empty void if a stage fails to
+        # compose (jobs 32/33).
         export GSDS_USD_STAGE_ROOT=$STAGE/usd_stages
         export GSDS_REQUIRE_STAGE=1
-        cd $STAGE/starling-deployment
-        $SIM_PY -u compare/run_comparison.py compare/{{ scenarios }} \
+        cd $REPO
+        $SIM_PY -u scripts/run_comparison.py configs/scenarios/{{ scenarios }} \
           --methods {{ methods }} \
-          --gsds-checkpoint $STAGE/checkpoints/GSDroneSim/{{ ckpt }} \
-          --gsds-python /opt/policy/bin/python \
-          --gsds_depth-checkpoint $STAGE/checkpoints/GSDroneSim/{{ ckpt_depth }} \
-          --gsds_depth-python /opt/policy/bin/python \
+          --depthnav-python /opt/policy/bin/python \
+          --depthnav_vel-python /opt/policy/bin/python \
+          --diffaero-python /opt/policy/bin/python \
+          --diffaero_vel-python /opt/policy/bin/python \
           --sim-python $SIM_PY \
           --px4-dir $STAGE/px4 \
           --results-dir $RESULTS \
@@ -292,20 +302,20 @@ workflow:
         echo "run_comparison rc=$FLY_RC"
 
         # ---- ship results out (container scratch vanishes on exit) ----
-        cd $STAGE/starling-deployment/compare/results
+        cd $REPO/results
         tar -czf /tmp/superfly_results_{{ tag }}.tar.gz {{ tag }} || true
-        export PYTHONPATH=$GSDS_REPO/src:$PYTHONPATH
-        python -m gs_drone_sim.remote_store upload \
+        PYTHONPATH=$REPO/src python -m superfly.remote_store upload \
           /tmp/superfly_results_{{ tag }}.tar.gz \
-          "superfly/{{ tag }}/superfly_results_{{ tag }}.tar.gz" || echo "UPLOAD_FAILED"
+          "runs/{{ tag }}/superfly_results_{{ tag }}.tar.gz" || echo "UPLOAD_FAILED"
 
         echo "SUPERFLY_DONE rc=$FLY_RC"
         exit $FLY_RC
   resources:
     gpu_resource:
-      # cpu/mem per INFRASTRUCTURE.md's right-sizing rule. storage is generous
-      # because Isaac's extscache + shader cache land on container scratch;
-      # the node has ~3.7 TB free, so this is not the packing constraint.
+      # cpu/mem per INFRASTRUCTURE_OSMO.md's right-sizing rule. storage is
+      # generous because Isaac's extscache + shader cache land on container
+      # scratch; the node has ~3.7 TB free, so this is not the packing
+      # constraint.
       cpu: 8
       gpu: 1
       memory: 32Gi
