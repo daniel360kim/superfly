@@ -1,0 +1,8 @@
+{
+  "method": "diffaero",
+  "artifact": "checkpoints/exported_actor.pt2 (TorchScript, self-contained)",
+  "produced_by": "legacy (pre-reorg): python script/train.py env=oa algo=sha2c dynamics=pmc sensor=camera + script/export.py",
+  "config_notes": "point-mass continuous, obs local frame, 9x16 depth hfov 86deg max 5m",
+  "host": "unknown (pre-reorg)",
+  "schema": "superfly-run-meta-v1"
+}

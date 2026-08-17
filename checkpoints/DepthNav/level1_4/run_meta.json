@@ -1,0 +1,8 @@
+{
+  "method": "depthnav",
+  "artifact": "level1_4_iteration_13500.pth",
+  "produced_by": "legacy (pre-reorg): depthnav habitat curriculum, examples/navigation/run_nav_level1.py; exact commit/config unrecorded",
+  "config_notes": "THRUST_YAW / START frame / TARGET_VELOCITY_TARGET_DISTANCE; depth 72x128, GRU 192, 50 Hz; target_speed trained [2,4] m/s (policy_cfg/small_yaw.yaml matches the state_dict)",
+  "host": "unknown (pre-reorg)",
+  "schema": "superfly-run-meta-v1"
+}

@@ -1,0 +1,8 @@
+{
+  "method": "agile",
+  "artifact": "ckpt-50 (TF2 checkpoint prefix)",
+  "produced_by": "legacy (pre-reorg): upstream-style planner_learning training; exact provenance unrecorded",
+  "config_notes": "PlaNet trajectory net: 3 modes x (1 alpha + 3x10 waypoints @0.1s), body frame, 224x224 depth @ 91deg/20m",
+  "host": "unknown (pre-reorg)",
+  "schema": "superfly-run-meta-v1"
+}
