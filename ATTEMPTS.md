@@ -39,12 +39,13 @@ submodule in history, `mapnav`, is stranded on `main` (not an ancestor of
 (non-git, missing `planner_learning/`). Recovery path: fork upstream repos on
 GitHub (user action; `gh` absent on gs2) and add as `methods/` submodules.
 
-## 2026-08-17 — Velocity-variant checkpoints — PENDING
+## 2026-08-17 — depthnav_vel checkpoint — PENDING
 
 `depthnav_vel` has ALWAYS pointed at `level1_vel.pth`, which was never
-produced by anyone; `sha2c_vel_cmd_oa` was committed without its
-`exported_actor.pt2` (only `actor.pth` — re-run diffaero's `script/export.py`).
-Both methods are checkpoint-gated out of the harness until Phase 3 delivers.
+produced by anyone; it is checkpoint-gated out of the harness until Phase 3
+delivers it. (An earlier draft of this entry also claimed
+`sha2c_vel_cmd_oa` lacked its `exported_actor.pt2` — false, a truncated
+directory listing; the artifact is committed and `diffaero_vel` is ready.)
 
 ## 2026-08 — Agile training dataset: sampler renders no images — PENDING
 

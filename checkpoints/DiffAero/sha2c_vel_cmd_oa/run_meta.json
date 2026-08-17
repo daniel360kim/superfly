@@ -1,6 +1,6 @@
 {
   "method": "diffaero_vel",
-  "artifact": "checkpoints/exported_actor.pt2 -- MISSING: only actor.pth/critic.pth were ever committed for this run; re-run diffaero's script/export.py on actor.pth to produce the deployable artifact (checkpoint_ready gates this method out until then)",
+  "artifact": "checkpoints/exported_actor.pt2",
   "produced_by": "legacy (pre-reorg): velocity-command actor, env=oa (consumes 9x16 depth)",
   "host": "unknown (pre-reorg)",
   "schema": "superfly-run-meta-v1"

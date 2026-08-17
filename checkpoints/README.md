@@ -15,12 +15,13 @@ normal commit), never rewriting history.
 | `depthnav` | `DepthNav/level1_4/level1_4_iteration_13500.pth` | `scripts/train_depthnav.py` (legacy run predates it) |
 | `depthnav_vel` | `DepthNav/level1_vel/level1_vel.pth` — **does not exist yet** | `scripts/train_depthnav.py --vel` (Phase-3 deliverable; the registry has always pointed at this never-produced artifact) |
 | `diffaero` | `DiffAero/sha2c_pmc/checkpoints/exported_actor.pt2` | `scripts/train_diffaero.py` (wraps `script/train.py` + `script/export.py`) |
-| `diffaero_vel` | `DiffAero/sha2c_vel_cmd_oa/checkpoints/exported_actor.pt2` — **missing**; only `actor.pth` was committed. Re-run diffaero's `script/export.py` to produce it | as above |
+| `diffaero_vel` | `DiffAero/sha2c_vel_cmd_oa/checkpoints/exported_actor.pt2` | as above |
 | `agile` | `AgileAutonomy/ckpt-50/ckpt-50` (TF2 prefix: `.index` + `.data-*`, no pointer file) | `scripts/train_agile.py` |
 
 `checkpoint_ready()` (superfly.compare.registry) gates each method on its
 artifact's existence per `ckpt_kind`, so a missing artifact skips the method
-with a notice instead of flying garbage.
+with a notice instead of flying garbage. Verified 2026-08-17 on a fresh
+clone: every method except `depthnav_vel` reports ckpt_ready=True.
 
 Deleted, deliberately: `DiffPhysDrone/` (method removed from the harness)
 and the three `DiffAero/planar_*` symlinks (targets never committed,
