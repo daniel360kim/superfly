@@ -50,17 +50,25 @@ workflow:
         [ -f $REPO/methods/diffaero/script/train.py ] || {
           echo "DIFFAERO_SUBMODULE_MISSING_ABORT (Phase 1 not staged)"; exit 1; }
 
-        # Blackwell (sm_120) needs cu128+ kernels; the base image torch (cu130)
-        # is fine and MUST NOT be replaced -- so pytorch3d is excluded from the
-        # bulk install (its sdist build pulls torch pins) and built separately
-        # against the image torch. Only its pure-PyTorch `transforms` module is
-        # used, so a CPU-ops-only build (FORCE_CUDA=0) suffices and is faster.
+        # pytorch3d: no PyPI distribution, no git in this image, and its C++
+        # extension build races torch-version drift -- but diffaero only uses
+        # pytorch3d.transforms, which is pure Python (verified by grep: every
+        # import site is `pytorch3d.transforms`). So: fetch the source tarball
+        # and copy the python package into site-packages, skipping the build
+        # entirely. If diffaero ever grows a dependency on a compiled
+        # pytorch3d op, this fails loudly at that op's import.
         grep -v "^pytorch3d" $REPO/methods/diffaero/requirements.txt > /tmp/req.txt
         pip install --no-cache-dir -q -r /tmp/req.txt
-        # pytorch3d has no PyPI sdist/wheel -- install from GitHub (stable tag),
-        # built against the already-installed image torch.
-        FORCE_CUDA=0 pip install --no-cache-dir -q --no-build-isolation \
-          "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+        python - <<'P3DEOF'
+        import site, tarfile, urllib.request, glob, shutil
+        url = "https://github.com/facebookresearch/pytorch3d/archive/refs/tags/stable.tar.gz"
+        urllib.request.urlretrieve(url, "/tmp/p3d.tar.gz")
+        with tarfile.open("/tmp/p3d.tar.gz") as t:
+            t.extractall("/tmp/p3d")
+        src = glob.glob("/tmp/p3d/pytorch3d-*/pytorch3d")[0]
+        shutil.copytree(src, site.getsitepackages()[0] + "/pytorch3d")
+        P3DEOF
+        python -c "import pytorch3d.transforms; print('pytorch3d.transforms OK (pure-python copy)')"
         # make `import diffaero` + `import superfly` work everywhere
         pip install --no-cache-dir -q --no-deps -e $REPO/methods/diffaero
         pip install --no-cache-dir -q --no-deps -e $REPO
