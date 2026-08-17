@@ -57,7 +57,10 @@ workflow:
         # used, so a CPU-ops-only build (FORCE_CUDA=0) suffices and is faster.
         grep -v "^pytorch3d" $REPO/methods/diffaero/requirements.txt > /tmp/req.txt
         pip install --no-cache-dir -q -r /tmp/req.txt
-        FORCE_CUDA=0 pip install --no-cache-dir -q --no-build-isolation pytorch3d
+        # pytorch3d has no PyPI sdist/wheel -- install from GitHub (stable tag),
+        # built against the already-installed image torch.
+        FORCE_CUDA=0 pip install --no-cache-dir -q --no-build-isolation \
+          "git+https://github.com/facebookresearch/pytorch3d.git@stable"
         # make `import diffaero` + `import superfly` work everywhere
         pip install --no-cache-dir -q --no-deps -e $REPO/methods/diffaero
         pip install --no-cache-dir -q --no-deps -e $REPO
