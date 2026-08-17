@@ -26,26 +26,19 @@ from matplotlib.patches import Circle, Rectangle
 from matplotlib.transforms import Affine2D
 from matplotlib.lines import Line2D
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from metrics import takeoff_index, CYLH_LEN  # noqa: E402
+from superfly.compare.metrics import takeoff_index, CYLH_LEN
 
 # ---- palette (dataviz categorical slots 1-4, fixed pre-validated order) ------
-POLICY_ORDER = ["diffaero", "diffphys", "depthnav", "agile", "gsds", "gsds_depth"]
+POLICY_ORDER = ["diffaero", "depthnav", "agile"]
 POLICY_COLOR = {
     "diffaero": "#2a78d6",  # blue
-    "diffphys": "#1baf7a",  # aqua
     "depthnav": "#eda100",  # yellow
     "agile":    "#8a3ffc",  # purple
-    "gsds":       "#d62d67",  # magenta
-    "gsds_depth": "#e8793a",  # orange
 }
 POLICY_LABEL = {
     "diffaero": "DiffAero",
-    "diffphys": "DiffPhysics",
     "depthnav": "DepthNav",
     "agile":    "Agile",
-    "gsds":       "GS-DroneSim (RGB)",
-    "gsds_depth": "GS-DroneSim (depth)",
 }
 
 SURFACE = "#fcfcfb"

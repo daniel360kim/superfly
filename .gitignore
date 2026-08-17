@@ -5,40 +5,27 @@ __pycache__/
 build/
 dist/
 
-# Virtual environments (each method trains in its own venv)
+# Virtual environments (repo root = agile venv; methods/<repo>/.venv per method)
 .venv/
 venv/
 env/
 
-# Comparison harness outputs (regenerated each run)
-starling-deployment/compare/results/
+# Comparison harness outputs (regenerated each run; also holds mesh_cache/,
+# the scene-mesh clearance cache -- large .npz, re-extracted on demand)
+/results/
 
-# Sim / camera debug artifacts (regenerated each run)
-starling-deployment/camera_debug.png
-starling-deployment/depth_debug.npy
-starling-deployment/*.mp4
+# Sim / camera debug artifacts (regenerated each run, written to scripts/
+# because the harness launches with cwd=scripts/)
+scripts/camera_debug.png
+scripts/depth_debug.npy
+scripts/agile_overhead_debug.png
+scripts/*.mp4
 
 # Editor / OS
 .DS_Store
 .idea/
 .vscode/
 
-# Scene-mesh clearance cache (large .npz, re-extracted on demand)
-starling-deployment/compare/mesh_cache/
-
-# End-to-end comparison run outputs (regenerated per run)
-starling-deployment/compare/results_e2e/
-starling-deployment/results/
-
-# Sim scene assets (large USD files, not source)
-starling-deployment/starling/
-
 # Hydra training run outputs / logs (regenerated per run)
 outputs/
 train.log
-
-# External method repos cloned locally, not tracked as submodules
-/depthnav/
-/DiffPhysDrone/
-/SAFE_Benchmark/
-/diffaero/

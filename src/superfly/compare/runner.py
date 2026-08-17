@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """
-Comparison harness: fly DiffPhysDrone / DiffAero / DiffAero-vel / DepthNav / Agile Autonomy
-through the SAME Isaac-Sim + PX4-SITL scenarios and score them on the same
-metrics (success rate, collision/clearance, time & speed).
+Comparison harness: fly DepthNav / DiffAero / Agile Autonomy (plus their
+velocity-command variants) through the SAME Isaac-Sim + PX4-SITL scenarios
+and score them on the same metrics (success rate, collision/clearance,
+time & speed).
 
 Every run is driven by a scenarios JSON file: a list of trials, each with its
 own environment, start/goal, optional procedural obstacle field, and optional
@@ -31,25 +32,26 @@ procedural obstacle field supplies the spawn):
     }
 
 It does NOT retrain or rewrite any method: per (method, scenario) it launches
-the merged run_px4_sim.py with --log-traj (one launcher, all policies)
-plus the method's own *_offboard.py, waits for the offboard sentinel
-(--auto-stop), then scores the logged trajectory with compare/metrics.py.
+scripts/run_px4_sim.py with --log-traj (one launcher, all policies) plus the
+method's own scripts/*_offboard.py, waits for the offboard sentinel
+(--auto-stop), then scores the logged trajectory with superfly.compare.metrics.
 
-Because each method needs its own Python (DiffAero/DepthNav venvs, a torch env
-for DiffPhysDrone) and run_px4_sim needs Isaac's Python, interpreters are
-configurable (per-method + --sim-python) with project-venv defaults. PX4 SITL
-is (re)launched automatically per trial unless --no-px4-manage.
+Because each method needs its own Python (the methods/<repo>/.venv venvs, and
+the acados exec shim for agile) and run_px4_sim needs Isaac's Python,
+interpreters are configurable (per-method + --sim-python) with submodule-venv
+defaults (superfly.compare.registry). PX4 SITL is (re)launched automatically
+per trial unless --no-px4-manage.
 
 Examples:
     # see exactly what would run, no Isaac needed:
-    python compare/run_comparison.py scenarios.json --dry-run
+    python scripts/run_comparison.py <scenarios.json> --dry-run
 
     # real headless run with per-trial videos, then aggregate:
-    python compare/run_comparison.py scenarios.json --headless --record-video --report
-cd$i
+    python scripts/run_comparison.py <scenarios.json> --headless --record-video --report
+
     # just re-aggregate existing results (each run gets its own timestamped
-    # folder under compare/results/, e.g. compare/results/20260702_153000):
-    python compare/run_comparison.py --report-only --results-dir results/20260702_153000
+    # folder under results/, e.g. results/20260702_153000):
+    python scripts/run_comparison.py --report-only --results-dir results/20260702_153000
 """
 
 import argparse
@@ -67,23 +69,22 @@ from pathlib import Path
 
 import numpy as np
 
-_HERE = Path(__file__).resolve().parent
-_DEPLOY = _HERE.parent                       # starling-deployment/
-_REPO = _DEPLOY.parent                       # superfly/
-sys.path.insert(0, str(_DEPLOY))             # import obstacle_field, metrics
-import metrics                               # noqa: E402  (compare/metrics.py)
+_REPO = Path(__file__).resolve().parents[3]  # superfly/
+_SCRIPTS = _REPO / "scripts"                 # launcher + offboard entrypoints
 
-# Sentinel each *_offboard.py writes on exit; run_px4_sim --auto-stop watches it.
-# Must match OFFBOARD_DONE_FILE in run_px4_sim.py / diffdrone_offboard.py.
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
+from superfly.compare import metrics
+from superfly.compare.registry import (
+    method_registry, checkpoint_ready, resolve_python,
+    DEFAULT_MAX_SPEED, effective_agile_max_speed,
+)
 
-# Phase sentinel each *_offboard.py appends to: "start <ts>" at the CLIMB/YAW ->
-# POLICY handoff, "end <ts>" at the POLICY -> LANDING handoff (diffaero /
-# diffaero_vel; the others fly POLICY until they exit or we time them out). Must match
-# POLICY_PHASE_FILE in the offboard scripts. Lets --timeout budget the policy
-# flight only, with separate caps for the pre-policy (arm/climb/yaw) and
-# post-policy (landing) phases.
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+# Sentinels shared with the offboards + sim (superfly.common.sentinels):
+# each *_offboard.py touches OFFBOARD_DONE_FILE on exit (run_px4_sim
+# --auto-stop watches it) and appends "start"/"end" phase events to
+# POLICY_PHASE_FILE, which lets --timeout budget the policy flight only,
+# with separate caps for the pre-policy (arm/climb/yaw) and post-policy
+# (landing) phases. depthnav (thrust variant) never writes "end".
+from superfly.common.sentinels import OFFBOARD_DONE_FILE, POLICY_PHASE_FILE
 
 # Fixed run parameters that used to be CLI flags but never needed changing.
 VIDEO_FPS = 15.0          # --record-video MP4 frame rate
@@ -99,7 +100,7 @@ SIM_GRACE = 180.0         # seconds for the sim to auto-stop after offboard ends
 # extracted once per (usd, env_scale, params) into MESH_CACHE_DIR and reused
 # across trials and runs. Extraction boots a headless Kit, so the timeout is
 # generous; failures only cost the clearance columns, never the trial.
-MESH_CACHE_DIR = _HERE / "mesh_cache"
+MESH_CACHE_DIR = _REPO / "results" / "mesh_cache"
 SCENE_MESH_SAMPLE_H = 0.05      # surface sample spacing [m]
 SCENE_MESH_GROUND_DEG = 30.0    # ground-like face tilt threshold [deg]
 SCENE_MESH_TIMEOUT = 1200.0     # seconds for one extraction (incl. Kit boot)
@@ -131,211 +132,6 @@ def retarget_usd(usd):
     if not root or not usd or not str(usd).startswith(USD_STAGE_PREFIX):
         return usd
     return os.path.join(root, str(usd)[len(USD_STAGE_PREFIX):])
-
-
-DEFAULT_MAX_SPEED = 3.0
-# Agile cruise/MPC tuning validated 2026-07-08 (after fixing the net's de-yaw
-# bug in wrapper/agile_core.py): a faster control loop and heavier attitude
-# tracking than the acados-port defaults keep the streamed attitude setpoint
-# achievable and avoid the stale-state limit cycle (see agile-oscillation-fix
-# / agile-autonomy-integration memory notes for the full history).
-DEFAULT_AGILE_MAX_SPEED = 4.0
-AGILE_MAX_TILT_DEG = 30.0
-AGILE_CONTROL_HZ = 100.0
-AGILE_MPC_Q_ATT = 200.0
-
-
-def effective_agile_max_speed(args) -> float:
-    """Agile cruise cap passed to agile_offboard --max-vel: --max-speed when the
-    user changes it from the default, else the validated agile cruise speed."""
-    if float(args.max_speed) != DEFAULT_MAX_SPEED:
-        return float(args.max_speed)
-    return DEFAULT_AGILE_MAX_SPEED
-
-
-# gs_drone_sim students: MH-labeler references are 1.5 m/s (realized ~1.9);
-# the S1 speed study found 3.0 m/s labels free but 5.0 breaking. Cap the
-# tracked reference at 2.0 m/s unless the user explicitly overrides.
-DEFAULT_GSDS_MAX_SPEED = 2.0
-
-
-def effective_gsds_max_speed(args) -> float:
-    """gsds reference-velocity cap: --max-speed when changed from the default,
-    else the students' in-distribution cruise speed."""
-    if float(args.max_speed) != DEFAULT_MAX_SPEED:
-        return float(args.max_speed)
-    return DEFAULT_GSDS_MAX_SPEED
-
-
-# --------------------------------------------------------------------------- #
-# Per-method registry: how to launch each offboard script + where its policy
-# artifact lives. Interpreter/checkpoint are overridable on the CLI.
-# --------------------------------------------------------------------------- #
-def method_registry():
-    return {
-        "diffphys": dict(
-            policy="diffphys",
-            offboard="diffdrone_offboard.py",
-            control_hz=15.0,
-            goal_argc=3,
-            # DiffPhysDrone offboard only needs torch + DiffPhysDrone/model.py.
-            python=_REPO / "DiffPhysDrone" / ".venv" / "bin" / "python",
-            checkpoint=_REPO / "checkpoints" / "DiffPhysDrone" / "checkpoint0004.pth",
-            speed_args=lambda a: ["--margin", str(a.drone_radius),
-                                  "--max-speed", str(a.max_speed)],
-        ),
-        "diffaero": dict(
-            policy="diffaero",
-            offboard="diffaero_offboard.py",
-            control_hz=30.0,
-            goal_argc=2,                     # diffaero --goal takes X Y only
-            python=_REPO / "diffaero" / ".venv" / "bin" / "python",
-            # diffaero --checkpoint is a DIRECTORY holding checkpoints/exported_actor.pt2
-            checkpoint=_REPO / "checkpoints" / "DiffAero" / "sha2c_pmc",
-            speed_args=lambda a: ["--max-vel", str(a.max_speed)],
-        ),
-        "diffaero_vel": dict(
-            policy="diffaero",               # same sim depth camera + UDP transport
-            offboard="diffaero_vel_offboard.py",
-            control_hz=30.0,
-            goal_argc=2,
-            python=_REPO / "diffaero" / ".venv" / "bin" / "python",
-            # velocity-command actor (action_is_velocity); sha2c_vel_cmd_oa uses depth
-            checkpoint=_REPO / "checkpoints" / "DiffAero" / "sha2c_vel_cmd_oa",
-            speed_args=lambda a: ["--max-vel", str(a.max_speed)],
-        ),
-        "diffaero_vel_planar": dict(
-            policy="diffaero",
-            offboard="diffaero_vel_offboard.py",
-            control_hz=30.0,
-            goal_argc=2,
-            python=_REPO / "diffaero" / ".venv" / "bin" / "python",
-            checkpoint=_REPO / "checkpoints" / "DiffAero" / "planar_cnn_sr0.97",
-            speed_args=lambda a: [
-                "--max-vel", "1.5",
-                "--max-vel-xy", "1.5",
-                "--max-vel-z", "1.5",
-            ],
-        ),
-        "depthnav": dict(
-            policy="depthnav",
-            offboard="depthnav_offboard.py",
-            control_hz=50.0,
-            goal_argc=3,
-            python=_REPO / "depthnav" / ".venv" / "bin" / "python",
-            checkpoint=_REPO / "checkpoints" / "DepthNav" / "level1_4_iteration_13500.pth",
-            speed_args=lambda a: ["--target-speed", str(a.max_speed)],
-        ),
-        # Velocity-command DepthNav: same network and same sim depth camera as
-        # "depthnav", but the policy emits a velocity setpoint that goes to
-        # PX4's velocity loop (SET_POSITION_TARGET_LOCAL_NED) rather than a
-        # thrust vector to the attitude loop. Trained for 0.7-1.5 m/s, so
-        # --max-speed should sit in that band. Unlike "depthnav", this offboard
-        # writes the "end" phase marker on goal-reach, so policy_reported_reached
-        # behaves the same way it does for the other methods.
-        "depthnav_vel": dict(
-            policy="depthnav",               # same sim depth camera + UDP transport
-            offboard="depthnav_vel_offboard.py",
-            control_hz=50.0,
-            goal_argc=3,
-            python=_REPO / "depthnav" / ".venv" / "bin" / "python",
-            checkpoint=_REPO / "checkpoints" / "DepthNav" / "level1_vel.pth",
-            speed_args=lambda a: [
-                "--target-speed", str(a.max_speed),
-                # keep PX4's saturation aligned with VelocityBoundedYaw's bounds
-                "--max-vel-xy", str(max(2.5, a.max_speed * 1.7)),
-                "--max-vel-z", str(max(1.5, a.max_speed)),
-            ],
-        ),
-        "agile": dict(
-            policy="agile",
-            offboard="agile_offboard.py",
-            control_hz=30.0,
-            goal_argc=2,                     # agile --goal takes X Y only (like diffaero)
-            # Not a venv python but an exec shim: acados' generated .so needs
-            # ACADOS_SOURCE_DIR/LD_LIBRARY_PATH in the process env BEFORE python
-            # starts; the shim sets them, then execs starling-deployment/.venv.
-            python=_DEPLOY / "agile_python.sh",
-            # agile --checkpoint is a TF2 checkpoint PREFIX (ckpt-50.index/.data-*
-            # alongside; there is no `checkpoint` pointer file) -- never a plain file.
-            checkpoint=_REPO / "checkpoints" / "AgileAutonomy" / "ckpt-50",
-            speed_args=lambda a: [
-                "--max-vel", str(effective_agile_max_speed(a)),
-                "--max-tilt-deg", str(AGILE_MAX_TILT_DEG),
-                "--att-lp", "1.0",
-                "--control-hz", str(AGILE_CONTROL_HZ),
-                "--q-att", str(AGILE_MPC_Q_ATT),
-                # 2026-07-30 margin-tuning campaign hook: per-leg agile knobs
-                # (e.g. "--keepout --obs-r 0.25") injected via the environment
-                # so campaign scripts never edit this file. Recorded in each
-                # trial's metrics.json "commands" like every other arg.
-            ] + shlex.split(os.environ.get("AGILE_EXTRA_ARGS", "")),
-        ),
-        # gs_drone_sim multi-hypothesis trajectory students (this repo's 4th
-        # method family). Same offboard for both; the checkpoint's config
-        # decides the obs modality (gsds = RGB student, gsds_depth = depth
-        # student) and the sim --policy name keeps their results separate in
-        # aggregation. Interpreter = the gs_drone_sim venv (torch cu128 +
-        # pymavlink); the wrapper imports the model class from that repo.
-        "gsds": dict(
-            policy="gsds",
-            offboard="gsds_offboard.py",
-            control_hz=50.0,
-            goal_argc=2,                     # gsds --goal takes X Y (like agile)
-            python=Path("/home/danielkim/gs_drone_sim/.venv/bin/python"),
-            # RGB tube-augmented student (B8 tube8_4k, best known)
-            checkpoint=_REPO / "checkpoints" / "GSDroneSim" / "il_b8_tube8_4k.pt",
-            # --alt-mode hold: the students' body-frame vertical plans re-anchor
-            # at the current pose every replan, so an OOD downward bias
-            # integrates into a steady descent (observed: 4.5 m -> ground in
-            # 13 s on diffaero_field, 2026-07-27). Absolute altitude hold at
-            # the climb altitude is the same guard agile uses.
-            # Campaign hook (mirrors AGILE_EXTRA_ARGS): per-leg gsds offboard
-            # knobs (e.g. "--depth-repulsion 0.5") via the explicit
-            # --gsds-extra-args CLI flag (preferred: immune to ancestor-shell
-            # env fiddling) or the $GSDS_EXTRA_ARGS environment variable;
-            # recorded in each trial's metrics.json "commands.offboard".
-            speed_args=lambda a: ["--max-vel", str(effective_gsds_max_speed(a)),
-                                  "--alt-mode", "hold"]
-            + shlex.split(getattr(a, "gsds_extra_args", None)
-                          or os.environ.get("GSDS_EXTRA_ARGS", "")),
-        ),
-        "gsds_depth": dict(
-            policy="gsds_depth",
-            offboard="gsds_offboard.py",
-            control_hz=50.0,
-            goal_argc=2,
-            python=Path("/home/danielkim/gs_drone_sim/.venv/bin/python"),
-            # depth-observation student (il_depth_v2b)
-            checkpoint=_REPO / "checkpoints" / "GSDroneSim" / "il_depth_v2b.pt",
-            speed_args=lambda a: ["--max-vel", str(effective_gsds_max_speed(a)),
-                                  "--alt-mode", "hold"]
-            + shlex.split(getattr(a, "gsds_extra_args", None)
-                          or os.environ.get("GSDS_EXTRA_ARGS", "")),
-        ),
-    }
-
-
-def checkpoint_ready(method, ckpt: Path) -> bool:
-    """diffaero's checkpoint is a directory (needs exported_actor.pt2); agile's is
-    a TF2 checkpoint PREFIX (needs <prefix>.index); the others are .pth/.pt files."""
-    if method in ("diffaero", "diffaero_vel", "diffaero_vel_planar"):
-        return (ckpt / "checkpoints" / "exported_actor.pt2").exists()
-    if method == "agile":
-        return Path(str(ckpt) + ".index").exists()
-    return ckpt.exists()
-
-
-def resolve_python(method, default: Path, override: str) -> str:
-    """Pick the interpreter: explicit override > project venv (if present) >
-    the interpreter running this harness (with a warning)."""
-    if override:
-        return override
-    if Path(default).exists():
-        return str(default)
-    print(f"[{method}] venv {default} not found; falling back to {sys.executable}. "
-          f"Override with --{method}-python.", file=sys.stderr)
-    return sys.executable
 
 
 # --------------------------------------------------------------------------- #
@@ -545,8 +341,9 @@ def restart_px4(px4_dir: Path, model: str, boot_timeout: float, log_path: Path):
 # holds TCP 4560 (simulator + MAVLink tcpin); a stale *_offboard.py holds its
 # MAVLink UDP port (14550) -- either one poisons the next trial with
 # 'OSError: [Errno 98] Address already in use'.
-STALE_PATTERNS = ("run_px4_sim.py", "gsds_offboard.py", "depthnav_offboard.py",
-                  "diffaero_offboard.py", "diffphys_offboard.py", "agile_offboard.py")
+STALE_PATTERNS = ("run_px4_sim.py", "depthnav_offboard.py",
+                  "depthnav_vel_offboard.py", "diffaero_offboard.py",
+                  "diffaero_vel_offboard.py", "agile_offboard.py")
 
 
 def stop_stale_sims():
@@ -620,7 +417,7 @@ def ensure_scene_mesh(usd, env_scale, start, goal, sim_python):
     if path.exists():
         return path
     MESH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [sim_python or "python", str(_HERE / "extract_scene_mesh.py"),
+    cmd = [sim_python or "python", str(_SCRIPTS / "extract_scene_mesh.py"),
            str(retarget_usd(usd)),
            "--env-scale", str(env_scale), "--out", str(path),
            "--sample-h", str(SCENE_MESH_SAMPLE_H),
@@ -629,7 +426,7 @@ def ensure_scene_mesh(usd, env_scale, start, goal, sim_python):
     print(f"  [scene-mesh] extracting scene geometry (one-time per scene, boots "
           f"a headless Kit):\n      {' '.join(cmd)}")
     try:
-        subprocess.run(cmd, cwd=str(_HERE), timeout=SCENE_MESH_TIMEOUT, check=True)
+        subprocess.run(cmd, cwd=str(_SCRIPTS), timeout=SCENE_MESH_TIMEOUT, check=True)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         print(f"  [scene-mesh] extraction failed ({e}); clearance/collision will "
               f"not be scored for this scene.", file=sys.stderr)
@@ -720,7 +517,7 @@ def load_scenarios(path):
             s["start"] = np.asarray(entry["start"], float)
             s["goal"] = np.asarray(entry["goal"], float)
         else:
-            import obstacle_field
+            from superfly.sim import obstacle_field
             gen = (obstacle_field.generate_diffaero if s["obstacles"] == "diffaero"
                    else obstacle_field.generate)
             fld = gen(seed=s["seed"], scale=s["scale"])
@@ -853,12 +650,12 @@ def run_trial(method, cfg, args, scenario):
     # start the policy-phase timer from a previous trial's handoff).
     Path(OFFBOARD_DONE_FILE).unlink(missing_ok=True)
     Path(POLICY_PHASE_FILE).unlink(missing_ok=True)
-    sim = subprocess.Popen(sim_cmd, cwd=str(_DEPLOY))
+    sim = subprocess.Popen(sim_cmd, cwd=str(_SCRIPTS))
     off = None
     try:
         print(f"  [warmup] giving Isaac {args.warmup:.0f}s to boot before offboard ...")
         _sleep_or_die(sim, args.warmup, "sim exited during warmup")
-        off = subprocess.Popen(off_cmd, cwd=str(_DEPLOY))
+        off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS))
         wait_offboard_phased(off, args, scenario)
         # Ensure the sim's --auto-stop trips even if offboard was killed (its
         # own on-exit sentinel write only runs on a clean/Ctrl-C exit).
@@ -913,7 +710,7 @@ def run_trial(method, cfg, args, scenario):
     # The offboard hands off to LANDING only once inside its own goal threshold,
     # so a logged "end" event is the policy reporting goal-reached (in its EKF
     # frame). Count it toward success alongside the ground-truth radius check
-    # (diffphys/depthnav have no landing phase, so for them this stays False and
+    # (thrust-variant depthnav has no landing phase, so for it this stays False and
     # only the ground-truth check applies).
     _, t_policy_end = _read_policy_phase()
     res["policy_reported_reached"] = t_policy_end is not None
@@ -930,8 +727,6 @@ def run_trial(method, cfg, args, scenario):
         connect=args.connect)
     if method == "agile":
         res["hyperparams"]["agile_max_speed"] = effective_agile_max_speed(args)
-    if method in ("gsds", "gsds_depth"):
-        res["hyperparams"]["gsds_max_speed"] = effective_gsds_max_speed(args)
     res["scenario"] = {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                        for k, v in scenario.items()}
     res["commands"] = dict(sim=" ".join(sim_cmd), offboard=" ".join(off_cmd))
@@ -1094,24 +889,22 @@ def main():
                          "module docstring for the entry schema). Every method flies "
                          "every scenario. Not needed with --report-only.")
     ap.add_argument("--methods", nargs="+",
-                    default=["diffphys", "diffaero", "depthnav", "agile"],
-                    choices=["diffphys", "diffaero", "diffaero_vel", "diffaero_vel_planar",
-                             "depthnav", "agile", "gsds", "gsds_depth"],
-                    help="Methods to compare (default: all four; add diffaero_vel "
-                         "or diffaero_vel_planar for velocity-command DiffAero, "
-                         "gsds/gsds_depth for the gs_drone_sim RGB/depth students).")
+                    default=["depthnav", "diffaero", "agile"],
+                    choices=sorted(method_registry()),
+                    help="Methods to compare (default: the three thrust/attitude "
+                         "baselines; add depthnav_vel / diffaero_vel for the "
+                         "velocity-command variants).")
     ap.add_argument("--climb-alt", type=float, default=2.0,
                     help="Default climb height [m] ABOVE the spawn altitude before the "
                          "policy takes over (PX4 local frame, so it works unchanged on "
                          "elevated spawns). Override per scenario with \"climb_alt\".")
     ap.add_argument("--max-speed", type=float, default=DEFAULT_MAX_SPEED,
-                    help="Cruise speed for diffphys/diffaero/depthnav offboards, and "
-                         f"for agile too if set (agile defaults to "
-                         f"{DEFAULT_AGILE_MAX_SPEED:.0f} m/s if this is left at "
-                         f"{DEFAULT_MAX_SPEED:.0f} m/s). diffaero_vel_planar ignores "
-                         "this (fixed at 1.5 m/s).")
+                    help="Cruise speed for the depthnav/diffaero offboards, and "
+                         "for agile too if set (agile defaults to its validated "
+                         f"cruise speed if this is left at "
+                         f"{DEFAULT_MAX_SPEED:.0f} m/s).")
     ap.add_argument("--drone-radius", type=float, default=0.2,
-                    help="Collision radius [m] for clearance scoring (also diffphys --margin).")
+                    help="Collision radius [m] for clearance scoring.")
     ap.add_argument("--goal-radius", type=float, default=1.0,
                     help="Distance [m] to goal that counts as reached.")
     ap.add_argument("--connect", default="udp:localhost:14550")
@@ -1125,9 +918,8 @@ def main():
                          "viewpoint). Headless-safe.")
     ap.add_argument("--sim-python", default=os.environ.get("ISAACSIM_PYTHON"),
                     help="Interpreter for run_px4_sim.py (Isaac's python). "
-                         "Default $ISAAC_PYTHON or 'python'.")
-    for m in ("diffphys", "diffaero", "diffaero_vel", "diffaero_vel_planar",
-              "depthnav", "agile", "gsds", "gsds_depth"):
+                         "Default $ISAACSIM_PYTHON or 'python'.")
+    for m in sorted(method_registry()):
         ap.add_argument(f"--{m}-python", default=None, help=f"Interpreter for {m} offboard.")
         ap.add_argument(f"--{m}-checkpoint", default=None, help=f"Checkpoint override for {m}.")
     ap.add_argument("--warmup", type=float, default=45.0,
@@ -1151,12 +943,6 @@ def main():
     ap.add_argument("--no-px4-manage", action="store_true",
                     help="Don't launch/restart PX4 SITL -- assume you're managing it "
                          "yourself in another terminal (the old workflow).")
-    ap.add_argument("--gsds-extra-args", default=None,
-                    help="Extra args appended verbatim to the gsds/gsds_depth "
-                         "offboard command line (e.g. \"--depth-repulsion 0.5\"). "
-                         "Explicit CLI variant of the $GSDS_EXTRA_ARGS campaign "
-                         "hook; takes precedence over the env var. Recorded in "
-                         "each trial's metrics.json commands.offboard.")
     ap.add_argument("--results-dir", default=None,
                     help="Directory for outputs. Default: a new folder named "
                          "results/<YYYYMMDD_HHMMSS> is created for every run so "
@@ -1193,7 +979,7 @@ def main():
                              "existing run folder (no default -- there's no run to "
                              "auto-name).")
         import datetime
-        args.results_dir = str(_HERE / "results" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        args.results_dir = str(_REPO / "results" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
 
     if args.report_only:
         if args.rescore_clearance:
@@ -1237,7 +1023,7 @@ def main():
     for method in args.methods:
         cfg = registry[method]
         ckpt = Path(getattr(args, f"{method}_checkpoint") or cfg["checkpoint"])
-        if not args.dry_run and not checkpoint_ready(method, ckpt):
+        if not args.dry_run and not checkpoint_ready(cfg, ckpt):
             print(f"\n[skip] {method}: checkpoint not found at {ckpt} "
                   f"-- skipping (provide one or --{method}-checkpoint).")
             continue

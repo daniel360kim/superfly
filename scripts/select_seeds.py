@@ -43,11 +43,12 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))          # compare/
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))      # starling-deployment/
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-import obstacle_field                                              # noqa: E402
-from metrics import clearance_along_traj                           # noqa: E402
+from superfly.sim import obstacle_field                            # noqa: E402
+from superfly.compare.metrics import clearance_along_traj          # noqa: E402
 
 #: Clearance the drone body needs at an endpoint. The drone is modelled with a
 #: 0.2 m radius; assets can exceed the primitive they replace, so this is

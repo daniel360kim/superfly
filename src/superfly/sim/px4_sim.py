@@ -1,51 +1,28 @@
 #!/usr/bin/env python
 """
-Launch Pegasus + PX4 SITL with a single Iris quadrotor, plus a forward-facing
-depth camera matching the DiffPhysDrone single_agent training config:
-    fov_x_half_tan = 0.82  ->  horizontal FOV = 2*atan(0.82) = 78.6 deg
-    cam_angle      = 20    ->  camera pitched 20 deg DOWN about the body left-axis
-The 48x64 metric (planar Z) depth is published over UDP each control tick for
-the offboard policy process to consume (see depth_transport.py).
+Launch Pegasus + PX4 SITL with a single Iris quadrotor plus a forward-facing
+depth camera matched to the selected method's training sensor (--policy
+diffaero | depthnav | agile; see POLICY_CAMERAS / POLICY_DEPTH_PUBLISH for
+the exact per-method camera + wire format). The metric depth is published
+over UDP each sim tick for the offboard policy process to consume
+(superfly.common.transport).
 
-Run this AFTER PX4 SITL is up; then run diffdrone_offboard.py --depth.
+NOTE: this module boots Isaac Sim's SimulationApp AT IMPORT TIME -- only
+import it under Isaac's interpreter, via scripts/run_px4_sim.py.
 
-Procedural obstacle field (default):
-    python run_px4_sim.py --seed 0 --obstacles diffphys
+Run this AFTER PX4 SITL is up; then run the matching scripts/*_offboard.py
+with --depth. Typical (procedural diffaero field):
+    python scripts/run_px4_sim.py --policy diffaero --obstacles diffaero --seed 0
+    python scripts/diffaero_offboard.py --checkpoint <dir> --depth --goal 40 30
 
-Warehouse background, no procedural obstacles (scene geometry only):
-    python run_px4_sim.py --environment Warehouse --obstacles none --spawn 0 0 1.0 --policy diffaero
-    python diffaero_offboard.py --checkpoint <dir> --depth --goal 15 0 --climb-alt 2.0
+Scene-only (named Pegasus scene or a USD stage, no procedural obstacles):
+    python scripts/run_px4_sim.py --environment Warehouse --obstacles none \
+        --spawn 0 0 1.0 --policy depthnav
+    python scripts/run_px4_sim.py --obstacles none --policy agile --spawn 0 0 1.0 \
+        --usd-environment omniverse://.../ConiferForest_stage.stage.usd --env-scale 0.01
 
-    python run_px4_sim.py --environment Warehouse --obstacles none --spawn 0 0 1.0 --policy diffphys
-    python diffdrone_offboard.py --checkpoint <pt> --depth --goal 15 0 2.0 --climb-alt 2.0
-
-Warehouse with Shelves (more rack rows; small ~40 m building, aisles along -X):
-    # Spawn in the main aisle (~Y=1 m); fly toward the open end at X≈-3 m.
-    python run_px4_sim.py --environment "Warehouse with Shelves" --obstacles none \
-        --spawn -12 1 0.1 --policy diffaero
-    python diffaero_offboard.py --checkpoint <dir> --depth --goal -3 1 --climb-alt 1.5 --max-vel 3.0
-
-    python run_px4_sim.py --environment "Warehouse with Shelves" --obstacles none \
-        --spawn -12 1 0.1 --policy diffphys
-    python diffdrone_offboard.py --checkpoint <pt> --depth --goal -3 1 1.5 --climb-alt 1.5 --max-speed 3.0
-
-Custom USD stage (e.g. ConiferForest), centimetre-authored so scaled to metres
-with --env-scale 0.01, no procedural obstacles (fly through the scene geometry):
-    python run_px4_sim.py --obstacles none --policy diffaero --spawn 0 0 1.0 \
-        --usd-environment omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConiferForest/ConiferForest_stage.stage.usd \
-        --env-scale 0.01
-    python diffaero_offboard.py --checkpoint <dir> --depth --goal 15 0 --climb-alt 2.0
-
-Training-distribution layout but with realistic geometry (--obstacle-assets swaps
-each procedural primitive for a USD asset from OBSTACLE_ASSETS, scaled to fit):
-    python run_px4_sim.py --obstacles diffaero --policy diffaero --obstacle-assets
-    python diffaero_offboard.py --checkpoint <dir> --depth --goal 40 30 --climb-alt 2.0
-
-Velocity-command DiffAero policy (PX4 velocity loop, no depth for env=pc checkpoints):
-    python run_px4_sim.py --environment Warehouse --obstacles none --spawn 0 0 1.0 \
-        --policy diffaero --auto-stop --no-debug-frames
-    python diffaero_vel_offboard.py --checkpoint checkpoints/DiffAero/sha2c_vel_cmd \
-        --goal 15 0 --climb-alt 2.0 --quiet
+Training-distribution layout with realistic geometry (--obstacle-assets swaps
+each procedural primitive for a USD asset from OBSTACLE_ASSETS, scaled to fit).
 """
 
 import argparse
@@ -96,10 +73,9 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from depth_transport import DepthPublisher, RgbPublisher, RENDER_H, RENDER_W
-from agile_debug_transport import AgileDebugSubscriber
-from obstacle_field import generate as generate_field
+from superfly.common.transport import DepthPublisher
+from superfly.common.agile_debug_transport import AgileDebugSubscriber
+from superfly.sim.obstacle_field import generate as generate_field
 
 
 # --- Realistic asset catalog for --obstacle-assets (Stage 1) ---
@@ -151,65 +127,74 @@ OBSTACLE_ASSETS = {
     ],
 }
 
-# --- DiffPhysDrone single_agent camera params ---
-FOV_X_HALF_TAN = 0.82
-CAM_ANGLE_DEG = 20.0
-FOV_X_DEG = 2.0 * math.degrees(math.atan(FOV_X_HALF_TAN))  # ~78.6 deg horizontal
+# --- Per-method camera + depth wire format --------------------------------
+# One row per --policy. Adding a method = adding one entry to each table
+# below (plus its registry row in superfly.compare.registry).
 
-# --- DiffAero (sha2c_pmc) camera params (diffaero/cfg/sensor/camera.yaml) ---
-# 16(w) x 9(h), horizontal FOV 86 deg, max range 5 m, forward-facing (no pitch),
-# mounted at body [0.2, 0, 0.05]. DiffAero's perception is the EUCLIDEAN ray range
-# encoded as 1 - clamp(r,0,5)/5. DiffAero defines vfov = hfov * H/W (angle-linear,
-# = 48.375 deg), so we set fx/fy independently to match both FOVs.
+# DiffAero (sha2c_pmc) camera params (diffaero/cfg/sensor/camera.yaml):
+# 16(w) x 9(h) perception grid rendered at 4x (64x36) then min-pooled by the
+# policy process; horizontal FOV 86 deg, max range 5 m, forward-facing,
+# mounted at body [0.2, 0, 0.05]. DiffAero's perception is the EUCLIDEAN ray
+# range encoded as 1 - clamp(r,0,5)/5; vfov = hfov * H/W (angle-linear,
+# = 48.375 deg), so fx/fy are set independently to match both FOVs.
 DA_OUT_W, DA_OUT_H = 16, 9             # network perception grid (cols, rows)
 DA_POOL = 4                            # min-pool factor (nearest surface per cell)
 DA_RENDER_W, DA_RENDER_H = DA_OUT_W * DA_POOL, DA_OUT_H * DA_POOL  # (64, 36)
 DA_FOV_X_DEG = 86.0
 DA_FOV_Y_DEG = DA_FOV_X_DEG * DA_OUT_H / DA_OUT_W  # 48.375 deg (DiffAero definition)
-DA_CAM_ANGLE_DEG = 0.0                 # forward, no downward pitch
 DA_MAX_DIST = 5.0
 
-# --- DepthNav camera params (depthnav training: 72x128 depth, no tilt) ---
-# 128(w) x 72(h), horizontal FOV ~89 deg (habitat's default, scene_manager.py;
-# training set no hfov override), near 0.25 / far 20 m, forward-facing (no pitch).
-# depthnav consumes RAW planar metric depth: the policy clamps to [near, far] and
-# inverts (1/(d+eps)) + maxpools internally (depthnav_policy.py), so we publish the
-# planar Z-depth in metres with no normalization here.
+# DepthNav camera params (depthnav training: 72x128 depth, no tilt):
+# 128(w) x 72(h), horizontal FOV ~89 deg (habitat's default), near 0.25 /
+# far 20 m, forward-facing. depthnav consumes RAW planar metric depth (the
+# policy clamps to [near, far], inverts and maxpools internally).
 DN_RENDER_W, DN_RENDER_H = 128, 72
 DN_FOV_X_DEG = 89.0
-DN_CAM_ANGLE_DEG = 0.0                  # forward, no downward pitch
 DN_NEAR, DN_FAR = 0.25, 20.0
 
-# --- Agile Autonomy (Loquercio) camera params (wrapper/agile_core.py) ---
-# Matches uzh-rpg/agile_autonomy flightmare.yaml: 640x480, 91 deg horizontal
-# FOV, forward-facing (pitch 0), far 20 m. The offboard consumes RAW planar
-# Z-depth in metres (the net converts to mm/80 internally).
-#
-# RESOLUTION: the Loquercio net's MobileNet backbone takes a 224x224 input, and
-# the original training loader (planner_learning data_loader.decode_depth_cv2)
-# fed it VGA-class SGM depth (640x480) DOWNSAMPLED to 224 via cv2.resize
-# (bilinear). We reproduce that: render at AG_RENDER_W/H, then bilinear-resize
-# to AG_NET_SIZE (224) and ship THAT.
+# Agile Autonomy (Loquercio) camera params (superfly.policies.agile.core):
+# matches uzh-rpg/agile_autonomy flightmare.yaml: 640x480 render, 91 deg
+# horizontal FOV, forward-facing, far 20 m. The net's MobileNet backbone
+# takes 224x224; the original training loader fed it VGA-class SGM depth
+# DOWNSAMPLED to 224 via cv2.resize (bilinear) -- reproduced here: render
+# at VGA, bilinear-resize to 224, ship RAW planar metres (the offboard's
+# policy core does the mm/80 encoding).
 AG_RENDER_W, AG_RENDER_H = 640, 480     # VGA native render (flightmare.yaml)
 AG_NET_SIZE = 224                       # net input; bilinear-downsampled, shipped
-AG_FOV_X_DEG = 91.0                     # flightmare.yaml camera.fov
-AG_CAM_ANGLE_DEG = 0.0                  # forward, no downward pitch
+AG_FOV_X_DEG = 91.0
 AG_FAR = 20.0
 
-# --- gs_drone_sim (gsds / gsds_depth) camera params ---
-# Matches the gs_drone_sim policy-observation camera (env.py / render_cache.py):
-# 224x224 NATIVE render (the student trained on native-224 gsplat renders, so
-# no high-res+downsample step), square pixels, 90 deg FOV both axes, forward
-# (no pitch), planar Z-depth. The student's depth encoding clips to
-# [0.3, 100] m with far/sky = 100 (DEPTH_HI); we publish far = GS_FAR = 100.
-# NOTE the u16-mm wire codec saturates at 65.535 m -- wrapper/gsds_core.py
-# remaps received pixels >= 65 m back to 100 m before encoding. The SAME
-# camera also feeds a JPEG RGB stream (RgbPublisher, port 15002): the RGB
-# student needs RGB frames, and both are published for either policy name.
-GS_SIZE = 224
-GS_FOV_X_DEG = 90.0
-GS_CAM_ANGLE_DEG = 0.0                  # forward, no downward pitch
-GS_FAR = 100.0
+# Camera geometry per policy. fov_y_deg None => square pixels (fy = fx).
+POLICY_CAMERAS = {
+    "diffaero": dict(position=(0.20, 0.0, 0.05), pitch_deg=0.0,
+                     resolution=(DA_RENDER_W, DA_RENDER_H),
+                     fov_x_deg=DA_FOV_X_DEG, fov_y_deg=DA_FOV_Y_DEG,
+                     clipping=None),
+    "depthnav": dict(position=(0.10, 0.0, 0.0), pitch_deg=0.0,
+                     resolution=(DN_RENDER_W, DN_RENDER_H),
+                     fov_x_deg=DN_FOV_X_DEG, fov_y_deg=None,
+                     clipping=(DN_NEAR, DN_FAR)),
+    "agile":    dict(position=(0.10, 0.0, 0.0), pitch_deg=0.0,
+                     resolution=(AG_RENDER_W, AG_RENDER_H),
+                     fov_x_deg=AG_FOV_X_DEG, fov_y_deg=None,
+                     clipping=None),
+}
+
+# Depth publish pipeline per policy: no-return/inf pixels -> `far`; optional
+# clip to [0, far] BEFORE resizing (agile: the training loader did
+# np.minimum(depth, 20000) ahead of cv2.resize so far pixels don't bleed
+# across obstacle edges); optional resize to `out` (rows, cols) by `interp`
+# ('bilinear' = cv2.INTER_LINEAR like the agile training loader; 'nearest' =
+# index subsampling); compress=True ships zlib(u16 mm) because a raw 224x224
+# float32 frame exceeds the UDP datagram cap.
+POLICY_DEPTH_PUBLISH = {
+    "diffaero": dict(far=DA_MAX_DIST, out=None, interp=None,
+                     clip=False, compress=False),
+    "depthnav": dict(far=DN_FAR, out=(DN_RENDER_H, DN_RENDER_W),
+                     interp="nearest", clip=False, compress=False),
+    "agile":    dict(far=AG_FAR, out=(AG_NET_SIZE, AG_NET_SIZE),
+                     interp="bilinear", clip=True, compress=True),
+}
 
 # --- RGB "drone_camera" used only for video logging (--record-rgb-video) ---
 # The policy depth cameras render at 64x36..128x72, far too small to watch, so
@@ -218,18 +203,11 @@ GS_FAR = 100.0
 # depth camera, so the RGB video shows the same viewpoint the policy sees.
 RGB_W, RGB_H = 640, 360
 
-# Sentinel file diffaero_offboard.py / diffdrone_offboard.py touch on exit
-# (any reason: landed, Ctrl-C, crash). --auto-stop polls for it so this script
-# can stop through its own normal loop exit instead of needing a manual
-# Ctrl-C, which races Isaac's SIGINT teardown (see run()).
-OFFBOARD_DONE_FILE = "/tmp/superfly_offboard_done"
-
-# Phase sentinel the offboard scripts append to ("start <unix_ts>" at the
-# climb/yaw -> policy handoff, "end <unix_ts>" at policy -> landing). Read at
-# trajectory-save time so the .npz carries the policy window and metrics.py
-# can clip clearance/speed to the policy flight exactly. Must match
-# POLICY_PHASE_FILE in the offboard scripts / compare/run_comparison.py.
-POLICY_PHASE_FILE = "/tmp/superfly_policy_phase"
+# Sentinels shared with the offboards + harness (see superfly.common.sentinels
+# for what each file means; --auto-stop polls OFFBOARD_DONE_FILE, and
+# POLICY_PHASE_FILE is read at trajectory-save time so the .npz carries the
+# policy window and metrics.py can clip clearance/speed to the policy flight).
+from superfly.common.sentinels import OFFBOARD_DONE_FILE, POLICY_PHASE_FILE
 
 
 class Mp4Writer:
@@ -425,7 +403,7 @@ class PegasusApp:
         if obstacles == "none":
             spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]), float(spawn_xyz[2])]
         elif obstacles == "diffaero":
-            from obstacle_field import generate_diffaero
+            from superfly.sim.obstacle_field import generate_diffaero
             self.field = generate_diffaero(seed=seed, scale=scale)
             print("[obstacle_field]", self.field.summary())
             if tuple(spawn_xyz) != _SPAWN_DEFAULT:
@@ -457,16 +435,7 @@ class PegasusApp:
         })
         config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
-        if policy == "diffaero":
-            self._setup_camera_diffaero()
-        elif policy == "depthnav":
-            self._setup_camera_depthnav()
-        elif policy == "agile":
-            self._setup_camera_agile()
-        elif policy in ("gsds", "gsds_depth"):
-            self._setup_camera_gsds()
-        else:
-            self._setup_camera_diffphys()
+        self._setup_camera()
         config_multirotor.graphical_sensors = [self._camera]
 
         # Dedicated RGB camera for --record-rgb-video only: same body pose and
@@ -510,8 +479,6 @@ class PegasusApp:
 
         self.world.reset()
         self._depth_pub = DepthPublisher()
-        self._rgb_pub = (RgbPublisher()
-                         if self.policy in ("gsds", "gsds_depth") else None)
         self._agile_debug_sub = (AgileDebugSubscriber() if self.policy == "agile" else None)
         self._last_agile_depth = None
         self._dbg_n = 0           # frame counter for throttled debug dumps
@@ -520,137 +487,34 @@ class PegasusApp:
         self.stop_sim = False
         self._camera_ready_logged = False  # prints once when the depth camera becomes ready
 
-    def _setup_camera_diffphys(self):
-        """Forward-facing depth camera pitched CAM_ANGLE_DEG down (DiffPhysDrone).
+    def _setup_camera(self):
+        """Forward-facing depth camera matching the selected policy's training
+        sensor (POLICY_CAMERAS row).
 
-        Pegasus MonocularCamera 'orientation' is Euler ZYX (deg) relative to the
-        body frame; default [0,0,180] points the camera forward (+X body). A
-        positive pitch about the camera's lateral axis tilts the view downward.
-        """
-        self._camera = MonocularCamera("depth_cam", config={
+        Pegasus MonocularCamera 'orientation' is Euler ZYX (deg) relative to
+        the body frame; [0, 0, 180] points the camera forward (+X body). With
+        that 180 deg yaw a positive Y-pitch tilts the view UP, so pitch_deg is
+        negated to pitch DOWN. The horizontal FOV is forced to match training
+        exactly; fov_y_deg None means square pixels (fy = fx)."""
+        cam = POLICY_CAMERAS[self.policy]
+        w, h = cam["resolution"]
+        config = {
             "depth": True,
-            "position": np.array([0.10, 0.0, 0.0]),
-            # NOTE: with the 180° yaw, a positive Y-pitch tilts the view UP, so we
-            # negate CAM_ANGLE_DEG to pitch the camera DOWN (matching training).
-            "orientation": np.array([0.0, -CAM_ANGLE_DEG, 180.0]),
-            "resolution": (RENDER_W, RENDER_H),   # (width, height) = (64, 48)
+            "position": np.array(cam["position"]),
+            "orientation": np.array([0.0, -cam["pitch_deg"], 180.0]),
+            "resolution": (w, h),
             "frequency": 30,
-            "intrinsics": None,  # falls back to fov-based; we override fov below
-        })
-        # Force the horizontal FOV to match training exactly.
-        self._camera.fov = FOV_X_DEG
-        self._camera.fx = 0.5 * RENDER_W / math.tan(0.5 * math.radians(FOV_X_DEG))
-        self._camera.fy = self._camera.fx
-        self._camera.cx = 0.5 * RENDER_W
-        self._camera.cy = 0.5 * RENDER_H
-        self._camera._intrinsics = np.array([
-            [self._camera.fx, 0.0, self._camera.cx],
-            [0.0, self._camera.fy, self._camera.cy],
-            [0.0, 0.0, 1.0]])
-
-    def _setup_camera_diffaero(self):
-        """Forward-facing depth camera matching DiffAero's sensor config.
-
-        16x9 grid (rendered at DA_RENDER_W x DA_RENDER_H, then min-pooled),
-        horizontal FOV 86 deg, vertical FOV = 86*9/16 deg (DiffAero's angle-linear
-        definition), no downward pitch, mounted at body [0.2, 0, 0.05]. fx/fy are
-        set independently so both FOVs match; the planar Z-depth is converted to
-        EUCLIDEAN range with these intrinsics in _publish_depth.
-        """
-        self._camera = MonocularCamera("depth_cam", config={
-            "depth": True,
-            "position": np.array([0.20, 0.0, 0.05]),
-            "orientation": np.array([0.0, -DA_CAM_ANGLE_DEG, 180.0]),
-            "resolution": (DA_RENDER_W, DA_RENDER_H),  # (width, height) = (64, 36)
-            "frequency": 30,
-            "intrinsics": None,
-        })
-        self._camera.fov = DA_FOV_X_DEG
-        self._camera.fx = 0.5 * DA_RENDER_W / math.tan(0.5 * math.radians(DA_FOV_X_DEG))
-        self._camera.fy = 0.5 * DA_RENDER_H / math.tan(0.5 * math.radians(DA_FOV_Y_DEG))
-        self._camera.cx = 0.5 * DA_RENDER_W
-        self._camera.cy = 0.5 * DA_RENDER_H
-        self._camera._intrinsics = np.array([
-            [self._camera.fx, 0.0, self._camera.cx],
-            [0.0, self._camera.fy, self._camera.cy],
-            [0.0, 0.0, 1.0]])
-
-    def _setup_camera_depthnav(self):
-        """Forward-facing depth camera matching depthnav's training sensor.
-
-        128x72, horizontal FOV ~89 deg (habitat default), near 0.25 / far 20 m,
-        no downward pitch, mounted at body [0.1, 0, 0]. RAW planar Z-depth
-        (distance_to_image_plane) is published in metres; depthnav_policy clamps
-        to [near, far] and inverts/maxpools internally (no work needed here)."""
-        self._camera = MonocularCamera("depth_cam", config={
-            "depth": True,
-            "position": np.array([0.10, 0.0, 0.0]),
-            "orientation": np.array([0.0, -DN_CAM_ANGLE_DEG, 180.0]),
-            "resolution": (DN_RENDER_W, DN_RENDER_H),  # (width, height) = (128, 72)
-            "clipping_range": (DN_NEAR, DN_FAR),
-            "frequency": 30,
-            "intrinsics": None,
-        })
-        self._camera.fov = DN_FOV_X_DEG
-        self._camera.fx = 0.5 * DN_RENDER_W / math.tan(0.5 * math.radians(DN_FOV_X_DEG))
-        self._camera.fy = self._camera.fx
-        self._camera.cx = 0.5 * DN_RENDER_W
-        self._camera.cy = 0.5 * DN_RENDER_H
-        self._camera._intrinsics = np.array([
-            [self._camera.fx, 0.0, self._camera.cx],
-            [0.0, self._camera.fy, self._camera.cy],
-            [0.0, 0.0, 1.0]])
-
-    def _setup_camera_agile(self):
-        """Forward-facing depth camera for Agile Autonomy (Loquercio).
-
-        VGA render (AG_RENDER_W x AG_RENDER_H) at 91 deg horizontal FOV
-        (flightmare.yaml), square pixels (fy == fx), no downward pitch, mounted at
-        body [0.1, 0, 0]. _publish_depth_agile bilinear-downsamples the RAW
-        planar Z-depth to 224x224 (matching Loquercio's training loader) and
-        ships that in metres; the offboard's wrapper/agile_core.py does the
-        mm/80 encoding. See the AG_* constants note for why we render high."""
-        self._camera = MonocularCamera("depth_cam", config={
-            "depth": True,
-            "position": np.array([0.10, 0.0, 0.0]),
-            "orientation": np.array([0.0, -AG_CAM_ANGLE_DEG, 180.0]),
-            "resolution": (AG_RENDER_W, AG_RENDER_H),  # VGA-class, downsampled to 224
-            "frequency": 30,
-            "intrinsics": None,
-        })
-        self._camera.fov = AG_FOV_X_DEG
-        self._camera.fx = 0.5 * AG_RENDER_W / math.tan(0.5 * math.radians(AG_FOV_X_DEG))
-        self._camera.fy = self._camera.fx
-        self._camera.cx = 0.5 * AG_RENDER_W
-        self._camera.cy = 0.5 * AG_RENDER_H
-        self._camera._intrinsics = np.array([
-            [self._camera.fx, 0.0, self._camera.cx],
-            [0.0, self._camera.fy, self._camera.cy],
-            [0.0, 0.0, 1.0]])
-
-    def _setup_camera_gsds(self):
-        """Forward-facing depth+RGB camera for gs_drone_sim students.
-
-        224x224 NATIVE render at 90 deg FOV, square pixels (fy == fx), no
-        pitch, mounted at body [0.1, 0, 0] -- matching GSDroneEnv's policy
-        observation camera (width=height=224, fov_deg=90, OpenCV pinhole with
-        the principal point at center). The student trained on native-224
-        gsplat renders, so we render at the net input size directly (no
-        high-res + downsample step). _publish_depth_gsds ships planar Z-depth
-        (compress=True) AND the same camera's RGB as JPEG (RgbPublisher)."""
-        self._camera = MonocularCamera("depth_cam", config={
-            "depth": True,
-            "position": np.array([0.10, 0.0, 0.0]),
-            "orientation": np.array([0.0, -GS_CAM_ANGLE_DEG, 180.0]),
-            "resolution": (GS_SIZE, GS_SIZE),
-            "frequency": 30,
-            "intrinsics": None,
-        })
-        self._camera.fov = GS_FOV_X_DEG
-        self._camera.fx = 0.5 * GS_SIZE / math.tan(0.5 * math.radians(GS_FOV_X_DEG))
-        self._camera.fy = self._camera.fx
-        self._camera.cx = 0.5 * GS_SIZE
-        self._camera.cy = 0.5 * GS_SIZE
+            "intrinsics": None,  # falls back to fov-based; we override below
+        }
+        if cam["clipping"] is not None:
+            config["clipping_range"] = cam["clipping"]
+        self._camera = MonocularCamera("depth_cam", config=config)
+        self._camera.fov = cam["fov_x_deg"]
+        self._camera.fx = 0.5 * w / math.tan(0.5 * math.radians(cam["fov_x_deg"]))
+        self._camera.fy = (self._camera.fx if cam["fov_y_deg"] is None else
+                           0.5 * h / math.tan(0.5 * math.radians(cam["fov_y_deg"])))
+        self._camera.cx = 0.5 * w
+        self._camera.cy = 0.5 * h
         self._camera._intrinsics = np.array([
             [self._camera.fx, 0.0, self._camera.cx],
             [0.0, self._camera.fy, self._camera.cy],
@@ -946,18 +810,6 @@ class PegasusApp:
             UsdGeom.Gprim(prim).GetDisplayColorAttr().Set(
                 [Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
 
-    def _publish_depth(self):
-        if self.policy == "diffaero":
-            self._publish_depth_diffaero()
-        elif self.policy == "depthnav":
-            self._publish_depth_depthnav()
-        elif self.policy == "agile":
-            self._publish_depth_agile()
-        elif self.policy in ("gsds", "gsds_depth"):
-            self._publish_depth_gsds()
-        else:
-            self._publish_depth_diffphys()
-
     def _camera_ready(self):
         """True once MonocularCamera.start() has run (sets _camera_full_set).
         Prints once on the False->True transition so you can see exactly when
@@ -972,45 +824,11 @@ class PegasusApp:
                   f"{time.strftime('%H:%M:%S', time.localtime(t))}.{int(t % 1 * 1000):03d}")
         return cam, full_set
 
-    def _publish_depth_diffphys(self):
-        """Grab the camera's planar Z-depth, resize to 48x64, publish over UDP."""
-        cam, full_set = self._camera_ready()
-        if cam is None or not full_set:
-            return
-        # get_depth() returns 'distance_to_image_plane' = planar/optical-axis
-        # Z-depth, matching the native render convention (NOT Euclidean range).
-        depth = cam.get_depth()
-        if depth is None:
-            return
-        depth = np.asarray(depth, dtype=np.float32)
-        if depth.size == 0:
-            return
-        # Replace inf / nan / no-return with far value (>= clamp max of 24 m).
-        depth = np.nan_to_num(depth, nan=24.0, posinf=24.0, neginf=24.0)
-        if depth.shape != (RENDER_H, RENDER_W):
-            # Nearest-neighbour resize to the exact policy resolution.
-            yi = (np.linspace(0, depth.shape[0] - 1, RENDER_H)).astype(np.int64)
-            xi = (np.linspace(0, depth.shape[1] - 1, RENDER_W)).astype(np.int64)
-            depth = depth[yi][:, xi]
-
-        # --- orientation fix (apply BEFORE publishing so debug == published) ---
-        # If the debug PNG shows rows/cols flipped vs the native convention
-        # (row 0 = up, col 0 = left), uncomment the matching line:
-        # depth = depth[::-1]        # flip rows (vertical)
-        # depth = depth[:, ::-1]     # flip cols (horizontal/mirror)
-
-        self._depth_pub.send(depth)
-        self._dump_depth_debug(depth)
-        self._record_depth_video_frame(depth)
-
-    def _publish_depth_diffaero(self):
-        """Publish the 9x16 EUCLIDEAN range image DiffAero expects.
-
-        Steps: planar Z-depth (distance_to_image_plane) -> Euclidean range via the
-        precomputed per-pixel scale -> min-pool DA_POOL x DA_POOL (nearest surface
-        per output cell, matching DiffAero's one-ray-per-cell sampling). The policy
-        process applies depth = 1 - clamp(r,0,5)/5. Convention: row 0 = up,
-        col 0 = left (same as the DiffPhysDrone path)."""
+    def _publish_depth(self):
+        """Grab the camera's planar Z-depth (distance_to_image_plane), run the
+        policy's POLICY_DEPTH_PUBLISH pipeline, publish over UDP. Convention:
+        row 0 = up, col 0 = left, metres on the wire for every method."""
+        cfg = POLICY_DEPTH_PUBLISH[self.policy]
         cam, full_set = self._camera_ready()
         if cam is None or not full_set:
             return
@@ -1020,127 +838,33 @@ class PegasusApp:
         depth = np.asarray(depth, dtype=np.float32)
         if depth.size == 0:
             return
-        depth = np.nan_to_num(depth, nan=DA_MAX_DIST, posinf=DA_MAX_DIST, neginf=DA_MAX_DIST)
-        self._depth_pub.send(depth)
-        self._dump_depth_debug(depth)
-        self._record_depth_video_frame(depth)
-
-    def _publish_depth_depthnav(self):
-        """Publish the 72x128 RAW planar metric depth depthnav expects.
-
-        Resize the camera's planar Z-depth (distance_to_image_plane) to exactly
-        (72, 128) and send it in metres -- depthnav_policy clamps to [0.25, 20]
-        and inverts internally, so we do NO normalization or pooling here.
-        Convention: row 0 = up, col 0 = left (same as the other paths)."""
-        cam, full_set = self._camera_ready()
-        if cam is None or not full_set:
-            return
-        depth = cam.get_depth()
-        if depth is None:
-            return
-        depth = np.asarray(depth, dtype=np.float32)
-        if depth.size == 0:
-            return
-        # Replace inf / nan / no-return with the far value.
-        depth = np.nan_to_num(depth, nan=DN_FAR, posinf=DN_FAR, neginf=DN_FAR)
-        if depth.shape != (DN_RENDER_H, DN_RENDER_W):
-            # Nearest-neighbour resize to the exact policy resolution (72x128).
-            yi = (np.linspace(0, depth.shape[0] - 1, DN_RENDER_H)).astype(np.int64)
-            xi = (np.linspace(0, depth.shape[1] - 1, DN_RENDER_W)).astype(np.int64)
-            depth = depth[yi][:, xi]
-        self._depth_pub.send(depth)
-        self._dump_depth_debug(depth)
-        self._record_depth_video_frame(depth)
-
-    def _publish_depth_agile(self):
-        """Publish the 224x224 RAW planar metric depth Agile Autonomy expects.
-
-        BILINEAR-downsample the VGA-class camera render (distance_to_image_plane)
-        to exactly (AG_NET_SIZE, AG_NET_SIZE) = 224 and send it in metres --
-        this reproduces Loquercio's training loader (cv2.resize of VGA SGM depth
-        to 224), rather than rendering at 84 and letting the net upsample. The
-        offboard's wrapper/agile_core.py does the mm/80 encoding, so NO
-        normalization/pooling here. The frame is shipped zlib-compressed
-        (compress=True) because a raw 224x224 float32 (200 KB) exceeds the UDP
-        datagram cap. Convention: row 0 = up, col 0 = left (as the other paths)."""
-        cam, full_set = self._camera_ready()
-        if cam is None or not full_set:
-            return
-        depth = cam.get_depth()
-        if depth is None:
-            return
-        depth = np.asarray(depth, dtype=np.float32)
-        if depth.size == 0:
-            return
-        # Replace inf / nan / no-return with the far value, then cap at AG_FAR
-        # BEFORE resizing -- the training loader did np.minimum(depth, 20000)
-        # ahead of cv2.resize, so far pixels don't bleed large values across an
-        # obstacle edge during interpolation.
-        depth = np.nan_to_num(depth, nan=AG_FAR, posinf=AG_FAR, neginf=AG_FAR)
-        depth = np.clip(depth, 0.0, AG_FAR)
-        # Bilinear downsample to the net's 224x224 input (matches training's
-        # cv2.resize; INTER_LINEAR is cv2.resize's default, what the loader used).
-        if depth.shape != (AG_NET_SIZE, AG_NET_SIZE):
-            depth = cv2.resize(depth, (AG_NET_SIZE, AG_NET_SIZE),
-                               interpolation=cv2.INTER_LINEAR)
-        # Optional flip to match upstream agile_autonomy, whose depth callback does
-        # cv2.flip(depth, -1) (both axes; the sensor was mounted inverted). The net
-        # was trained on that convention. "both" == cv2.flip(-1); "v"/"h" isolate an
-        # axis for A/B testing left-right vs up-down misregistration.
-        if self._agile_depth_flip == "both":
-            depth = depth[::-1, ::-1]
-        elif self._agile_depth_flip == "v":
-            depth = depth[::-1, :]
-        elif self._agile_depth_flip == "h":
-            depth = depth[:, ::-1]
-        depth = np.ascontiguousarray(depth)
-        self._last_agile_depth = depth
-        self._depth_pub.send(depth, compress=True)
-        self._dump_depth_debug(depth)
-        self._record_depth_video_frame(depth)
-
-    def _publish_depth_gsds(self):
-        """Publish the 224x224 planar metric depth + JPEG RGB for gsds students.
-
-        The camera renders natively at GS_SIZE so no resize is needed. Depth:
-        far/no-return pixels -> GS_FAR (100 m, the student's DEPTH_HI), shipped
-        zlib-u16-mm compressed (saturates at 65.535 m on the wire; the offboard
-        remaps >= 65 m back to 100 m before the net's log encoding). RGB: the
-        SAME camera's render product, shipped JPEG (RgbPublisher, port 15002).
-        Convention: row 0 = up, col 0 = left (as the other paths)."""
-        cam, full_set = self._camera_ready()
-        if cam is None or not full_set:
-            return
-        depth = cam.get_depth()
-        if depth is None:
-            return
-        depth = np.asarray(depth, dtype=np.float32)
-        if depth.size == 0:
-            return
-        depth = np.nan_to_num(depth, nan=GS_FAR, posinf=GS_FAR, neginf=GS_FAR)
-        depth = np.clip(depth, 0.0, GS_FAR)
-        if depth.shape != (GS_SIZE, GS_SIZE):
-            depth = cv2.resize(depth, (GS_SIZE, GS_SIZE),
-                               interpolation=cv2.INTER_LINEAR)
-        depth = np.ascontiguousarray(depth)
-        self._depth_pub.send(depth, compress=True)
-
-        if self._rgb_pub is not None:
-            try:
-                rgb = cam.get_rgb()
-            except Exception:
-                rgb = None
-            if rgb is not None:
-                rgb = np.asarray(rgb)
-                if rgb.ndim == 3 and rgb.shape[2] >= 3 and rgb.size:
-                    rgb = rgb[:, :, :3]
-                    if rgb.dtype != np.uint8:
-                        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-                    if rgb.shape[:2] != (GS_SIZE, GS_SIZE):
-                        rgb = cv2.resize(rgb, (GS_SIZE, GS_SIZE),
-                                         interpolation=cv2.INTER_LINEAR)
-                    self._rgb_pub.send(rgb)
-
+        far = cfg["far"]
+        depth = np.nan_to_num(depth, nan=far, posinf=far, neginf=far)
+        if cfg["clip"]:
+            depth = np.clip(depth, 0.0, far)
+        out = cfg["out"]
+        if out is not None and depth.shape != out:
+            if cfg["interp"] == "bilinear":
+                depth = cv2.resize(depth, (out[1], out[0]),
+                                   interpolation=cv2.INTER_LINEAR)
+            else:
+                # Nearest-neighbour resize to the exact policy resolution.
+                yi = (np.linspace(0, depth.shape[0] - 1, out[0])).astype(np.int64)
+                xi = (np.linspace(0, depth.shape[1] - 1, out[1])).astype(np.int64)
+                depth = depth[yi][:, xi]
+        if self.policy == "agile":
+            # Optional flip to match upstream agile_autonomy, whose depth
+            # callback does cv2.flip(depth, -1) (both axes; the sensor was
+            # mounted inverted). "v"/"h" isolate one axis for A/B tests.
+            if self._agile_depth_flip == "both":
+                depth = depth[::-1, ::-1]
+            elif self._agile_depth_flip == "v":
+                depth = depth[::-1, :]
+            elif self._agile_depth_flip == "h":
+                depth = depth[:, ::-1]
+            depth = np.ascontiguousarray(depth)
+            self._last_agile_depth = depth
+        self._depth_pub.send(depth, compress=cfg["compress"])
         self._dump_depth_debug(depth)
         self._record_depth_video_frame(depth)
 
@@ -1170,8 +894,8 @@ class PegasusApp:
             ncols = 2 if rgb is not None else 1
             fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4.5), squeeze=False)
 
-            depth_vmax = {"diffaero": DA_MAX_DIST, "agile": AG_FAR,
-                          "gsds": 30.0, "gsds_depth": 30.0}.get(self.policy, 24.0)
+            depth_vmax = {"diffaero": DA_MAX_DIST,
+                          "agile": AG_FAR}.get(self.policy, 24.0)
             ax = axes[0][0]
             im = ax.imshow(depth, origin="upper", cmap="turbo", vmin=0.3, vmax=depth_vmax)
             fig.colorbar(im, ax=ax, label="range [m]" if self.policy == "diffaero" else "depth [m]")
@@ -1342,10 +1066,10 @@ class PegasusApp:
                    per-pixel ray scale, min-pool DA_POOL x DA_POOL -> 9x16
                    (crop is the whole image: the camera renders exactly the
                    training FOV). The net sees 1 - clamp(r,0,5)/5 of this grid.
-        diffphys:  clamp(0.3, 24) then 4x4 pool of 48x64 -> 12x16 (the policy's
-                   max-pool of 3/d is a min-pool of distance).
         depthnav:  the 72x128 planar clamped to [near, far] -- the network
-                   inverts + maxpools INTERNALLY, so its input is this grid."""
+                   inverts + maxpools INTERNALLY, so its input is this grid.
+        agile:     the raw 224x224 planar depth (mm/80 encoding is monotone in
+                   this grid), so this IS the policy's input view."""
         if self.policy == "diffaero":
             if self._da_euclid_scale is None:
                 u = np.arange(DA_RENDER_W, dtype=np.float32)
@@ -1360,18 +1084,7 @@ class PegasusApp:
             return d, DA_MAX_DIST
         if self.policy == "depthnav":
             return np.clip(depth, DN_NEAR, DN_FAR), DN_FAR
-        if self.policy == "agile":
-            # The net consumes the raw 224x224 planar depth (mm/80 encoding is
-            # monotone in this grid), so this IS the policy's input view.
-            return np.clip(depth, 0.0, AG_FAR), AG_FAR
-        if self.policy in ("gsds", "gsds_depth"):
-            # The net consumes the 224x224 planar depth log-encoded to
-            # [0.3, 100]; vmax 30 keeps near-field obstacle structure visible
-            # in the colormap (100 would flatten everything interesting).
-            return np.clip(depth, 0.0, 30.0), 30.0
-        d = np.clip(depth, 0.3, 24.0)
-        d = d.reshape(RENDER_H // 4, 4, RENDER_W // 4, 4).min(axis=(1, 3))
-        return d, 24.0
+        return np.clip(depth, 0.0, AG_FAR), AG_FAR
 
     def _record_depth_video_frame(self, depth):
         """Append one turbo-colormap frame of the policy-input depth grid
@@ -1510,10 +1223,7 @@ class PegasusApp:
             if (getattr(self, "obstacle_assets", False)
                     and _os.environ.get("GSDS_SKIP_OBST_SAMPLING", "0") != "1"):
                 try:
-                    _cmp = str(Path(__file__).resolve().parent / "compare")
-                    if _cmp not in sys.path:
-                        sys.path.insert(0, _cmp)
-                    from mesh_sampling import sample_subtree
+                    from superfly.perception.mesh_sampling import sample_subtree
                     S, meta = sample_subtree(self.world.stage, "/World/obstacles",
                                              sample_h=0.05)
                     if S.shape[0]:
@@ -1618,16 +1328,11 @@ def main():
     parser.add_argument("--spawn-yaw", type=float, default=0.0,
                         help="Spawn yaw [deg]. EKF heading is mag-locked in sim, so this "
                              "mainly affects the initial facing; the field is rotated instead.")
-    parser.add_argument("--policy", choices=["diffphys", "diffaero", "depthnav", "agile",
-                                             "gsds", "gsds_depth"],
-                        default="diffphys",
+    parser.add_argument("--policy", choices=sorted(POLICY_CAMERAS), required=True,
                         help="Which policy's camera/depth pipeline to configure: "
-                             "diffphys (12x16, 78.6 deg, 24 m, planar, pitched 20 deg down), "
                              "diffaero (9x16, 86 deg, 5 m, Euclidean, forward), "
-                             "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward), "
-                             "agile (640x480 render -> 224x224, 91 deg, 20 m, planar, forward), or "
-                             "gsds/gsds_depth (gs_drone_sim students: 224x224 native, 90 deg, "
-                             "100 m, planar depth + JPEG RGB, forward).")
+                             "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward), or "
+                             "agile (640x480 render -> 224x224, 91 deg, 20 m, planar, forward).")
     parser.add_argument("--obstacles", choices=["diffphys", "diffaero", "none"], default="diffphys",
                         help="Obstacle-field distribution: diffphys, diffaero, or none "
                              "(scene geometry only, no procedural primitives).")
@@ -1637,7 +1342,7 @@ def main():
                              "training-matched layout but with real geometry. Assets that don't "
                              "resolve on Nucleus fall back to the analytic primitive.")
     parser.add_argument("--auto-stop", action="store_true",
-                        help="Watch for diffaero_offboard.py/diffdrone_offboard.py exiting "
+                        help="Watch for the method's *_offboard.py exiting "
                              "(via a sentinel file each writes on exit, any reason) and stop "
                              "this sim's loop automatically through its normal exit path. "
                              "Safer than Ctrl-C, which races Isaac's own SIGINT teardown.")

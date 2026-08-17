@@ -79,8 +79,10 @@ from pxr import Usd, UsdGeom, Gf                       # noqa: E402
 # tree canopy was invisible to v1 clearance scoring (ATTEMPTS 2026-07-29).
 EXTRACTOR_VERSION = 2
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import mesh_sampling                                   # noqa: E402
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+from superfly.perception import mesh_sampling          # noqa: E402
 
 
 def gather_world_triangles(stage):
