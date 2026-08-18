@@ -150,28 +150,36 @@ def _walk_usd_files(root, depth=4):
 
 
 _SKIP_PAT = ("/materials/", "/textures/", "/props/", "/looks/", "/skies/",
-             "_mat.", "_material")
+             "/assets/", "/subusds/", "/archive/", "/engine/", "_mat.",
+             "_material")
 
 
 def build_catalog(nucleus_roots, include_isaac_envs):
-    """One entry per scene: within each leaf directory prefer '*stage*' files,
-    else the largest .usd (asset libraries keep parts/materials alongside)."""
+    """ONE entry per top-level scene folder under each root (personal work
+    dirs like Muyang/ or Dmytro/ hold dozens of asset .usd files in subtrees
+    -- those are parts, not scenes). Within a folder prefer, in order:
+    '*stage*' basenames, shallower depth, larger size."""
     catalog = []
     for root in nucleus_roots:
+        rootp = root.rstrip("/")
         files = _walk_usd_files(root)
-        by_dir = {}
+        groups = {}
         for url, size in files:
             if any(p in url.lower() for p in _SKIP_PAT):
                 continue
-            by_dir.setdefault(url.rsplit("/", 1)[0], []).append((url, size))
-        for d, fs in sorted(by_dir.items()):
-            staged = [f for f in fs if "stage" in f[0].rsplit("/", 1)[1].lower()]
-            pick = sorted(staged or fs, key=lambda f: -f[1])[0]
-            name = d[len(root.rstrip("/")):].strip("/").replace("/", "_") or \
-                Path(pick[0]).stem
+            rel = url[len(rootp):].strip("/")
+            top = rel.split("/", 1)[0]          # scene folder, or root-level file
+            groups.setdefault(top, []).append((url, size, rel.count("/")))
+        for top, fs in sorted(groups.items()):
+            def rank(f):
+                url, size, depth = f
+                staged = "stage" in url.rsplit("/", 1)[1].lower()
+                return (not staged, depth, -size)
+            pick = sorted(fs, key=rank)[0]
+            name = top[:-len(Path(top).suffix)] if "." in top else top
             catalog.append({"name": name, "usd": pick[0], "size": pick[1],
                             "source": root,
-                            "siblings": [f[0] for f in fs if f[0] != pick[0]]})
+                            "siblings": [f[0] for f in fs if f[0] != pick[0]][:20]})
     if include_isaac_envs:
         from pegasus.simulator.params import SIMULATION_ENVIRONMENTS
         for name, url in sorted(SIMULATION_ENVIRONMENTS.items()):
