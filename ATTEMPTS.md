@@ -4,6 +4,35 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-08-18 — Scene vetting pipeline (audit + planar goal mining) — SHIPPED (pilot); Nucleus sweep PENDING on auth
+
+`scripts/scene_audit.py` (airstation03, Isaac python) + `scripts/
+mine_scene_goals.py` / `superfly.perception.occupancy` (gs2) + `docs/
+scene_vetting.md`. Verified three ways before touching real scenes:
+- **Known-answer tests** (gs2, `usd-core`, no GPU): a synthetic stage
+  (cm units, nested xform, instanceable reference, PointInstancer) through
+  the REAL `mesh_sampling` -> extract-npz -> `metrics.score_trajectory`
+  path reproduces hand-computed numbers (gap clearance 0.8 m ±h, wall
+  crossing collides, 0.15 m ground skim does NOT — filter semantics).
+  19 tests in `tests/`, run with the repo venv.
+- **Pilot** on `isaac_Full_Warehouse` (public NVIDIA S3, no auth): full
+  audit 37 s warm; drop test 3/3 rest at exactly floor+radius (colliders
+  verified physically — `scene_setup.add_colliders` is now the SHARED impl
+  the flight harness also calls); depth probe 100% finite 15–32 m;
+  mining found 122 gated pairs, 3 selected across difficulty percentiles.
+- **Pilot caught a real bug**: dominant-ground-mode picked the warehouse
+  CEILING (9.1 m) — in any roofed scene ceiling+roof out-sample the floor.
+  Fixed: ground = lowest bin holding ≥25% of the max bin. Also: stock
+  NVIDIA stages ship ~3.4k authored colliders + their own PhysicsScene
+  (FLAGged); the negative control must STRIP authored collision APIs or
+  it is vacuous.
+Blockers/next: **Nucleus auth on airstation03 is EXPIRED** (omni.client
+Auth error 5) — the airlab Library/Stages sweep needs an OMNI_API_TOKEN
+(Navigator) or interactive re-login; the token would also decide the OSMO
+fan-out probe (see 2026-07 omniverse://-in-OSMO ESTABLISHED-NEGATIVE — the
+token path postdates it and is untested). Disk on airstation03 at 97%
+(pilot ran with `--force`, outputs capped ~60 MB/scene).
+
 ## 2026-08-17 — pmv (velocity-command) dynamics re-implemented in the fork — SHIPPED
 
 Goal shift: deployments now want **PX4 velocity setpoints, planar at
