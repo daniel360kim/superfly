@@ -1,0 +1,12 @@
+- env=oa
+- algo=sha2c
+- dynamics=pmv_planar
+- sensor=camera
+- network=mlp
+- env.max_target_vel=1.5
+- env.min_target_vel=0.8
+- env.max_time=60
+- env.r_drone=0.3
+- env.n_obstacles=40
+- n_updates=2000
+- save_freq=200

@@ -1,0 +1,459 @@
+Timer unit: 0.001 s
+
+Total time: 730.39 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/utils/runner.py
+Function: TrainRunner.run at line 119
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   119                                               def run(self):
+   120                                                   """Start training."""
+   121                                                   # make progress bars to display on different rows in multirun mode
+   122         1        651.5    651.5      0.1          obs = self.env.reset()
+   123         1          0.1      0.1      0.0          on_step_cb = display_image if self.cfg.display_image else None
+   124         1          0.0      0.0      0.0          if self.torch_profiler is not None:
+   125                                                       self.torch_profiler.start()
+   126      2001        181.0      0.1      0.0          for i in self.logger.pbar:
+   127      2000          0.8      0.0      0.0              if self.torch_profiler is not None:
+   128                                                           self.torch_profiler.step()
+   129      2000          0.8      0.0      0.0              t1 = self.logger.pbar._time()
+   130      2000         46.6      0.0      0.0              self.env.detach()
+   131      2000     727389.0    363.7     99.6              obs, policy_info, env_info, losses, grad_norms = self.agent.step(self.cfg, self.env, self.logger, obs, on_step_cb=on_step_cb)
+   132      2000          3.1      0.0      0.0              l_episode = env_info["stats"].get("l_episode", 0.)
+   133      2000          0.7      0.0      0.0              success_rate = env_info["stats"].get("success_rate", 0.)
+   134      2000          0.5      0.0      0.0              survive_rate = env_info["stats"].get("survive_rate", 0.)
+   135      4000        408.8      0.1      0.1              self.logger.pbar.set_postfix({
+   136      2000         13.4      0.0      0.0                  "loss": f"{env_info['loss_components']['total_loss']:6.3f}",
+   137      2000          1.3      0.0      0.0                  "l_episode": f"{l_episode:4.1f}",
+   138      2000          2.0      0.0      0.0                  "success_rate": f"{success_rate:.2f}",
+   139      2000          0.6      0.0      0.0                  "survive_rate": f"{survive_rate:.2f}",
+   140      2000       1517.4      0.8      0.2                  "fps": f"{int(self.cfg.l_rollout*self.cfg.n_envs/(self.logger.pbar._time()-t1)):,d}"})
+   141      2000         44.2      0.0      0.0              if i % self.cfg.log_freq == 0:
+   142       200          0.4      0.0      0.0                  log_info = {
+   143       200          0.0      0.0      0.0                      "env_loss": env_info["loss_components"],
+   144       200          0.0      0.0      0.0                      "agent_loss": losses,
+   145       200          0.0      0.0      0.0                      "agent_grad_norm": grad_norms,
+   146       200          0.0      0.0      0.0                      "metrics": env_info["stats"]
+   147                                                           }
+   148       200          0.1      0.0      0.0                  if "WorldModel/state_total_loss" in policy_info.keys():
+   149                                                               log_info.update({k: v for k, v in policy_info.items() if k.startswith("WorldModel")})
+   150       200        122.7      0.6      0.0                  self.logger.log_scalars(log_info)
+   151                                                       
+   152      2000          1.4      0.0      0.0              if success_rate >= self.max_success_rate:
+   153       156          0.0      0.0      0.0                  self.max_success_rate = success_rate
+   154       156          2.9      0.0      0.0                  if i > 0 and i % self.cfg.save_freq == 0:
+   155                                                               self.agent.save(os.path.join(self.logger.logdir, "best"))
+
+Total time: 62.5752 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/env/obstacle_avoidance.py
+Function: ObstacleAvoidance.reset_idx at line 311
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   311                                               @timeit
+   312                                               def reset_idx(self, env_idx):
+   313     33494      10533.6      0.3     16.8          self.randomizer.refresh(env_idx)
+   314     33494       4736.4      0.1      7.6          self.imu.reset_idx(env_idx)
+   315     33494        150.4      0.0      0.2          n_resets = len(env_idx)
+   316     33494        165.8      0.0      0.3          state_mask = torch.zeros_like(self.dynamics._state, dtype=torch.bool)
+   317     33494        445.6      0.0      0.7          state_mask[env_idx] = True
+   318                                                   
+   319     33494         82.5      0.0      0.1          L = self.L.unsqueeze(-1)
+   320     33494        524.7      0.0      0.8          xy_min, xy_max = -L+0.5, L-0.5
+   321     33494        656.7      0.0      1.0          z_min, z_max = -self.height_scale*L+0.5, self.height_scale*L-0.5
+   322    100482        257.5      0.0      0.4          p_new = torch.cat([
+   323     33494        806.6      0.0      1.3              torch.rand((self.n_envs, 2), device=self.device) * (xy_max - xy_min) + xy_min,
+   324     33494        618.1      0.0      1.0              torch.rand((self.n_envs, 1), device=self.device) * (z_max - z_min) + z_min
+   325     33494          2.7      0.0      0.0          ], dim=-1)
+   326     33494        414.5      0.0      0.7          self.init_pos[env_idx] = p_new[env_idx]
+   327     33494        413.7      0.0      0.7          new_state = torch.cat([p_new, torch.zeros(self.n_envs, self.dynamics.state_dim-3, device=self.device)], dim=-1)
+   328     33494          9.5      0.0      0.0          if self.dynamic_type == "quadrotor":
+   329                                                       new_state[:, 6] = 1 # real part of the quaternion
+   330     33494          4.9      0.0      0.0          elif self.dynamic_type == "pointmass":
+   331                                                       new_state[:, -1] = 9.8
+   332                                                   # pointmass_vel: state is [p, v]; zero velocity init needs no patching
+   333     33494        299.9      0.0      0.5          self.dynamics._state = torch.where(state_mask, new_state, self.dynamics._state)
+   334     33494       1966.3      0.1      3.1          self.dynamics.reset_idx(env_idx)
+   335                                                   
+   336                                                   # min_init_dist = 1.2 * self.L
+   337     33494         10.9      0.0      0.0          if self.dynamic_type == "pointmass_vel" and self.dynamics.planar:
+   338                                                       # Targets are flattened to the drone's spawn altitude below, so
+   339                                                       # the 3-D half-diagonal is unreachable from a centered spawn
+   340                                                       # (max planar distance ~= sqrt(2) * half-span). Half the XY span
+   341                                                       # is achievable from anywhere in the box.
+   342     33494        554.2      0.0      0.9              min_init_dist = (xy_max - xy_min - 1) / 2  # [n_envs, 1]
+   343                                                   else:
+   344                                                       min_init_dist = ( # [n_envs, 1]
+   345                                                           ((xy_max - xy_min - 1) / 2) ** 2 +
+   346                                                           ((xy_max - xy_min - 1) / 2) ** 2 +
+   347                                                           ((z_max - z_min - 1) / 2) ** 2
+   348                                                       ) ** 0.5
+   349                                                   # randomly select a target position that meets the minimum distance constraint
+   350     33494          5.6      0.0      0.0          N = 10
+   351     33494        319.3      0.0      0.5          linspace = torch.linspace(0, 1, N, device=self.device).unsqueeze(0)
+   352     33494        490.8      0.0      0.8          x = y = (xy_max - xy_min) * linspace + xy_min
+   353     33494        437.8      0.0      0.7          z = (z_max - z_min) * linspace + z_min
+   354                                                   
+   355     33494       2217.2      0.1      3.5          random_idx = torch.stack([torch.randperm(N**3, device=self.device) for _ in range(n_resets)], dim=0) # [n_resets, N**3]
+   356     33494        143.9      0.0      0.2          random_idx = random_idx.unsqueeze(-1).expand(-1, -1, 3) # [n_resets, N**3, 3]
+   357                                                   # indexing of meshgrid dosen't really matter here, explicitly setting to avoid warning
+   358    133976        729.8      0.0      1.2          xyz = torch.stack([
+   359     33494        383.3      0.0      0.6              x[env_idx].reshape(-1, N, 1, 1).expand(-1,-1, N, N),
+   360     33494        274.0      0.0      0.4              y[env_idx].reshape(-1, 1, N, 1).expand(-1, N,-1, N),
+   361     33494        272.1      0.0      0.4              z[env_idx].reshape(-1, 1, 1, N).expand(-1, N, N,-1)
+   362     66988        414.1      0.0      0.7          ], dim=-1).reshape(-1, N**3, 3).gather(dim=1, index=random_idx)
+   363     33494         11.4      0.0      0.0          if self.dynamic_type == "pointmass_vel" and self.dynamics.planar:
+   364                                                       # Planar policies cannot change altitude: flatten every target
+   365                                                       # candidate to the drone's spawn altitude BEFORE the validity
+   366                                                       # check so the min-distance constraint holds for the actual
+   367                                                       # (same-altitude) target.
+   368     33494        870.0      0.0      1.4              xyz[..., 2] = self.p[env_idx, None, 2]
+   369     33494       1638.5      0.0      2.6          valid = torch.gt((xyz - self.p[env_idx, None, :]).norm(dim=-1), min_init_dist[env_idx])
+   370                                                   
+   371     33494        980.3      0.0      1.6          valid_points = valid.nonzero()
+   372     33494       2250.8      0.1      3.6          point_index = torch.tensor([(valid_points[:, 0] == i).sum() for i in range(n_resets)]).roll(1, dims=0)
+   373     33494        144.3      0.0      0.2          point_index[0] = 0
+   374     33494        171.9      0.0      0.3          point_index = torch.cumsum(point_index, dim=0)
+   375     33494        578.1      0.0      0.9          chosen_points = valid_points[point_index]
+   376     33494        653.5      0.0      1.0          self.target_pos[env_idx] = xyz[chosen_points[:, 0], chosen_points[:, 1]]
+   377                                                   # check that all regenerated initial and target positions meet the minimal distance contraint
+   378     33494       1902.6      0.1      3.0          assert torch.all(((self.p - self.target_pos).norm(dim=-1) > min_init_dist.squeeze(-1))[env_idx]).item()
+   379                                           
+   380     33494          8.2      0.0      0.0          if self.dynamic_type == "pointmass_vel":
+   381                                                       # Start each episode facing its target, matching the deploy YAW
+   382                                                       # phase that hands over to the policy already goal-facing.
+   383     33494        696.5      0.0      1.1              rel = self.target_pos[env_idx] - self.p[env_idx]
+   384     33494        587.6      0.0      0.9              self.dynamics.set_yaw(env_idx, torch.atan2(rel[:, 1], rel[:, 0]))
+   385                                                   
+   386                                                   # randomize obstacles sizes, poses and positions
+   387     66988      21389.0      0.3     34.2          self.obstacle_manager.randomize_obstacles(
+   388     33494          8.8      0.0      0.0              env_spacing=self.L.value,
+   389     33494          3.2      0.0      0.0              env_idx=env_idx,
+   390     33494        118.8      0.0      0.2              drone_init_pos=self.p,
+   391     33494          3.5      0.0      0.0              target_pos=self.target_pos
+   392                                                   )
+   393                                                       
+   394     33494        590.5      0.0      0.9          self.progress[env_idx] = 0
+   395     33494        417.2      0.0      0.7          self.arrive_time[env_idx] = 0
+   396     33494        400.8      0.0      0.6          self.last_action[env_idx] = 0.
+   397    133976        782.4      0.0      1.3          self.max_vel[env_idx] = torch.rand(
+   398    100482         25.4      0.0      0.0              n_resets, device=self.device) * (self.max_target_vel - self.min_target_vel) + self.min_target_vel
+
+Total time: 24.2873 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/env/obstacle_avoidance.py
+Function: ObstacleAvoidance.get_observations at line 83
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    83                                               @timeit
+    84                                               def get_observations(self, with_grad=False):
+    85     64001         31.9      0.0      0.1          if self.obs_frame == "local":
+    86     64001      11654.2      0.2     48.0              target_vel = self.dynamics.world2local(self.target_vel)
+    87     64001       7085.2      0.1     29.2              _v = self.dynamics.world2local(self._v)
+    88                                                   elif self.obs_frame == "world":
+    89                                                       target_vel = self.target_vel
+    90                                                       _v = self._v
+    91                                                   
+    92     64001         20.2      0.0      0.1          if self.dynamic_type == "pointmass":
+    93                                                       obs = torch.cat([
+    94                                                           target_vel,
+    95                                                           self.dynamics.uz if self.obs_frame == "local" else self.q,
+    96                                                           _v,
+    97                                                       ], dim=-1)
+    98     64001         10.2      0.0      0.0          elif self.dynamic_type == "pointmass_vel":
+    99     64001        472.3      0.0      1.9              obs = torch.cat([target_vel, _v], dim=-1)
+   100                                                   else:
+   101                                                       obs = torch.cat([target_vel, self._q, _v], dim=-1)
+   102     64001         14.1      0.0      0.1          if self.last_action_in_obs:
+   103                                                       obs = torch.cat([obs, self.last_action], dim=-1)
+   104    192003       2116.0      0.0      8.7          obs = TensorDict({
+   105    128002        659.4      0.0      2.7              "state": obs, "perception": self.sensor_tensor.clone()}, batch_size=self.n_envs)
+   106     64001       2218.6      0.0      9.1          obs = obs if with_grad else obs.detach()
+   107     64001          5.3      0.0      0.0          return obs
+
+Total time: 725.9 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/algo/SHAC.py
+Function: SHA2C.step at line 327
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   327                                               @timeit
+   328                                               def step(self, cfg, env, logger, obs, on_step_cb=None):
+   329      2000          3.5      0.0      0.0          self.buffer.clear()
+   330      2000          0.8      0.0      0.0          if self.agent.is_rnn_based:
+   331                                                       self.rnn_state_buffer.clear()
+   332      2000       1408.2      0.7      0.2          self.clear_loss()
+   333     66000         13.9      0.0      0.0          for t in range(self.l_rollout):
+   334     64000      30490.0      0.5      4.2              action, policy_info = self.act(obs)
+   335     64000      27258.8      0.4      3.8              state = env.get_state()
+   336    128000        550.1      0.0      0.1              with torch.no_grad():
+   337     64000       9229.8      0.1      1.3                  value = self.agent.get_value(state)
+   338     64000     480664.7      7.5     66.2              next_obs, (loss, reward), terminated, env_info = env.step(env.rescale_action(action), next_state_before_reset=True)
+   339     64000      58251.3      0.9      8.0              next_value = self.record_loss(loss, policy_info, env_info, last_step=(t==cfg.l_rollout-1))
+   340    128000       4417.1      0.0      0.6              self.buffer.add(
+   341     64000          6.3      0.0      0.0                  obs=state,
+   342     64000         11.4      0.0      0.0                  sample=policy_info["sample"],
+   343     64000          9.2      0.0      0.0                  logprob=policy_info["logprob"],
+   344     64000          6.1      0.0      0.0                  loss=reward,
+   345     64000          5.6      0.0      0.0                  value=value,
+   346     64000          8.3      0.0      0.0                  next_done=env_info["reset"],
+   347     64000          5.8      0.0      0.0                  next_terminated=terminated,
+   348     64000          3.9      0.0      0.0                  next_value=next_value)
+   349     64000         52.7      0.0      0.0              self.reset(env_info["reset"])
+   350     64000        128.6      0.0      0.0              obs = next_obs
+   351     64000         13.8      0.0      0.0              if on_step_cb is not None:
+   352                                                           on_step_cb(
+   353                                                               obs=obs,
+   354                                                               action=action,
+   355                                                               policy_info=policy_info,
+   356                                                               env_info=env_info)
+   357      2000       3303.9      1.7      0.5          _, target_values = self.bootstrap_gae()
+   358      2000      92478.6     46.2     12.7          actor_losses, actor_grad_norms = self.update_actor()
+   359      2000      17266.1      8.6      2.4          critic_losses, critic_grad_norms = self.update_critic(target_values)
+   360      2000          3.7      0.0      0.0          self.detach()
+   361      2000        305.4      0.2      0.0          logger.log_scalar("value", value.mean().item())
+   362      2000          1.0      0.0      0.0          losses = {**actor_losses, **critic_losses}
+   363      2000          0.6      0.0      0.0          grad_norms = {**actor_grad_norms, **critic_grad_norms}
+   364      2000          0.5      0.0      0.0          return obs, policy_info, env_info, losses, grad_norms
+
+Total time: 51.4075 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/env/obstacle_avoidance.py
+Function: ObstacleAvoidance.get_state at line 70
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    70                                               @timeit
+    71                                               def get_state(self, with_grad=False):
+    72    128000      40888.8      0.3     79.5          dist2obstacles, nearest_points2obstacles = self.obstacle_manager.nearest_distance_to_obstacles(self.p.unsqueeze(1))
+    73    384000       1345.2      0.0      2.6          state = torch.cat([
+    74    128000        322.2      0.0      0.6              self.sensor_tensor.flatten(start_dim=-2),
+    75    128000       2347.1      0.0      4.6              (nearest_points2obstacles.squeeze(1) - self.p.unsqueeze(1)).flatten(start_dim=-2),
+    76    128000       1071.3      0.0      2.1              self.target_pos - self.p,
+    77    128000       4801.2      0.0      9.3              self.q,
+    78    128000        377.8      0.0      0.7              self._v,
+    79    128000        175.3      0.0      0.3              self._a if self.dynamic_type in ("pointmass", "pointmass_vel") else self._w,
+    80    128000         10.4      0.0      0.0          ], dim=-1)
+    81    128000         68.2      0.0      0.1          return state if with_grad else state.detach()
+
+Total time: 467.835 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/env/obstacle_avoidance.py
+Function: ObstacleAvoidance.step at line 120
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   120                                               @timeit
+   121                                               def step(self, action, next_obs_before_reset=False, next_state_before_reset=False):
+   122                                                   # type: (Tensor, bool, bool) -> Tuple[TensorDict, Tuple[Tensor, Tensor], Tensor, Dict[str, Union[Dict[str, Tensor], Tensor]]]
+   123     64000      84673.0      1.3     18.1          terminated, truncated, success, avg_vel = super()._step(action)
+   124     64000        287.4      0.0      0.1          reset = terminated | truncated
+   125     64000       1924.1      0.0      0.4          reset_indices = reset.nonzero().view(-1)
+   126     64000     130157.8      2.0     27.8          loss, reward, loss_components = self.loss_and_reward(action)
+   127     64000      91750.6      1.4     19.6          self.update_sensor_data()
+   128     64000         36.5      0.0      0.0          extra = {
+   129     64000          4.9      0.0      0.0              "truncated": truncated,
+   130     64000        406.3      0.0      0.1              "l": self.progress.clone(),
+   131     64000          6.5      0.0      0.0              "reset": reset,
+   132     64000          5.6      0.0      0.0              "reset_indices": reset_indices,
+   133     64000          5.6      0.0      0.0              "success": success,
+   134     64000        316.4      0.0      0.1              "arrive_time": self.arrive_time.clone(),
+   135     64000          5.4      0.0      0.0              "loss_components": loss_components,
+   136     64000         31.7      0.0      0.0              "stats_raw": {
+   137     64000      38102.0      0.6      8.1                  "success_rate": success[reset],
+   138     64000       1448.5      0.0      0.3                  "survive_rate": truncated[reset],
+   139     64000       2982.8      0.0      0.6                  "l_episode": ((self.progress.clone() - 1) * self.dt)[reset],
+   140     64000       1356.7      0.0      0.3                  "avg_vel": avg_vel[success],
+   141     64000       1654.3      0.0      0.4                  "arrive_time": self.arrive_time.clone()[success],
+   142                                                       },
+   143     64000        312.1      0.0      0.1              "sensor": self.sensor_tensor.clone()
+   144                                                   }
+   145     64000         10.4      0.0      0.0          if next_obs_before_reset:
+   146                                                       extra["next_obs_before_reset"] = self.get_observations(with_grad=True)
+   147     64000          8.0      0.0      0.0          if next_state_before_reset:
+   148     64000      25036.3      0.4      5.4              extra["next_state_before_reset"] = self.get_state(with_grad=True)
+   149     64000         47.5      0.0      0.0          if reset_indices.numel() > 0:
+   150     33493      62739.5      1.9     13.4              self.reset_idx(reset_indices)
+   151     64000      24525.7      0.4      5.2          return self.get_observations(), (loss, reward), terminated, extra
+
+Total time: 43.9006 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/env/obstacle_avoidance.py
+Function: ObstacleAvoidance.collision at line 400
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   400                                               @timeit
+   401                                               def collision(self) -> Tensor:
+   402    128000      37035.6      0.3     84.4          dist2obstacles, nearest_points2obstacles = self.obstacle_manager.nearest_distance_to_obstacles(self.p.unsqueeze(1))
+   403    128000       1641.4      0.0      3.7          min_dist2obstacle = dist2obstacles.squeeze(1).min(dim=-1).values
+   404    128000       1078.8      0.0      2.5          collision = min_dist2obstacle < self.r_drone # [n_envs]
+   405                                                   
+   406    128000         36.1      0.0      0.1          if self.z_ground_plane is not None:
+   407    128000       4097.1      0.0      9.3              collision = collision | (self.p[..., 2] - self.r_drone < self.z_ground_plane)
+   408                                                   
+   409    128000         11.7      0.0      0.0          return collision
+
+Total time: 129.243 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/env/obstacle_avoidance.py
+Function: ObstacleAvoidance.loss_and_reward at line 168
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   168                                               @timeit
+   169                                               def loss_and_reward(self, action):
+   170                                                   # type: (Tensor) -> Tuple[Tensor, Tensor, Dict[str, float]]
+   171     64000         19.5      0.0      0.0          inflation = 0.2
+   172                                                   # calculate the nearest points on the obstacles to the drone
+   173     64000      18728.2      0.3     14.5          dist2obstacles, nearest_points2obstacles = self.obstacle_manager.nearest_distance_to_obstacles(self.p.unsqueeze(1))
+   174     64000        617.5      0.0      0.5          self.obstacle_nearest_points.copy_(nearest_points2obstacles.squeeze(1)) # [n_envs, n_obstacles, 3]
+   175     64000       2899.2      0.0      2.2          obstacle_reldirection = F.normalize(nearest_points2obstacles.squeeze(1) - self.p.unsqueeze(1), dim=-1) # [n_envs, n_obstacles, 3]
+   176                                                   
+   177     64000        940.1      0.0      0.7          dist2surface_inflated = (dist2obstacles.squeeze(1) - (self.r_drone + inflation)).clamp(min=0)
+   178     64000        686.2      0.0      0.5          dangerous_factor = dist2surface_inflated.neg().exp()
+   179                                                   # calculate the obstacle avoidance loss
+   180     64000       1485.4      0.0      1.1          approaching_vel = torch.sum(obstacle_reldirection * self._v.unsqueeze(1), dim=-1) # [n_envs, n_obstacles]
+   181     64000        487.2      0.0      0.4          approaching = approaching_vel > 0
+   182     64000       1819.8      0.0      1.4          avoiding_vel = torch.norm(self._v.unsqueeze(1) - approaching_vel.detach().unsqueeze(-1) * obstacle_reldirection, dim=-1) # [n_envs, n_obstacles]
+   183     64000       2344.7      0.0      1.8          approaching_penalty, most_dangerous = (torch.where(approaching, approaching_vel, 0.) * dangerous_factor).max(dim=-1) # [n_envs]
+   184     64000       1009.4      0.0      0.8          avoiding_reward = torch.where(approaching, avoiding_vel, 0.) * dangerous_factor # [n_envs, n_obstacles]
+   185     64000       1531.0      0.0      1.2          avoiding_reward = avoiding_reward[torch.arange(self.n_envs, device=self.device), most_dangerous] # [n_envs]
+   186     64000        787.3      0.0      0.6          oa_loss = approaching_penalty - 0.5 * avoiding_reward
+   187                                                   
+   188     64000      22115.7      0.3     17.1          collision_loss = self.collision().float()
+   189     64000       2723.6      0.0      2.1          arrive_loss = 1 - torch.norm(self.p - self.target_pos, dim=-1).lt(0.5).float()
+   190                                           
+   191     64000         14.8      0.0      0.0          if self.dynamic_type == "pointmass_vel":
+   192                                                       # Velocity-command variant of the pointmass loss (reuses the
+   193                                                       # pointmass weight group, as the pre-reorg pmv runs did). The
+   194                                                       # jerk analog penalizes velocity commands far from the achieved
+   195                                                       # velocity -- the same shape as pmc's a_thrust-vs-action term.
+   196     64000       2451.6      0.0      1.9              pos_loss = 1 - (-(self._p - self.target_pos).norm(dim=-1)).exp()
+   197                                           
+   198     64000       3770.1      0.1      2.9              vel_diff = torch.norm(self.dynamics._vel_ema - self.target_vel, dim=-1)
+   199     64000       1644.4      0.0      1.3              vel_loss = F.smooth_l1_loss(vel_diff, torch.zeros_like(vel_diff), reduction="none")
+   200     64000       2611.3      0.0      2.0              z_loss = 1 - (-(self._p[..., 2] - self.target_pos[..., 2]).abs()).exp()
+   201                                           
+   202     64000         14.1      0.0      0.0              if self.dynamics.planar:
+   203     64000       1065.8      0.0      0.8                  action = torch.cat([action, torch.zeros_like(action[..., :1])], dim=-1)
+   204     64000         17.5      0.0      0.0              if self.dynamics.action_frame == "local":
+   205     64000       8243.1      0.1      6.4                  action = self.dynamics.local2world(action)
+   206    128000       2610.8      0.0      2.0              jerk_loss = F.mse_loss(self.dynamics.v, action, reduction="none").sum(dim=-1) + \
+   207     64000       2697.6      0.0      2.1                          F.mse_loss(torch.norm(self.dynamics.v, dim=-1), torch.norm(action, dim=-1), reduction="none") * 5
+   208     64000          6.4      0.0      0.0              total_loss = (
+   209    384000       5458.6      0.0      4.2                  self.loss_weights.pointmass.vel * vel_loss +
+   210     64000       2564.9      0.0      2.0                  self.loss_weights.pointmass.z * z_loss +
+   211     64000       2471.6      0.0      1.9                  self.loss_weights.pointmass.oa * oa_loss +
+   212     64000       2444.6      0.0      1.9                  self.loss_weights.pointmass.jerk * jerk_loss +
+   213     64000       2444.0      0.0      1.9                  self.loss_weights.pointmass.pos * pos_loss +
+   214     64000       2413.7      0.0      1.9                  self.loss_weights.pointmass.collision * collision_loss
+   215                                                       )
+   216     64000          7.1      0.0      0.0              total_reward = (
+   217    512000       3620.4      0.0      2.8                  self.reward_weights.constant -
+   218     64000       2426.7      0.0      1.9                  self.reward_weights.pointmass.z * z_loss -
+   219     64000       2444.7      0.0      1.9                  self.reward_weights.pointmass.vel * vel_loss -
+   220     64000       2427.1      0.0      1.9                  self.reward_weights.pointmass.oa * oa_loss -
+   221     64000       2416.0      0.0      1.9                  self.reward_weights.pointmass.jerk * jerk_loss -
+   222     64000       2412.0      0.0      1.9                  self.reward_weights.pointmass.pos * pos_loss -
+   223     64000       2378.5      0.0      1.8                  self.reward_weights.pointmass.arrive * arrive_loss -
+   224     64000       2372.9      0.0      1.8                  self.reward_weights.pointmass.collision * collision_loss
+   225     64000        260.2      0.0      0.2              ).detach()
+   226     64000         53.2      0.0      0.0              loss_components = {
+   227     64000       1499.9      0.0      1.2                  "vel_loss": vel_loss.mean().item(),
+   228     64000        767.0      0.0      0.6                  "z_loss": z_loss.mean().item(),
+   229     64000        714.2      0.0      0.6                  "pos_loss": pos_loss.mean().item(),
+   230     64000        705.5      0.0      0.5                  "arrive_loss": arrive_loss.mean().item(),
+   231     64000        723.3      0.0      0.6                  "jerk_loss": jerk_loss.mean().item(),
+   232     64000        712.0      0.0      0.6                  "collision_loss": collision_loss.mean().item(),
+   233     64000        727.5      0.0      0.6                  "oa_loss": oa_loss.mean().item(),
+   234     64000        706.1      0.0      0.5                  "total_loss": total_loss.mean().item(),
+   235     64000        717.7      0.0      0.6                  "total_reward": total_reward.mean().item()
+   236                                                       }
+   237                                                   elif self.dynamic_type == "pointmass":
+   238                                                       pos_loss = 1 - (-(self._p-self.target_pos).norm(dim=-1)).exp()
+   239                                                       
+   240                                                       vel_diff = torch.norm(self.dynamics._vel_ema - self.target_vel, dim=-1)
+   241                                                       vel_loss = F.smooth_l1_loss(vel_diff, torch.zeros_like(vel_diff), reduction="none")
+   242                                                       z_loss = 1 - (-(self._p[..., 2]-self.target_pos[..., 2]).abs()).exp()
+   243                                           
+   244                                                       if self.dynamics.action_frame == "local":
+   245                                                           action = self.dynamics.local2world(action)
+   246                                                       jerk_loss = F.mse_loss(self.dynamics.a_thrust, action, reduction="none").sum(dim=-1) + \
+   247                                                                   F.mse_loss(torch.norm(self.dynamics.a_thrust, dim=-1), torch.norm(action, dim=-1), reduction="none") * 5
+   248                                                       total_loss = (
+   249                                                           self.loss_weights.pointmass.vel * vel_loss +
+   250                                                           self.loss_weights.pointmass.z * z_loss +
+   251                                                           self.loss_weights.pointmass.oa * oa_loss +
+   252                                                           self.loss_weights.pointmass.jerk * jerk_loss +
+   253                                                           self.loss_weights.pointmass.pos * pos_loss +
+   254                                                           self.loss_weights.pointmass.collision * collision_loss
+   255                                                       )
+   256                                                       total_reward = (
+   257                                                           self.reward_weights.constant - 
+   258                                                           self.reward_weights.pointmass.z * z_loss -
+   259                                                           self.reward_weights.pointmass.vel * vel_loss -
+   260                                                           self.reward_weights.pointmass.oa * oa_loss -
+   261                                                           self.reward_weights.pointmass.jerk * jerk_loss -
+   262                                                           self.reward_weights.pointmass.pos * pos_loss -
+   263                                                           self.reward_weights.pointmass.arrive * arrive_loss -
+   264                                                           self.reward_weights.pointmass.collision * collision_loss
+   265                                                       ).detach()
+   266                                                       loss_components = {
+   267                                                           "vel_loss": vel_loss.mean().item(),
+   268                                                           "z_loss": z_loss.mean().item(),
+   269                                                           "pos_loss": pos_loss.mean().item(),
+   270                                                           "arrive_loss": arrive_loss.mean().item(),
+   271                                                           "jerk_loss": jerk_loss.mean().item(),
+   272                                                           "collision_loss": collision_loss.mean().item(),
+   273                                                           "oa_loss": oa_loss.mean().item(),
+   274                                                           "total_loss": total_loss.mean().item(),
+   275                                                           "total_reward": total_reward.mean().item()
+   276                                                       }
+   277                                                   else:
+   278                                                       pos_loss = -(-(self._p-self.target_pos).norm(dim=-1)).exp()
+   279                                                       
+   280                                                       vel_diff = (self._v - self.target_vel).norm(dim=-1)
+   281                                                       vel_loss = F.smooth_l1_loss(vel_diff, torch.zeros_like(vel_diff), reduction="none")
+   282                                                       
+   283                                                       jerk_loss = self._w.norm(dim=-1)
+   284                                                       
+   285                                                       total_loss = (
+   286                                                           self.loss_weights.quadrotor.vel * vel_loss +
+   287                                                           self.loss_weights.quadrotor.oa * oa_loss +
+   288                                                           self.loss_weights.quadrotor.jerk * jerk_loss +
+   289                                                           self.loss_weights.quadrotor.pos * pos_loss +
+   290                                                           self.loss_weights.quadrotor.collision * collision_loss
+   291                                                       )
+   292                                                       total_reward = (
+   293                                                           self.reward_weights.constant - 
+   294                                                           self.reward_weights.quadrotor.vel * vel_loss -
+   295                                                           self.reward_weights.quadrotor.oa * oa_loss -
+   296                                                           self.reward_weights.quadrotor.jerk * jerk_loss -
+   297                                                           self.reward_weights.quadrotor.pos * pos_loss -
+   298                                                           self.reward_weights.quadrotor.collision * collision_loss
+   299                                                       ).detach()
+   300                                                       loss_components = {
+   301                                                           "vel_loss": vel_loss.mean().item(),
+   302                                                           "pos_loss": pos_loss.mean().item(),
+   303                                                           "jerk_loss": jerk_loss.mean().item(),
+   304                                                           "collision_loss": collision_loss.mean().item(),
+   305                                                           "oa_loss": oa_loss.mean().item(),
+   306                                                           "total_loss": total_loss.mean().item(),
+   307                                                           "total_reward": total_reward.mean().item()
+   308                                                       }
+   309     64000         10.8      0.0      0.0          return total_loss, total_reward, loss_components
+
+Total time: 91.4459 s
+File: /osmo/run/workspace/superfly_stage/superfly/methods/diffaero/../diffaero/env/obstacle_avoidance.py
+Function: ObstacleAvoidance.update_sensor_data at line 109
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   109                                               @timeit
+   110                                               def update_sensor_data(self):
+   111     64000        429.0      0.0      0.5          z_ground_plane = -self.height_scale*self.L if self.ground_plane else None
+   112    128000      87790.6      0.7     96.0          sensory_data, contact_points = self.sensor(
+   113     64000          8.3      0.0      0.0              obstacle_manager=self.obstacle_manager,
+   114     64000        409.1      0.0      0.4              pos=self.p,
+   115     64000       2211.1      0.0      2.4              quat_xyzw=self.q,
+   116     64000          5.1      0.0      0.0              z_ground_plane=z_ground_plane
+   117                                                   )
+   118     64000        592.7      0.0      0.6          self.sensor_tensor.copy_(sensory_data)
+

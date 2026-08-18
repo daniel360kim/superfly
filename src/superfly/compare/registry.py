@@ -121,7 +121,9 @@ def method_registry():
             control_hz=30.0,
             goal_argc=2,
             python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "pmv_planar_starling_v1",
+            # v2: r_drone 0.3 (real Starling footprint) + n_obstacles 40
+            # for clearance margin; v1 (r_drone 0.2) flew 0.10-0.14 m clearances.
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "pmv_planar_starling_v2",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
