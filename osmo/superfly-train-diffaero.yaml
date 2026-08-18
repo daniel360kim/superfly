@@ -41,6 +41,16 @@ workflow:
       - -c
       - |
         set -ex
+        export DEBIAN_FRONTEND=noninteractive
+        # ---- system libs (~25 s, same mirror behavior as the eval job's
+        # set): taichi dlopens libX11, cv2 needs libGL+glib, open3d needs
+        # libGL/gomp. Without libX11 train.py dies at `import taichi`
+        # (superfly-train-diffaero-12). ----
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends \
+          libx11-6 libgl1 libglu1-mesa libegl1 libglx0 libopengl0 \
+          libxrender1 libxext6 libsm6 libice6 libgomp1 libatomic1 \
+          libglib2.0-0 > /dev/null
         cd /osmo/run/workspace
         tar -xf {{input:0}}/{{ data_tar }}
         STAGE=/osmo/run/workspace/superfly_stage
@@ -85,7 +95,13 @@ workflow:
         echo "TRAIN_DONE"
   resources:
     gpu_resource:
-      cpu: 8
+      # right-sized DOWN from the doc's 8/32Gi guidance: this trainer is a
+      # fully on-GPU sim (no dataloader workers); 2026-08-17 the shared
+      # nodes were CPU-starved by other tenants with 11/12 GPUs idle, and
+      # cpu=8 was exactly what kept the job unschedulable.
+      cpu: 2
       gpu: 1
-      memory: 32Gi
-      storage: 100Gi
+      memory: 16Gi
+      # 40Gi is ample (148 MB tarball + ~6 GB pip deps); 100Gi blocked
+      # scheduling on nodes short only on ephemeral-storage (2026-08-17).
+      storage: 40Gi
