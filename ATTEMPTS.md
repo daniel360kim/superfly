@@ -28,6 +28,25 @@ climb_alt 2, budgets sized for ~1 m/s). NOTE: fork push to GitHub was
 blocked in-session — `daniel360kim/diffaero` main is ahead of origin
 locally; push before relying on GitHub state.
 
+## 2026-08-18 — pmv_planar + pmc-starling trained on OSMO — SHIPPED
+
+`checkpoints/DiffAero/pmv_planar_starling_v1` (train-17, **sr 0.92 /
+survive 0.96**, targets 0.8–1.5 m/s, max_time 60, 2000 updates) and
+`sha2c_pmc_starling2max_v1` (train-18, sr 0.78 at 3–6 m/s) — both
+committed. It took runs 12→17 to get there; each failure is now fixed in
+`osmo/superfly-train-diffaero.yaml` + `scripts/train_diffaero.py`:
+- **cpu8/32Gi/100Gi was unschedulable for hours with 11/12 pool GPUs
+  idle** — the shared nodes are CPU/mem-starved by other tenants. This
+  trainer is a fully on-GPU sim: 2cpu/16Gi/40Gi schedules in ~2 min.
+  (The 8/32Gi umbrella-doc guidance is a ceiling for heavy jobs, not a
+  floor.)
+- taichi dlopens libX11 → apt set added (~25 s, eval-job pattern).
+- run_meta's `git rev-parse` died: no git in the image (try/except now).
+- the S3 mirror needs boto3 (not a diffaero dep; pip'd in the workflow).
+Eval: `superfly-eval-2`, suite planar_lowvel_v1, methods
+diffaero_vel_planar, --max-speed 1.2, tarball superfly_stage_0817f.tar
+(= 0817e sim payload + repo + the new checkpoint).
+
 ## 2026-08-17 — diffaero requirements.txt was missing einops — ESTABLISHED-NEGATIVE
 
 `import diffaero.algo` pulls `dreamerv3` → `einops`, but einops was never in
