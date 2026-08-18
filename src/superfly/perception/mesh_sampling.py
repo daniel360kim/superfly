@@ -303,6 +303,42 @@ def sample_surface(V, F, h):
     return np.concatenate(out) if out else np.zeros((0, 3))
 
 
+def triangle_normals_areas(V, F):
+    """Unit face normals (M,3) + areas (M,) of a triangle soup. Degenerate
+    faces get nan normals and ~0 area (filter on area > eps before using the
+    normals). Same math as extract_scene_mesh.py's local copy."""
+    e1 = V[F[:, 1]] - V[F[:, 0]]
+    e2 = V[F[:, 2]] - V[F[:, 0]]
+    n = np.cross(e1, e2)
+    nlen = np.linalg.norm(n, axis=1)
+    area = 0.5 * nlen
+    with np.errstate(invalid="ignore", divide="ignore"):
+        n = n / nlen[:, None]
+    return n, area
+
+
+def split_ground_faces(V, F, ground_deg: float = 30.0):
+    """(lateral_mask, ground_mask) over F, using the exact semantics the
+    clearance metric is documented with (docs/comparison_harness.md): faces
+    within `ground_deg` of horizontal (|normal_z| >= cos(ground_deg) --
+    terrain, floors, and also rooftops/ceilings) are 'ground-like' and
+    excluded from clearance; everything else is 'lateral' obstacle surface
+    (walls, trees, poles, facades). Degenerate faces land in neither mask."""
+    normals, area = triangle_normals_areas(V, F)
+    ok = area > 1e-12
+    ground_like = np.abs(normals[:, 2]) >= float(np.cos(np.radians(ground_deg)))
+    return ok & ~ground_like, ok & ground_like
+
+
+def estimated_samples(V, F, h):
+    """Predicted sample_surface count at spacing h (same formula as
+    extract_scene_mesh.py) -- used to coarsen h to a sample budget."""
+    max_edge = _max_edge(V, F)
+    tiny = max_edge <= h
+    k = np.ceil(max_edge[~tiny] / h)
+    return float(tiny.sum()) + float(((k + 1) * (k + 2) / 2).sum())
+
+
 def dedupe_samples(S, cell):
     """Collapse samples to one per `cell`-sized voxel."""
     if S.shape[0] == 0:
