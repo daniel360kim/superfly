@@ -195,8 +195,11 @@ def build_catalog(nucleus_roots, include_isaac_envs):
 
 def detect_env_scale(V, meters_per_unit):
     """Pick env_scale from {1.0, metersPerUnit, 0.01} by extent plausibility.
-    Returns (scale or None, [plausible scales], reason)."""
-    ext = V.max(0) - V.min(0)
+    Extent is the 0.5-99.5% vertex quantile span, NOT min/max: UE exports
+    carry km-scale sky spheres / backdrop geometry that blow up the raw AABB
+    at every candidate scale (AbandonedFactory & friends, sweep 2026-08-18).
+    Returns (scale or None, [plausible scales], reason, robust extent)."""
+    ext = np.quantile(V, 0.995, axis=0) - np.quantile(V, 0.005, axis=0)
     cands = []
     for s in dict.fromkeys([1.0, float(meters_per_unit or 1.0), 0.01]):
         xy = float(max(ext[0], ext[1])) * s
@@ -205,12 +208,12 @@ def detect_env_scale(V, meters_per_unit):
                 PLAUSIBLE_Z[0] <= z <= PLAUSIBLE_Z[1]:
             cands.append(s)
     if not cands:
-        return None, [], f"no plausible scale for extent {ext.round(1).tolist()}"
+        return None, [], f"no plausible scale for extent {ext.round(1).tolist()}", ext
     # prefer the authored metersPerUnit, then 1.0
     for pref in (float(meters_per_unit or 1.0), 1.0):
         if pref in cands:
-            return pref, cands, "authored" if pref != 1.0 else "unit"
-    return cands[0], cands, "fallback"
+            return pref, cands, "authored" if pref != 1.0 else "unit", ext
+    return cands[0], cands, "fallback", ext
 
 
 def scan_stage_flags(stage, max_prims=60_000):
@@ -257,15 +260,21 @@ def geometry_audit(entry, rep, scene_dir):
         rep["reasons"].append("FAIL:no_mesh_geometry")
         return None
 
-    scale, cands, why = detect_env_scale(V, rep["meters_per_unit"])
+    scale, cands, why, ext_units = detect_env_scale(V, rep["meters_per_unit"])
     rep["env_scale"], rep["scale_candidates"], rep["scale_reason"] = scale, cands, why
+    rep["robust_extent_units"] = ext_units.round(1).tolist()
     if scale is None:
         rep["reasons"].append("FAIL:implausible_scale")
         return None
     if len(cands) > 1:
         rep["reasons"].append(f"FLAG:scale_ambiguous_{cands}")
     V = V * scale
-    rep["aabb_m"] = [V.min(0).round(1).tolist(), V.max(0).round(1).tolist()]
+    # robust bounds (sky spheres excluded) -- the drop-test / camera code
+    # aims at this box's center, so it must be the SCENE, not the skybox
+    lo = np.quantile(V, 0.005, axis=0)
+    hi = np.quantile(V, 0.995, axis=0)
+    rep["aabb_m"] = [lo.round(1).tolist(), hi.round(1).tolist()]
+    rep["aabb_raw_m"] = [V.min(0).round(1).tolist(), V.max(0).round(1).tolist()]
 
     n_anim, phys, n_scanned = scan_stage_flags(stage)
     rep["time_sampled_xforms"], rep["authored_physics"] = n_anim, phys
