@@ -82,8 +82,14 @@ def main():
                          "check export.py's expected run-dir layout before "
                          "trusting this wrapper.")
 
-    sha = subprocess.run(["git", "-C", str(DIFFAERO), "rev-parse", "HEAD"],
-                         capture_output=True, text=True).stdout.strip()
+    try:
+        # git is absent in the OSMO training image; the artifact matters
+        # more than the provenance sha (superfly-train-diffaero-13 trained
+        # to sr 0.93 and then died right here).
+        sha = subprocess.run(["git", "-C", str(DIFFAERO), "rev-parse", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+    except FileNotFoundError:
+        sha = ""
     meta = dict(schema="superfly-run-meta-v1", method="diffaero",
                 artifact="checkpoints/exported_actor.pt2",
                 produced_by=f"scripts/train_diffaero.py --config {' '.join(args.config)}",
