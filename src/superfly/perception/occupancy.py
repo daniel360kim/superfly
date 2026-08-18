@@ -60,25 +60,42 @@ class PlanarSlice:
 
 
 def dominant_ground_z(ground_samples: np.ndarray, bin_m: float = 0.25,
-                      min_mode_frac: float = 0.25):
-    """The scene's WALKABLE ground elevation: the lowest substantial mode of
-    the ground-sample z histogram. ground_samples include rooftops and
-    ceilings, and in any roofed scene the ceiling+roof out-sample the floor --
-    the global mode is the ROOF (pilot finding, isaac_Full_Warehouse
-    2026-08-18: mode said z=9.1, the ceiling; the floor is z=0). So: take the
-    lowest bin holding >= min_mode_frac of the largest bin's count (floors and
-    ceilings have comparable area; incidental low ledges don't qualify).
-    Returns (z0, coverage_fraction_of_ground_samples within +-0.5 m of z0)."""
+                      window_m: float = 1.0, min_frac_of_best: float = 0.25,
+                      min_frac_total: float = 0.05):
+    """The scene's WALKABLE ground elevation. Two failure modes bound the
+    design (both hit on 2026-08-18):
+      - the global histogram mode is the ROOF in any roofed scene
+        (isaac_Full_Warehouse: mode said 9.1 m, floor is 0) -> prefer the
+        LOWEST qualifying level, not the biggest;
+      - UE exports carry a huge flat plane THOUSANDS of meters below the
+        scene (skybox bottom / kill-plane; -10015.6 m in CityPark AND
+        AbandonedWarehouse) holding only ~0.2% of ground samples, while
+        rolling terrain spreads the real ground over many small bins ->
+        a level only qualifies with REAL coverage: a window_m-wide slab
+        holding >= min_frac_total of ALL ground samples (and
+        >= min_frac_of_best of the best slab).
+    z0 = weighted center of the lowest qualifying slab. Returns (z0,
+    coverage fraction of ground samples within +-0.5 m of z0)."""
     z = np.asarray(ground_samples[:, 2], float)
     if z.size == 0:
         return None, 0.0
     zmin = float(z.min())
     idx = np.floor((z - zmin) / bin_m).astype(np.int64)
-    counts = np.bincount(idx)
-    qualifying = np.nonzero(counts >= min_mode_frac * counts.max())[0]
-    z0 = zmin + (int(qualifying[0]) + 0.5) * bin_m
+    counts = np.bincount(idx).astype(float)
+    k = max(1, int(round(window_m / bin_m)))
+    win = np.convolve(counts, np.ones(k), mode="same")
+    thresh = max(min_frac_of_best * win.max(), min_frac_total * counts.sum())
+    qual = np.nonzero(win >= thresh)[0]
+    if qual.size == 0:                       # degenerate: fall back to the mode
+        qual = np.array([int(np.argmax(win))])
+    i = int(qual[0])
+    lo, hi = max(0, i - k // 2), min(counts.size, i + k // 2 + 1)
+    centers = zmin + (np.arange(lo, hi) + 0.5) * bin_m
+    w = counts[lo:hi]
+    z0 = float(np.average(centers, weights=w)) if w.sum() > 0 else \
+        float(zmin + (i + 0.5) * bin_m)
     frac = float(np.mean(np.abs(z - z0) <= 0.5))
-    return float(z0), frac
+    return z0, frac
 
 
 def build_slice(samples: np.ndarray, ground_samples: np.ndarray,

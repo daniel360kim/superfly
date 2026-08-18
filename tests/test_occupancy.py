@@ -94,6 +94,21 @@ class TestDominantGround(unittest.TestCase):
         z0, _ = oc.dominant_ground_z(np.concatenate([ground, pit]))
         self.assertAlmostEqual(z0, 0.125, delta=0.3)
 
+    def test_deep_outlier_plane_does_not_qualify(self):
+        # UE skybox-bottom / kill-plane: a sparse flat plane thousands of
+        # meters below rolling terrain (CityPark/AbandonedWarehouse sweep
+        # finding: z0 snapped to -10015.6). Terrain z is SPREAD, so no single
+        # bin is large -- the absolute-coverage window must still reject the
+        # outlier and land on the terrain band.
+        rng = np.random.default_rng(0)
+        terrain = _grid_pts(0, 100, 0, 100, 0.0, h=0.6)
+        terrain[:, 2] = 12.0 + 3.0 * np.sin(terrain[:, 0] / 9.0) \
+            + rng.normal(0, 0.4, terrain.shape[0])          # rolling, z ~ 9-15
+        plane = _grid_pts(0, 100, 0, 100, -10015.6, h=12.0)  # ~0.25% of samples
+        z0, _ = oc.dominant_ground_z(np.concatenate([terrain, plane]))
+        self.assertGreater(z0, 8.0)
+        self.assertLess(z0, 16.0)
+
 
 class TestMining(unittest.TestCase):
 
