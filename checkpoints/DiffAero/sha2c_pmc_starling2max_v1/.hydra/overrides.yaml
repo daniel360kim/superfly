@@ -1,0 +1,13 @@
+- env=oa
+- algo=sha2c
+- dynamics=pmc
+- sensor=camera
+- dynamics.lmbda.default=13.9
+- dynamics.lmbda.min=11.8
+- dynamics.lmbda.max=18.2
+- dynamics.max_acc.xy.default=17.0
+- dynamics.max_acc.xy.min=15.0
+- dynamics.max_acc.xy.max=17.0
+- dynamics.max_acc.z.default=19.6
+- dynamics.max_acc.z.min=17.6
+- dynamics.max_acc.z.max=19.6

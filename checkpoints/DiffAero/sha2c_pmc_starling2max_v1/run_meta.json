@@ -1,0 +1,9 @@
+{
+  "schema": "superfly-run-meta-v1",
+  "method": "diffaero",
+  "artifact": "checkpoints/exported_actor.pt2",
+  "produced_by": "scripts/train_diffaero.py --config env=oa algo=sha2c dynamics=pmc sensor=camera dynamics.lmbda.default=13.9 dynamics.lmbda.min=11.8 dynamics.lmbda.max=18.2 dynamics.max_acc.xy.default=17.0 dynamics.max_acc.xy.min=15.0 dynamics.max_acc.xy.max=17.0 dynamics.max_acc.z.default=19.6 dynamics.max_acc.z.min=17.6 dynamics.max_acc.z.max=19.6",
+  "submodule_sha": "unknown",
+  "host": "321a0b7a87a14d78-6a4a40ffc6a84294",
+  "date": "2026-08-18T01:03:41+00:00"
+}

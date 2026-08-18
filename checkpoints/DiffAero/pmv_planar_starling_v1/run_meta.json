@@ -1,0 +1,9 @@
+{
+  "schema": "superfly-run-meta-v1",
+  "method": "diffaero",
+  "artifact": "checkpoints/exported_actor.pt2",
+  "produced_by": "scripts/train_diffaero.py --config env=oa algo=sha2c dynamics=pmv_planar sensor=camera network=mlp env.max_target_vel=1.5 env.min_target_vel=0.8 env.max_time=60 n_updates=2000 save_freq=200",
+  "submodule_sha": "unknown",
+  "host": "0063f1c5be224d4b-ee42cf84f008416d",
+  "date": "2026-08-18T01:09:27+00:00"
+}
