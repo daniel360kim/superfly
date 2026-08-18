@@ -80,7 +80,19 @@ simulation_app = SimulationApp({"headless": True})
 
 # Optional non-interactive Nucleus auth (same hook as extract_scene_mesh.py):
 # OMNI_API_TOKEN from an Omniverse Navigator API token. No-op if unset.
+# Convenience: when the env var is missing, ~/.omni_env ("export
+# OMNI_API_TOKEN=..." lines) is parsed directly -- dispatch layers (airstation
+# run -> ssh -> nice) mangle `bash -c 'source ...'` quoting too easily.
 import os                                              # noqa: E402
+if not os.environ.get("OMNI_API_TOKEN"):
+    _envf = Path.home() / ".omni_env"
+    if _envf.exists():
+        for _line in _envf.read_text().splitlines():
+            _line = _line.strip().removeprefix("export ").strip()
+            if _line.startswith("OMNI_API_TOKEN="):
+                os.environ["OMNI_API_TOKEN"] = _line.split("=", 1)[1].strip().strip("'\"")
+                print("[auth] OMNI_API_TOKEN loaded from ~/.omni_env")
+                break
 if os.environ.get("OMNI_API_TOKEN"):
     import omni.client                                 # noqa: E402
     omni.client.register_authentication_callback(
