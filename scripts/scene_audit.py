@@ -47,6 +47,9 @@ parser.add_argument("--nucleus", action="append", default=None,
 parser.add_argument("--isaac-environments", action="store_true",
                     help="also audit the stock Isaac/NVIDIA environments "
                          "(Pegasus SIMULATION_ENVIRONMENTS catalog)")
+parser.add_argument("--no-nucleus", action="store_true",
+                    help="skip the Nucleus roots (stock environments only -- "
+                         "e.g. while Nucleus auth is expired)")
 parser.add_argument("--catalog", default=None,
                     help="reuse an existing scene_catalog.json instead of listing")
 parser.add_argument("--list-only", action="store_true",
@@ -57,6 +60,11 @@ parser.add_argument("--resume", action="store_true",
                     help="skip scenes that already have a report.json")
 parser.add_argument("--no-drop-test", action="store_true",
                     help="geometry-only audit (no World/physics/rendering)")
+parser.add_argument("--negative-control", action="store_true",
+                    help="SKIP collider application before the drop test: every "
+                         "sphere must fall through and the scene must FAIL. "
+                         "Proves the drop test can catch broken colliders. "
+                         "Writes reports under <out>/_negative_control/.")
 parser.add_argument("--sample-h", type=float, default=0.2,
                     help="lateral sample spacing [m] for the mining npz (default 0.2)")
 parser.add_argument("--max-samples", type=float, default=3e6,
@@ -316,12 +324,17 @@ def sim_audit(entry, rep, scene_dir, z0):
     if scale != 1.0:
         UsdGeom.XformCommonAPI(layout).SetScale(Gf.Vec3f(scale, scale, scale))
     scene_setup.spawn_lighting()
-    t0 = time.time()
-    rep["n_colliders"] = scene_setup.add_colliders(stage, "/World/layout")
-    rep["collider_time_s"] = round(time.time() - t0, 1)
-    if not rep["n_colliders"]:
-        rep["reasons"].append("FAIL:zero_colliders")
-        return
+    if args.negative_control:
+        # deliberately broken setup: no colliders. The drop test MUST fail.
+        rep["n_colliders"] = 0
+        rep["reasons"].append("NOTE:negative_control_no_colliders")
+    else:
+        t0 = time.time()
+        rep["n_colliders"] = scene_setup.add_colliders(stage, "/World/layout")
+        rep["collider_time_s"] = round(time.time() - t0, 1)
+        if not rep["n_colliders"]:
+            rep["reasons"].append("FAIL:zero_colliders")
+            return
 
     # drop test: rigid spheres over 3 spread ground points must come to rest
     # near z0 instead of falling through (the probe3 failure mode)
@@ -410,6 +423,8 @@ def verdict(rep):
 
 
 def audit_scene(entry, out_dir):
+    if args.negative_control:
+        out_dir = out_dir / "_negative_control"
     scene_dir = out_dir / entry["name"]
     scene_dir.mkdir(parents=True, exist_ok=True)
     rep = {"name": entry["name"], "usd": entry["usd"], "reasons": [],
@@ -439,7 +454,7 @@ def main():
     if args.catalog:
         catalog = json.loads(Path(args.catalog).read_text())
     else:
-        roots = args.nucleus if args.nucleus else DEFAULT_NUCLEUS
+        roots = [] if args.no_nucleus else (args.nucleus or DEFAULT_NUCLEUS)
         catalog = build_catalog(roots, args.isaac_environments)
         (out_dir / "scene_catalog.json").write_text(json.dumps(catalog, indent=1))
         print(f"[inventory] {len(catalog)} scenes -> {out_dir/'scene_catalog.json'}")
