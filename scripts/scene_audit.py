@@ -325,9 +325,21 @@ def sim_audit(entry, rep, scene_dir, z0):
         UsdGeom.XformCommonAPI(layout).SetScale(Gf.Vec3f(scale, scale, scale))
     scene_setup.spawn_lighting()
     if args.negative_control:
-        # deliberately broken setup: no colliders. The drop test MUST fail.
+        # deliberately broken setup: no colliders -- including any AUTHORED
+        # collision APIs the stage ships with (stock NVIDIA envs carry
+        # thousands; without stripping them the control is vacuous).
+        # The drop test MUST fail afterwards.
+        n_stripped = 0
+        for prim in stage.Traverse():
+            try:
+                for api in (UsdPhysics.MeshCollisionAPI, UsdPhysics.CollisionAPI):
+                    if prim.HasAPI(api):
+                        prim.RemoveAPI(api)
+                        n_stripped += 1
+            except Exception:
+                pass  # instance proxies etc. -- best effort
         rep["n_colliders"] = 0
-        rep["reasons"].append("NOTE:negative_control_no_colliders")
+        rep["reasons"].append(f"NOTE:negative_control_stripped_{n_stripped}")
     else:
         t0 = time.time()
         rep["n_colliders"] = scene_setup.add_colliders(stage, "/World/layout")
