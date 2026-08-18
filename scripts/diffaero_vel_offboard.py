@@ -216,6 +216,8 @@ def main():
     landing_sent = False
     yaw_ned_cmd = yaw_ned
     last_arm_attempt = time.time()
+    grounded_since = None
+    recoveries = 0
     print(f"CLIMB: velocity climb to {args.climb_alt:.1f} m at {args.climb_rate:.1f} m/s ...")
     if policy.planar:
         print(
@@ -312,6 +314,29 @@ def main():
                     yaw_ned_cmd = policy.slew_yaw_ned_cmd(yaw_ned_cmd, control_dt)
                     yaw_out = yaw_ned_cmd
                     send_velocity_target_ned(mav, vx_n, vy_e, vz_d, yaw_out)
+                    # Grounded-recovery: after an upset (obstacle graze, rough
+                    # tracking) PX4's land detector can latch with the drone
+                    # parked on the ground, ignoring climb setpoints forever.
+                    # If we sit grounded and motionless mid-policy, re-run the
+                    # CLIMB/YAW sequence from the current spot instead of
+                    # burning the rest of the flight budget.
+                    if pos[2] < 0.5 and np.linalg.norm(vel) < 0.3:
+                        if grounded_since is None:
+                            grounded_since = now
+                        elif now - grounded_since > 3.0 and recoveries < 3:
+                            recoveries += 1
+                            grounded_since = None
+                            hold_x_n, hold_y_e = pos[1], pos[0]
+                            yaw_goal = math.atan2(goal_enu[0] - pos[0],
+                                                  goal_enu[1] - pos[1])
+                            policy.reset()
+                            last_arm_attempt = 0.0
+                            phase = "CLIMB"
+                            print(f"\n>>> GROUNDED mid-policy at pos={pos.round(2)} -- "
+                                  f"recovery {recoveries}/3: re-arm + climb <<<\n")
+                            continue
+                    else:
+                        grounded_since = None
                     if np.linalg.norm(goal_enu - pos) < 0.5:
                         phase = "LANDING"
                         mark_policy_phase("end")
