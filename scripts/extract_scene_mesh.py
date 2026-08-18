@@ -67,6 +67,14 @@ args = parser.parse_args()
 # register_authentication_callback route used previously does NOT work against
 # airlab-nucleus (server pushes browser SSO; verified 2026-08-18).
 import os                                              # noqa: E402
+if not os.environ.get("OMNI_API_TOKEN"):
+    _envf = Path.home() / ".omni_env"                  # same fallback as scene_audit.py
+    if _envf.exists():
+        for _line in _envf.read_text().splitlines():
+            _line = _line.strip().removeprefix("export ").strip()
+            if _line.startswith("OMNI_API_TOKEN="):
+                os.environ["OMNI_API_TOKEN"] = _line.split("=", 1)[1].strip().strip("'\"")
+                break
 if os.environ.get("OMNI_API_TOKEN") and not os.environ.get("OMNI_USER"):
     os.environ["OMNI_USER"] = "$omni-api-token"
     os.environ["OMNI_PASS"] = os.environ["OMNI_API_TOKEN"]
