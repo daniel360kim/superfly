@@ -28,6 +28,43 @@ climb_alt 2, budgets sized for ~1 m/s). NOTE: fork push to GitHub was
 blocked in-session — `daniel360kim/diffaero` main is ahead of origin
 locally; push before relying on GitHub state.
 
+## 2026-08-18 — Planar low-vel deployment PASSES the diffaero+diffphys fields — SHIPPED
+
+`diffaero_vel_planar` (checkpoint `pmv_planar_starling_v1` + the offboard
+arming-retry and grounded-recovery fixes) flies
+`suites/planar_lowvel_prims_v1.json` **6/6, zero collisions** (eval
+`planar5`): clearances 0.40–1.27 m at ~1.0 m/s cruise on all four
+standard diffphys/diffaero fields, and both dense stretch fields pass
+too (s112_dense squeaks by at 0.01 m, 104 s). Peak speed 1.43 m/s —
+fully inside the 2 m/s clamp.
+
+What the five eval campaigns established on the way:
+- **Asset-mesh suites (obstacle_assets: true) are stochastic for this
+  policy**: planar1/3/4 scored 4/6, 3/6, 2/6 with the same policy. RTF
+  was healthy (0.66–0.85) every time; the failures are physical grazes
+  with USD tree meshes that extend past the analytic primitives —
+  contact happens OUTSIDE the 86° camera cone during lateral dodges,
+  then PX4's land detector latches (now recoverable in the offboard,
+  but a graze near a trunk is still a tumble). Analytic clearance was
+  held (0.1–0.6 m) in every one of those "failures". Documented gap:
+  margin vs. unseen canopy is a forward-camera limitation to attack
+  later (wider margin training recipe, or camera-cone-aware costs).
+- **v2 (r_drone 0.3 + n_obstacles 40) REGRESSED**: 1/6 on the asset
+  suite, collisions on fields v1 passed. Reverted; committed for
+  reference. Don't reuse that recipe as the margin lever.
+- The offboard now **retries arming** every 2 s in CLIMB (first-trial
+  shader-compile stall made PX4 reject the single arm attempt —
+  deterministic "s89 failure" was purely an order artifact) and
+  **re-runs CLIMB/YAW if grounded+motionless mid-policy** (land-detector
+  latch), capped at 3 recoveries.
+
+Caveats on the passing claim: eval vehicle is **iris** (starling2max
+USD lives on Nucleus, unusable on OSMO; the velocity-loop deploy
+contract abstracts the airframe, but fly `--vehicle starling2max` on
+airstation03 before hardware). The diffaero fork's pmv commit is
+**unpushed** (session permission); push `daniel360kim/diffaero` main
+before cloning anywhere fresh.
+
 ## 2026-08-18 — pmv_planar + pmc-starling trained on OSMO — SHIPPED
 
 `checkpoints/DiffAero/pmv_planar_starling_v1` (train-17, **sr 0.92 /
