@@ -59,18 +59,24 @@ class PlanarSlice:
         return self.origin + np.asarray(iyx, float)[::-1] * self.cell
 
 
-def dominant_ground_z(ground_samples: np.ndarray, bin_m: float = 0.25):
-    """The scene's dominant ground elevation: mode of the ground-sample z
-    histogram (ground_samples include rooftops/ceilings; the *dominant* level
-    is the walkable ground). Returns (z0, coverage_fraction_of_ground_samples
-    within +-0.5 m of z0)."""
+def dominant_ground_z(ground_samples: np.ndarray, bin_m: float = 0.25,
+                      min_mode_frac: float = 0.25):
+    """The scene's WALKABLE ground elevation: the lowest substantial mode of
+    the ground-sample z histogram. ground_samples include rooftops and
+    ceilings, and in any roofed scene the ceiling+roof out-sample the floor --
+    the global mode is the ROOF (pilot finding, isaac_Full_Warehouse
+    2026-08-18: mode said z=9.1, the ceiling; the floor is z=0). So: take the
+    lowest bin holding >= min_mode_frac of the largest bin's count (floors and
+    ceilings have comparable area; incidental low ledges don't qualify).
+    Returns (z0, coverage_fraction_of_ground_samples within +-0.5 m of z0)."""
     z = np.asarray(ground_samples[:, 2], float)
     if z.size == 0:
         return None, 0.0
     zmin = float(z.min())
     idx = np.floor((z - zmin) / bin_m).astype(np.int64)
     counts = np.bincount(idx)
-    z0 = zmin + (int(np.argmax(counts)) + 0.5) * bin_m
+    qualifying = np.nonzero(counts >= min_mode_frac * counts.max())[0]
+    z0 = zmin + (int(qualifying[0]) + 0.5) * bin_m
     frac = float(np.mean(np.abs(z - z0) <= 0.5))
     return float(z0), frac
 

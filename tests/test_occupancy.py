@@ -75,6 +75,26 @@ class TestBuildSlice(unittest.TestCase):
             self.assertFalse(self.sl.known[iy, ix])
 
 
+class TestDominantGround(unittest.TestCase):
+
+    def test_roofed_scene_picks_floor_not_ceiling(self):
+        # warehouse shape: floor at 0, roof+ceiling at 9 with MORE samples
+        # (two horizontal surfaces + skylight framing). The pilot bug: the
+        # global mode said 9. Ground must be the lowest substantial level.
+        floor = _grid_pts(0, 60, 0, 40, 0.0)
+        roof = np.concatenate([_grid_pts(0, 60, 0, 40, 9.0),
+                               _grid_pts(0, 60, 0, 40, 9.2)])
+        z0, frac = oc.dominant_ground_z(np.concatenate([floor, roof]))
+        self.assertAlmostEqual(z0, 0.125, delta=0.3)
+
+    def test_small_low_ledge_does_not_qualify(self):
+        # a pit/ledge covering a small area below the real ground must not win
+        ground = _grid_pts(0, 60, 0, 40, 0.0)
+        pit = _grid_pts(0, 5, 0, 5, -3.0)      # ~1% of the ground area
+        z0, _ = oc.dominant_ground_z(np.concatenate([ground, pit]))
+        self.assertAlmostEqual(z0, 0.125, delta=0.3)
+
+
 class TestMining(unittest.TestCase):
 
     def _mine(self, gap):
