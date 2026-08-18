@@ -68,7 +68,9 @@ workflow:
         # entirely. If diffaero ever grows a dependency on a compiled
         # pytorch3d op, this fails loudly at that op's import.
         grep -v "^pytorch3d" $REPO/methods/diffaero/requirements.txt > /tmp/req.txt
-        pip install --no-cache-dir -q -r /tmp/req.txt
+        # boto3: not a diffaero dep, but the mirror step below runs
+        # superfly.remote_store (train-15 died at the upload without it).
+        pip install --no-cache-dir -q -r /tmp/req.txt boto3
         python - <<'P3DEOF'
         import site, tarfile, urllib.request, glob, shutil
         url = "https://github.com/facebookresearch/pytorch3d/archive/refs/tags/stable.tar.gz"
