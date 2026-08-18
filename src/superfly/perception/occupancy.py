@@ -84,7 +84,8 @@ def dominant_ground_z(ground_samples: np.ndarray, bin_m: float = 0.25,
 def build_slice(samples: np.ndarray, ground_samples: np.ndarray,
                 climb_alt: float = 2.0, cell: float = DEFAULT_CELL_M,
                 band_half: float = BAND_HALF_M, ground_tol: float = 0.5,
-                z0: float | None = None) -> PlanarSlice | None:
+                z0: float | None = None,
+                known_close_m: float = 3.0) -> PlanarSlice | None:
     """Planar occupancy at cruise altitude z0 + climb_alt.
 
     - occ: lateral samples with z in [z_fly - band_half, z_fly + band_half]
@@ -135,8 +136,14 @@ def build_slice(samples: np.ndarray, ground_samples: np.ndarray,
     # ground maps
     g_near = G[np.abs(G[:, 2] - z0) <= ground_tol]
     ground_ok = _grid_count(g_near) > 0
+    # `known` keeps A* inside the mapped scene. Ground sampling has real holes
+    # (faces steeper than the 30-deg ground cone are neither ground nor, at
+    # altitude, lateral occupancy -- construction mounds, slopes), so close
+    # them up to `known_close_m` or corridors fragment (ConstructionSite
+    # calibration: 550/720 pairs lost to phantom map gaps at 2 iterations).
+    n_close = max(1, int(round(known_close_m / cell)))
     known = _grid_count(G) > 0
-    known = ndimage.binary_closing(known, iterations=2)
+    known = ndimage.binary_closing(known, iterations=n_close)
     known = ndimage.binary_dilation(known, iterations=1)
     ground_ok = ndimage.binary_closing(ground_ok, iterations=2)
 
