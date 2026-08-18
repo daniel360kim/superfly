@@ -285,6 +285,25 @@ def geometry_audit(entry, rep, scene_dir):
             f"FLAG:authored_physics_scene={phys['physics_scene']}"
             f"_rigid={phys['rigid_bodies']}")
 
+    # Crop triangles to the robust box (+margin) BEFORE sampling: UE sky
+    # spheres/kill-planes have ~10^5x the scene's surface area, so without the
+    # crop they eat the whole sample budget -- CityPark's npz was 94% skybox
+    # with 41 samples on the actual terrain (sweep finding 2026-08-18). Same
+    # rationale as extract_scene_mesh --bounds. Chunked: V[F] on 30M tris is
+    # multi-GB at once.
+    box_lo = lo - np.array([20.0, 20.0, 10.0])
+    box_hi = hi + np.array([20.0, 20.0, 10.0])
+    keep = np.zeros(F.shape[0], dtype=bool)
+    for s in range(0, F.shape[0], 5_000_000):
+        tv = V[F[s:s + 5_000_000]]
+        keep[s:s + 5_000_000] = ((tv.max(axis=1) >= box_lo) &
+                                 (tv.min(axis=1) <= box_hi)).all(axis=1)
+    rep["n_triangles_cropped"] = int((~keep).sum())
+    F = F[keep]
+    if F.shape[0] == 0:
+        rep["reasons"].append("FAIL:no_geometry_in_robust_box")
+        return None
+
     # dual-channel coarse sampling (extract_scene_mesh format, mining input)
     lat, gnd = mesh_sampling.split_ground_faces(V, F, GROUND_DEG)
     h = args.sample_h
