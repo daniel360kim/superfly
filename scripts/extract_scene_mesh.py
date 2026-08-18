@@ -60,17 +60,19 @@ parser.add_argument("--max-samples", type=int, default=20_000_000,
                     help="Cap on total surface samples; h is coarsened to fit.")
 args = parser.parse_args()
 
-from isaacsim import SimulationApp                     # noqa: E402
-simulation_app = SimulationApp({"headless": True})
-
 # Optional non-interactive Nucleus auth via an Omniverse Navigator API token
 # (OMNI_API_TOKEN env var) -- no-op if unset, so existing username/password /
-# interactive-login paths are untouched.
+# interactive-login paths are untouched. Must be configured BEFORE Kit boots:
+# omni.client reads OMNI_USER/OMNI_PASS at init, and the
+# register_authentication_callback route used previously does NOT work against
+# airlab-nucleus (server pushes browser SSO; verified 2026-08-18).
 import os                                              # noqa: E402
-_omni_api_token = os.environ.get("OMNI_API_TOKEN")
-if _omni_api_token:
-    import omni.client                                 # noqa: E402
-    omni.client.register_authentication_callback(lambda prefix: ("$omni-api-token", _omni_api_token))
+if os.environ.get("OMNI_API_TOKEN") and not os.environ.get("OMNI_USER"):
+    os.environ["OMNI_USER"] = "$omni-api-token"
+    os.environ["OMNI_PASS"] = os.environ["OMNI_API_TOKEN"]
+
+from isaacsim import SimulationApp                     # noqa: E402
+simulation_app = SimulationApp({"headless": True})
 
 import numpy as np                                     # noqa: E402
 from pxr import Usd, UsdGeom, Gf                       # noqa: E402

@@ -75,14 +75,14 @@ args = parser.parse_args()
 
 DEFAULT_NUCLEUS = ["omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages"]
 
-from isaacsim import SimulationApp                     # noqa: E402
-simulation_app = SimulationApp({"headless": True})
-
-# Optional non-interactive Nucleus auth (same hook as extract_scene_mesh.py):
-# OMNI_API_TOKEN from an Omniverse Navigator API token. No-op if unset.
-# Convenience: when the env var is missing, ~/.omni_env ("export
-# OMNI_API_TOKEN=..." lines) is parsed directly -- dispatch layers (airstation
-# run -> ssh -> nice) mangle `bash -c 'source ...'` quoting too easily.
+# Non-interactive Nucleus auth MUST be configured BEFORE Kit boots: omni.client
+# honors OMNI_USER='$omni-api-token' + OMNI_PASS=<token> read at init. (The
+# register_authentication_callback route that extract_scene_mesh.py originally
+# used does NOT work against airlab-nucleus -- the server still pushes browser
+# SSO and the list fails ERROR_CONNECTION; verified 2026-08-18.) When the env
+# var is missing, ~/.omni_env ("export OMNI_API_TOKEN=...") is parsed directly
+# -- dispatch layers (airstation run -> ssh -> nice) mangle `bash -c 'source
+# ...'` quoting too easily.
 import os                                              # noqa: E402
 if not os.environ.get("OMNI_API_TOKEN"):
     _envf = Path.home() / ".omni_env"
@@ -93,10 +93,12 @@ if not os.environ.get("OMNI_API_TOKEN"):
                 os.environ["OMNI_API_TOKEN"] = _line.split("=", 1)[1].strip().strip("'\"")
                 print("[auth] OMNI_API_TOKEN loaded from ~/.omni_env")
                 break
-if os.environ.get("OMNI_API_TOKEN"):
-    import omni.client                                 # noqa: E402
-    omni.client.register_authentication_callback(
-        lambda prefix: ("$omni-api-token", os.environ["OMNI_API_TOKEN"]))
+if os.environ.get("OMNI_API_TOKEN") and not os.environ.get("OMNI_USER"):
+    os.environ["OMNI_USER"] = "$omni-api-token"
+    os.environ["OMNI_PASS"] = os.environ["OMNI_API_TOKEN"]
+
+from isaacsim import SimulationApp                     # noqa: E402
+simulation_app = SimulationApp({"headless": True})
 
 import numpy as np                                     # noqa: E402
 import omni.client                                     # noqa: E402
