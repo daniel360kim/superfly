@@ -409,10 +409,14 @@ def sim_audit(entry, rep, scene_dir, z0):
             if finite.mean() < 0.05:
                 rep["reasons"].append("FLAG:depth_degenerate")
 
-        # overhead thumbnail for the human review report
+        # overhead thumbnail for the human review report. Roofed scenes:
+        # stay BELOW the ceiling (aabb top) or the shot is just the roof
+        # exterior (pilot finding, Full Warehouse).
         ext = np.array(rep["aabb_m"][1]) - np.array(rep["aabb_m"][0])
         alt = float(np.clip(0.7 * max(ext[0], ext[1]), 20.0, 400.0))
-        cam.set_world_pose(position=np.array([center[0], center[1], z0 + alt]),
+        top = float(rep["aabb_m"][1][2])
+        cam_z = min(z0 + alt, top - 0.5) if top - 0.5 > z0 + 2.0 else z0 + alt
+        cam.set_world_pose(position=np.array([center[0], center[1], cam_z]),
                            orientation=_quat_wxyz(90.0, -90.0))
         for _ in range(30):
             world.step(render=True)
