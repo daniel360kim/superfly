@@ -419,7 +419,11 @@ def sim_audit(entry, rep, scene_dir, z0):
     for s, p in zip(spheres, pts):
         rest = float(s.get_world_pose()[0][2])
         ok = abs(rest - (z0 + R)) <= 0.6
-        through = rest < z0 - 1.0
+        # a real fall-through ends tens of meters down (still falling after
+        # 4 s, or resting on a distant kill-plane); a rest a couple meters
+        # below z0 is a basement/pit -- a legit lower level, not a collider
+        # failure (AbandonedFactory, sweep 2026-08-18)
+        through = rest < z0 - 5.0
         drops.append({"xy": [round(float(p[0]), 1), round(float(p[1]), 1)],
                       "rest_z": round(rest, 2), "ok": bool(ok),
                       "fell_through": bool(through)})
