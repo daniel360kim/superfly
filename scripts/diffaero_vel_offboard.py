@@ -215,6 +215,7 @@ def main():
     phase = "CLIMB"
     landing_sent = False
     yaw_ned_cmd = yaw_ned
+    last_arm_attempt = time.time()
     print(f"CLIMB: velocity climb to {args.climb_alt:.1f} m at {args.climb_rate:.1f} m/s ...")
     if policy.planar:
         print(
@@ -250,6 +251,14 @@ def main():
                     speed = np.linalg.norm(vel)
                     if not state.offboard:
                         set_offboard_mode(mav)
+                    if not state.armed and now - last_arm_attempt >= 2.0:
+                        # PX4 rejects arming while the EKF is still settling
+                        # (in sim, the first trial's shader-compile stall;
+                        # on hardware, a slow GPS/vision lock). The single
+                        # pre-loop arm() then leaves the drone parked until
+                        # the pre-policy timeout -- retry until it sticks.
+                        arm(mav)
+                        last_arm_attempt = now
                     if alt < args.climb_alt - args.arrive_tol:
                         # NED vz < 0 commands upward motion.
                         send_velocity_target_ned(

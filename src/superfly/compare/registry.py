@@ -121,9 +121,12 @@ def method_registry():
             control_hz=30.0,
             goal_argc=2,
             python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
-            # v2: r_drone 0.3 (real Starling footprint) + n_obstacles 40
-            # for clearance margin; v1 (r_drone 0.2) flew 0.10-0.14 m clearances.
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "pmv_planar_starling_v2",
+            # v1 is the deployed policy. v2 (r_drone 0.3, n_obstacles 40,
+            # meant to buy clearance margin) REGRESSED at deploy: 1/6 vs
+            # v1's 4/6 on planar_lowvel_v1, colliding on fields v1 passed
+            # (eval planar2 vs planar1, 2026-08-18). Kept committed for
+            # reference; do not re-try that recipe as a margin lever.
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "pmv_planar_starling_v1",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
