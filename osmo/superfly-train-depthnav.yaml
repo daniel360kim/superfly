@@ -87,8 +87,11 @@ workflow:
         # ---- preflight: submodule + entry present in the tarball ----
         [ -f $DN/examples/navigation/run_nav_level1_vel.py ] || {
           echo "DEPTHNAV_SUBMODULE_MISSING_ABORT (stage with submodule working trees)"; exit 1; }
-        [ -d $DN/habitat-sim/src ] || {
-          echo "HABITAT_SUBMODULE_MISSING_ABORT (git submodule update --init in methods/depthnav)"; exit 1; }
+        # deps/corrade is the canary for habitat's own NESTED submodules --
+        # run -2 died at cmake configure because they were never initialized
+        # (git submodule update --init --recursive INSIDE habitat-sim).
+        [ -f $DN/habitat-sim/src/deps/corrade/CMakeLists.txt ] || {
+          echo "HABITAT_SUBMODULE_MISSING_ABORT (git submodule update --init --recursive in methods/depthnav/habitat-sim)"; exit 1; }
 
         # ---- dataset (shipped separately; 4.6 GB) ----
         tar -xf {{input:1}}/{{ dataset_tar }} -C $DN/datasets/
@@ -96,12 +99,25 @@ workflow:
           echo "DATASET_LAYOUT_ABORT"; exit 1; }
 
         # ---- python deps: drop the cu121-torch / numpy / cmake pins (the
-        # image's cu13 torch must survive; numba needs numpy<2.1), keep the
-        # rest pinned as depthnav tested them. boto3 for remote_store. ----
-        grep -vE '^(torch==|torchvision==|torchaudio==|numpy==|cmake==|--index-url|--extra-index-url|gdown)' \
+        # image's cu13 torch must survive), keep the rest pinned as depthnav
+        # tested them. numpy MUST be <2: scikit-fmm has NO linux wheels
+        # (only win_amd64 on PyPI) and its C++ uses NPY_IN_ARRAY, which
+        # numpy 2 removed -- superfly-train-depthnav-1 died there when the
+        # isolated build env pulled numpy 2. So: pin numpy<2 up front, drop
+        # scikit-fmm from the bulk install, and build it against the runtime
+        # numpy with --no-build-isolation (needs meson-python preinstalled).
+        # boto3 for remote_store. ----
+        # cmake<4: CMake 4 removed <3.5-policy compatibility and habitat's
+        # vendored deps (corrade/magnum/eigen era) still declare old minima;
+        # the env var is the cmake-4 escape hatch if the pin ever slips.
+        pip install --no-cache-dir -q "numpy<2" boto3 "cmake<4" ninja meson-python meson
+        export CMAKE_POLICY_VERSION_MINIMUM=3.5
+        grep -vE '^(torch==|torchvision==|torchaudio==|numpy==|cmake==|scikit-fmm|--index-url|--extra-index-url|gdown)' \
           $DN/requirements.txt > /tmp/req.txt
-        echo 'numpy<2.1' >> /tmp/req.txt
-        pip install --no-cache-dir -q -r /tmp/req.txt boto3 cmake ninja
+        echo 'numpy<2' >> /tmp/req.txt
+        pip install --no-cache-dir -q -r /tmp/req.txt
+        SKFMM_PIN=$(grep -oE '^scikit-fmm==[0-9.]+' $DN/requirements.txt || echo scikit-fmm)
+        pip install --no-cache-dir -q --no-build-isolation "$SKFMM_PIN"
         pip install --no-cache-dir -q --no-deps -e $DN
         pip install --no-cache-dir -q --no-deps -e $REPO
 
