@@ -49,7 +49,11 @@ workflow:
     tasks:
     - name: train
       lead: true
-      image: pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel
+      # cuda12.8, NOT the eval jobs' cuda13.0 image: habitat's vendored
+      # cuda_helpers/HelperCuda.h reads cudaDeviceProp::computeMode/clockRate,
+      # which CUDA 13 removed (run -5 died there at compile). 12.8 still has
+      # them AND has sm_120 kernels for the Blackwell nodes.
+      image: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
       resource: gpu_resource
       inputs:
       - url: s3://superfly/tmp_data/
@@ -67,10 +71,16 @@ workflow:
         # git+https). ~25 s historically; anything heavier belongs in the
         # deps cache. ----
         apt-get update -qq
+        # the *-dev GL packages are for habitat's cmake configure: run -3
+        # died on "Could NOT find OpenGL (OPENGL_opengl_LIBRARY /
+        # OPENGL_glx_LIBRARY / OPENGL_INCLUDE_DIR)" -- runtime libs alone
+        # (libgl1/libegl1/...) carry no headers or .so symlinks.
         apt-get install -y -qq --no-install-recommends \
           libx11-6 libgl1 libglu1-mesa libegl1 libglx0 libopengl0 \
           libxrender1 libxext6 libsm6 libice6 libgomp1 libatomic1 \
-          libglib2.0-0 libjpeg-dev libglm-dev zlib1g-dev git > /dev/null
+          libglib2.0-0 libjpeg-dev libglm-dev zlib1g-dev git \
+          libglvnd-dev libgl1-mesa-dev libegl1-mesa-dev \
+          libcgal-dev > /dev/null
         # EGL on NVIDIA without X needs the glvnd vendor json; the runtime
         # usually injects it, this is the defensive fallback.
         mkdir -p /usr/share/glvnd/egl_vendor.d
@@ -131,6 +141,11 @@ workflow:
           python -c "import habitat_sim" && HAVE_HABITAT=1 || echo "cache restore failed; building"
         fi
         if [ "$HAVE_HABITAT" != 1 ]; then
+          # habitat's own requirements.txt pins numpy<1.24 (setup.py feeds it
+          # to install_requires); easy_install then egg-installs numpy 1.23.5
+          # over our 1.26 and ERRORS against contourpy's numpy>=1.25 (run -6).
+          # Relax the pin -- the installed numpy<2 satisfies everyone.
+          sed -i -E 's/^numpy[<>=!,.0-9]+$/numpy<2/' $DN/habitat-sim/requirements.txt
           ls -1 $SP > /tmp/sp_before.txt
           ( cd $DN/habitat-sim && \
             python setup.py install --headless --with-cuda --build-type Release )
