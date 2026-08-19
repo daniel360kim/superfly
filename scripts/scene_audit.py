@@ -499,6 +499,13 @@ def audit_scene(entry, out_dir):
     scene_dir.mkdir(parents=True, exist_ok=True)
     rep = {"name": entry["name"], "usd": entry["usd"], "reasons": [],
            "audited_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    # crash fence: if this scene OOM-kills or hangs the whole process, the
+    # stub survives, so a --resume relaunch SKIPS it instead of dying on it
+    # again forever (DerelicitCorridor OOM loop, sweep 2026-08-18). The real
+    # report overwrites the stub on any normal completion.
+    (scene_dir / "report.json").write_text(json.dumps(
+        {**rep, "verdict": "FAIL",
+         "reasons": ["FAIL:killed_midway_oom_or_hang"]}, indent=1))
     t0 = time.time()
     try:
         geo = geometry_audit(entry, rep, scene_dir)

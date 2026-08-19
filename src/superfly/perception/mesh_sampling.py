@@ -25,6 +25,11 @@ import numpy as np
 # extractor: past this many instanced triangles per instancer, instances are
 # strided evenly (logged). Clearance then slightly UNDER-covers that canopy.
 MAX_INSTANCED_TRIS = 30_000_000
+# ...and capped ACROSS instancers too: DerelicitCorridor has ~30 pipe
+# instancers of ~31M triangles each -- individually under the cap after
+# striding, together ~450M and an OOM kill (sweep 2026-08-18). The budget is
+# shared over the whole gather; once spent, later instancers stride harder.
+MAX_TOTAL_INSTANCED_TRIS = 60_000_000
 _MAX_INSTANCER_DEPTH = 3
 
 
@@ -115,7 +120,8 @@ def _instance_xforms(pi, time):
     return out
 
 
-def _instancer_triangles(pi_prim, verbose=True, _depth=0):
+def _instancer_triangles(pi_prim, verbose=True, _depth=0,
+                         cap=MAX_INSTANCED_TRIS):
     """World-frame (verts_list, tris_list) for every instance of a
     PointInstancer. Nested instancers inside prototypes recurse up to
     _MAX_INSTANCER_DEPTH. Row-vector convention throughout:
@@ -162,7 +168,7 @@ def _instancer_triangles(pi_prim, verbose=True, _depth=0):
             for prim in rng:
                 if prim != root and prim.IsA(UsdGeom.PointInstancer):
                     # nested instancer: expand in world, pull back to proto frame
-                    nv, nf = _instancer_triangles(prim, verbose, _depth + 1)
+                    nv, nf = _instancer_triangles(prim, verbose, _depth + 1, cap)
                     for V, F in zip(nv, nf):
                         Vl = V @ M_root_inv[:3, :3] + M_root_inv[3, :3]
                         pieces.append((Vl, F))
@@ -185,11 +191,12 @@ def _instancer_triangles(pi_prim, verbose=True, _depth=0):
                               for i in proto_idx], dtype=np.int64)
     total = int(tris_per_inst.sum())
     stride = 1
-    if total > MAX_INSTANCED_TRIS:
-        stride = int(np.ceil(total / MAX_INSTANCED_TRIS))
+    cap = max(int(cap), 100_000)     # never stride down to literally nothing
+    if total > cap:
+        stride = int(np.ceil(total / cap))
         if verbose:
             print(f"[mesh_sampling] {pi_prim.GetPath()}: {total} instanced "
-                  f"triangles > cap {MAX_INSTANCED_TRIS}; keeping every "
+                  f"triangles > cap {cap}; keeping every "
                   f"{stride}th instance.", file=sys.stderr)
     verts_out, tris_out = [], []
     for n, (i_proto, X) in enumerate(zip(proto_idx, xforms)):
@@ -230,15 +237,18 @@ def gather_triangles(stage, root_path: str | None = None, verbose: bool = True):
 
     verts, faces, v_off = [], [], 0
     n_mesh = n_skipped = n_instancers = 0
+    inst_budget = MAX_TOTAL_INSTANCED_TRIS      # shared across ALL instancers
     it = iter(rng)
     for prim in it:
         if prim.IsA(UsdGeom.PointInstancer):
             n_instancers += 1
-            iv, itr = _instancer_triangles(prim, verbose)
+            iv, itr = _instancer_triangles(
+                prim, verbose, cap=min(MAX_INSTANCED_TRIS, inst_budget))
             for P, tri in zip(iv, itr):
                 verts.append(P)
                 faces.append(tri + v_off)
                 v_off += P.shape[0]
+                inst_budget -= tri.shape[0]
             # prototypes live under the instancer; don't ALSO walk them as
             # plain (origin-frame) meshes
             it.PruneChildren()
