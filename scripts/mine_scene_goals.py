@@ -90,7 +90,15 @@ def main():
                                   "or a single samples .npz")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--suite-out", default=None,
-                    help="also write a run_comparison scenario suite JSON here")
+                    help="also write a run_comparison scenario suite JSON here "
+                         "(the curated --pairs-per-scene spread)")
+    ap.add_argument("--suite-all-out", default=None,
+                    help="also write EVERY gate-surviving pair as a scenario "
+                         "suite (dense harvest; curate per experiment)")
+    ap.add_argument("--goals-per-source", type=int, default=60,
+                    help="goal candidates evaluated per Dijkstra source")
+    ap.add_argument("--max-keep", type=int, default=400,
+                    help="survivor cap per scene")
     ap.add_argument("--climb-alt", type=float, default=2.0,
                     help="cruise altitude above the dominant ground [m] (default 2)")
     ap.add_argument("--pairs-per-scene", type=int, default=3)
@@ -137,7 +145,9 @@ def main():
             print(f"[scene] {name}: no usable ground -- skipped")
             continue
         cands, stats = oc.mine_pairs(sl, n_sources=args.sources, seed=args.seed,
-                                     len_range=tuple(args.len_range))
+                                     len_range=tuple(args.len_range),
+                                     goals_per_source=args.goals_per_source,
+                                     max_keep=args.max_keep)
         per_scene[name] = dict(sl=sl, cands=cands, stats=stats, meta=meta, report=rep)
 
     # pool-normalized difficulty, then per-scene selection
@@ -145,7 +155,20 @@ def main():
     ranges = oc.score_difficulty(pool)
     print(f"[difficulty] pool={len(pool)} ranges={ranges}")
 
-    result, suite = {}, []
+    def scenario_entry(scen_name, c, usd, scale, sl):
+        return {
+            "name": scen_name,
+            "usd_environment": usd,
+            "env_scale": scale,
+            "start": [c.start_xy[0], c.start_xy[1], round(sl.z0 + 0.3, 2)],
+            "goal": [c.goal_xy[0], c.goal_xy[1], round(sl.z_fly, 2)],
+            "climb_alt": args.climb_alt,
+            "timeout": int(max(240, 60 + 2 * c.path_m)),
+            "pre_policy_timeout": 600,
+            "difficulty": round(c.difficulty, 3),
+        }
+
+    result, suite, suite_all = {}, [], []
     for name, v in per_scene.items():
         picked = oc.select_pairs(v["cands"], k=args.pairs_per_scene)
         plot_scene(v["sl"], v["cands"], picked, name, out / f"{name}_map.png")
@@ -161,17 +184,9 @@ def main():
         usd = rep.get("usd") or v["meta"].get("usd")
         scale = rep.get("env_scale") or v["meta"].get("env_scale", 1.0)
         for i, c in enumerate(picked):
-            suite.append({
-                "name": f"{name}_p{i}",
-                "usd_environment": usd,
-                "env_scale": scale,
-                "start": [c.start_xy[0], c.start_xy[1], round(sl.z0 + 0.3, 2)],
-                "goal": [c.goal_xy[0], c.goal_xy[1], round(sl.z_fly, 2)],
-                "climb_alt": args.climb_alt,
-                "timeout": int(max(240, 60 + 2 * c.path_m)),
-                "pre_policy_timeout": 600,
-                "difficulty": round(c.difficulty, 3),
-            })
+            suite.append(scenario_entry(f"{name}_p{i}", c, usd, scale, sl))
+        for i, c in enumerate(sorted(v["cands"], key=lambda c: c.difficulty)):
+            suite_all.append(scenario_entry(f"{name}_c{i:03d}", c, usd, scale, sl))
 
     (out / "mined_pairs.json").write_text(json.dumps({
         "params": {k: (list(v) if isinstance(v, tuple) else v)
@@ -179,12 +194,16 @@ def main():
         "difficulty_ranges": {k: list(map(float, r)) for k, r in ranges.items()},
         "scenes": result}, indent=1))
     print(f"[out] {out / 'mined_pairs.json'} + {len(per_scene)} map PNGs")
-    if args.suite_out and suite:
-        Path(args.suite_out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.suite_out).write_text(json.dumps(suite, indent=1))
-        print(f"[out] suite: {args.suite_out} ({len(suite)} scenarios)")
-    elif args.suite_out:
-        print("[out] no scenarios survived -- suite not written")
+    for path, entries, label in ((args.suite_out, suite, "curated"),
+                                 (args.suite_all_out, suite_all, "all-survivors")):
+        if not path:
+            continue
+        if entries:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(json.dumps(entries, indent=1))
+            print(f"[out] {label} suite: {path} ({len(entries)} scenarios)")
+        else:
+            print(f"[out] no scenarios survived -- {label} suite not written")
 
 
 if __name__ == "__main__":
