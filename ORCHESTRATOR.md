@@ -44,11 +44,12 @@ dependency order:
    credential `superfly` registered (`osmo credential list` shows it), both
    superfly workflow YAMLs pass `osmo workflow validate`, `SUPERFLY_S3_*`
    aliases added to `~/.s3env`.
-3. **Training pipelines (Phase 3)**: `scripts/train_diffaero.py` is written
-   and its train/export interface verified against the submodule source
-   (still needs one GPU run). `train_depthnav.py` (entry:
-   `examples/navigation/run_nav_level1.py`; the vel variant also needs
-   `policy_cfg/small_yaw_vel.yaml` recreated — it exists nowhere),
+3. **Training pipelines (Phase 3)**: `scripts/train_diffaero.py` DONE
+   (pmv_planar_starling + pmc-starling runs committed, see ATTEMPTS.md).
+   `scripts/train_depthnav.py` written 2026-08-19 — the vel variant's
+   VELOCITY_YAW support + `small_yaw_vel.yaml` were re-implemented in the
+   fork (@4f845f5) and the first OSMO run submitted
+   (`superfly-train-depthnav-1`, `osmo/superfly-train-depthnav.yaml`);
    `train_agile.py` + `build_agile_dataset.py` still to write. The agile
    labels come from `superfly_expert_sampler` on airstation03; the one
    genuine gap is depth-image rendering for its rollouts (see ATTEMPTS.md
