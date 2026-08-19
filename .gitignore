@@ -29,3 +29,16 @@ scripts/*.mp4
 # Hydra training run outputs / logs (regenerated per run)
 outputs/
 train.log
+
+# OSMO job specs (local-only)
+/osmo/
+
+# Markdown notes (local-only; README.md files stay tracked)
+*.md
+!README.md
+
+# Agent tooling / scratch (local-only)
+.claude/
+.cursor/
+.aider*
+.codex/
