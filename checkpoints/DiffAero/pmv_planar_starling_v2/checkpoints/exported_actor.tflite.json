@@ -1,0 +1,23 @@
+{
+  "schema": "superfly-tflite-export-v1",
+  "source_onnx": "checkpoints/DiffAero/pmv_planar_starling_v2/checkpoints/exported_actor.onnx",
+  "source_onnx_sha256": "6f22c6ae5ab142fd71b67281fa8123bd956c3a1852ca18d7e7d7e9c43cb3d418",
+  "opset": 20,
+  "dynamic_batch_fixed_to_1": false,
+  "tool_versions": {
+    "onnx2tf": "1.29.24",
+    "onnxsim": "v0.6.5",
+    "tensorflow": "2.21.0",
+    "onnx": "1.20.1",
+    "onnxruntime": "1.26.0",
+    "numpy": "2.5.2"
+  },
+  "verification": {
+    "n_random_inputs": 64,
+    "max_abs_err": 1.9073486328125e-06,
+    "max_rel_err": 9.504622753217915e-06,
+    "fp32_atol": 0.0001
+  },
+  "date": "2026-08-19T22:02:15+00:00",
+  "command": "scripts/export_tflite.py checkpoints/DiffAero/pmv_planar_starling_v2"
+}

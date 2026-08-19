@@ -164,6 +164,21 @@ copy working-tree state). `train_depthnav.py` and `train_agile.py` are not
 written yet; `airstation_train.sh` will tell you so rather than fail
 obscurely.
 
+### TFLite export
+
+For onboard deployment, `scripts/export_tflite.py` converts a DiffAero run's
+`exported_actor.onnx` (and, best-effort, `obs_fn.onnx`) to `.tflite` via
+onnxsim → onnx2tf → TFLiteConverter, then verifies the result against
+onnxruntime on 64 random inputs (fails if fp32 max abs error > 1e-4) and
+writes a `.tflite.json` sidecar (source sha256, tool versions, error stats):
+
+```bash
+python scripts/export_tflite.py checkpoints/DiffAero/<run>   # or a .onnx path
+```
+
+CPU-only work; needs its own venv — the exact pinned pip install is in the
+script's docstring. `--fp16` adds a half-precision variant.
+
 ## Results and storage
 
 A run writes `results/<run>/<scenario>/<method>/` — `traj.npz` (trajectory +
