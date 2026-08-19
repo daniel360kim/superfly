@@ -56,9 +56,13 @@ mkdir -p "$STAGE"
 
 echo "== staging the superfly repo (code + checkpoints + configs, no venvs) =="
 mkdir -p "$STAGE/superfly"
+# datasets/depthnav_dataset (4.6 GB) deliberately excluded: it ships once
+# as s3://superfly/deps/depthnav_dataset_v1.tar and the depthnav training
+# workflow pulls it as its own input.
 rsync -a \
   --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' \
   --exclude 'results' --exclude 'methods/*/.venv' --exclude 'outputs' \
+  --exclude 'datasets/depthnav_dataset' \
   "$REPO"/ "$STAGE/superfly"/
 # results/mesh_cache IS needed: clearance scoring for USD scenes reads it, and
 # regenerating a cache entry boots a headless Kit (SCENE_MESH_TIMEOUT 1200 s).

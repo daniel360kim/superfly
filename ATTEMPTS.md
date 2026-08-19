@@ -4,6 +4,36 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-08-19 — depthnav velocity-command variant (VELOCITY_YAW) re-implemented in the fork — SHIPPED (code); OSMO training PENDING
+
+Mirrors the diffaero pmv re-implementation: the vel variant existed only in
+the lost checkout, so it was rebuilt in `methods/depthnav` @ `4f845f5`
+(pushed), schema-matched to what `DepthNavPolicy(action_mode="velocity")`
+reads. Dynamics `velocity_world_frame` = explicit PX4 velocity loop (P on
+vel error, MPC_*_VEL_P_ACC defaults 1.8/4.0, nominal-9.81 hover feedforward
+so the randomized-gravity mismatch stands in for hover-thrust estimation
+error) -> starling accel box (xy 17.0 / z 0.5..19.6, from
+`configs/vehicles/starling2max.yaml`) -> first-order rotor lag (lmbda
+[11.8, 18.2] per env, = sys-ID tau 85..55 ms) -> the existing thrust
+integrator, so orientation/omega/jerk fall out unchanged.
+`VelocityBoundedYaw` bounds xy on the norm (tanh, 2.5) and z componentwise
+(1.5) — MUST stay aligned with the registry's --max-vel-xy/--max-vel-z.
+Targets 0.8–1.5 m/s (`target_speed` mean 1.15 half 0.7; Uniform spans mean
+± half/2 — same trap as the thrust variant's [2,4]). Verified on gs2 CPU:
+setpoint tracking exact, 0.56 s rise, grad/detach/indexed-reset, activation
+bounds, state_dict identical to level1_4's, deploy wrapper loads + steps it.
+Training: `scripts/train_depthnav.py [--vel]` (artifact
+`checkpoints/DepthNav/level1_vel/level1_vel.pth`) via
+`osmo/superfly-train-depthnav.yaml` — habitat-sim builds FROM SOURCE in-job
+(--headless --with-cuda; gpu2gpu default is True) with an S3 deps-cache of
+the built site-packages entries; the 4.6 GB scene dataset ships once as
+`deps/depthnav_dataset_v1.tar` (stage_superfly_osmo.sh now excludes
+`datasets/depthnav_dataset`), and a 30-min background loop mirrors logs/ to
+S3 mid-run. Untested risks, in order: habitat source build against the
+image's python/toolchain, EGL headless render on the pool (the env
+preflight in the YAML fails fast on both), torch-2.9-vs-2.2 API drift in
+the trainer.
+
 ## 2026-08-18 — Scene vetting pipeline (audit + planar goal mining) — SHIPPED (pilot); Nucleus sweep PENDING on auth
 
 `scripts/scene_audit.py` (airstation03, Isaac python) + `scripts/
@@ -159,7 +189,7 @@ GitHub (user action; `gh` absent on gs2) and add as `methods/` submodules.
 **RESOLVED 2026-08-17**: `daniel360kim/{depthnav,diffaero,agile_autonomy}`
 added as submodules; agile_autonomy's fork includes `planner_learning/`.
 
-## 2026-08-17 — depthnav_vel checkpoint — PENDING
+## 2026-08-17 — depthnav_vel checkpoint — PENDING (code half RESOLVED 2026-08-19, see the VELOCITY_YAW entry)
 
 `depthnav_vel` has ALWAYS pointed at `level1_vel.pth`, which was never
 produced by anyone; it is checkpoint-gated out of the harness until Phase 3
@@ -170,6 +200,8 @@ the lost checkout, so Phase 3 must recreate the config too (the docstring in
 `policies/depthnav.py` records its known training parameters). (An earlier draft of this entry also claimed
 `sha2c_vel_cmd_oa` lacked its `exported_actor.pt2` — false, a truncated
 directory listing; the artifact is committed and `diffaero_vel` is ready.)
+2026-08-19: config + VELOCITY_YAW support recreated in the fork (@4f845f5);
+only the trained `.pth` itself is still missing.
 
 ## 2026-08 — Agile training dataset: sampler renders no images — PENDING
 

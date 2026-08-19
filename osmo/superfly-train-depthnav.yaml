@@ -1,0 +1,179 @@
+# Train a DepthNav policy on OSMO and mirror the run dir to
+# s3://superfly/runs/<tag>/. Written for the velocity-command variant
+# (scripts/train_depthnav.py --vel -> checkpoints/DepthNav/level1_vel/
+# level1_vel.pth, the registry's "depthnav_vel" artifact); pass vel="" for
+# the thrust variant.
+#
+# What makes this job different from superfly-train-diffaero:
+#   * habitat-sim is a FROM-SOURCE C++ build (the methods/depthnav submodule
+#     of it; --headless for EGL rendering without X, --with-cuda because
+#     scene_manager defaults gpu2gpu=True). First run pays the build
+#     (tens of minutes); it then caches every new site-packages entry to
+#     s3://superfly/deps/{{ habitat_cache }} and later runs restore from
+#     there and skip the build. Bump the cache name when changing the image
+#     or the habitat submodule SHA.
+#   * the 4.6 GB scene dataset is NOT in the stage tarball
+#     (stage_superfly_osmo.sh excludes it); it ships once as
+#     s3://superfly/deps/depthnav_dataset_v1.tar and is pulled as a second
+#     input.
+#   * depthnav's requirements.txt pins torch 2.2.1+cu121 (no sm_120
+#     kernels) and numpy 1.23.5 -- the torch/numpy/cmake pins are filtered
+#     out so the image's own cu13 torch survives; numpy stays <2.1 for the
+#     numba pin.
+#   * a preflight constructs a real 2-env NavigationEnv (velocity dynamics,
+#     habitat EGL render, dataset scenes) and steps it before committing to
+#     the long train -- the habitat/EGL failure modes should cost minutes,
+#     not the whole run.
+#   * training is long: a background loop mirrors the logs dir to S3 every
+#     30 min so a mid-run death doesn't lose the iteration checkpoints.
+#
+# Usage:
+#   scripts/stage_superfly_osmo.sh 0819 --code-only
+#   osmo workflow submit osmo/superfly-train-depthnav.yaml --pool default \
+#     --set-env SUPERFLY_S3_KEY_ID=$S3ID SUPERFLY_S3_KEY=$S3KEY \
+#     --set-string data_tar=superfly_stage_0819.tar tag=level1_vel \
+#       l0_iters=500 l1_iters=20000
+version: 2
+default-values:
+  data_tar: superfly_stage.tar
+  dataset_tar: depthnav_dataset_v1.tar
+  habitat_cache: depthnav_habitat_cache_v1.tar.gz
+  tag: level1_vel
+  vel: "--vel"
+  l0_iters: "500"
+  l1_iters: "20000"
+workflow:
+  name: superfly-train-depthnav
+  groups:
+  - name: train-group
+    tasks:
+    - name: train
+      lead: true
+      image: pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel
+      resource: gpu_resource
+      inputs:
+      - url: s3://superfly/tmp_data/
+        regex: '{{ data_tar }}$'
+      - url: s3://superfly/deps/
+        regex: '{{ dataset_tar }}$'
+      command:
+      - bash
+      - -c
+      - |
+        set -ex
+        export DEBIAN_FRONTEND=noninteractive
+        # ---- system libs: the eval-job GL set (EGL/GLX/X11) + habitat's
+        # build deps (libjpeg/libglm/zlib) + git (two requirements are
+        # git+https). ~25 s historically; anything heavier belongs in the
+        # deps cache. ----
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends \
+          libx11-6 libgl1 libglu1-mesa libegl1 libglx0 libopengl0 \
+          libxrender1 libxext6 libsm6 libice6 libgomp1 libatomic1 \
+          libglib2.0-0 libjpeg-dev libglm-dev zlib1g-dev git > /dev/null
+        # EGL on NVIDIA without X needs the glvnd vendor json; the runtime
+        # usually injects it, this is the defensive fallback.
+        mkdir -p /usr/share/glvnd/egl_vendor.d
+        [ -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ] || cat > /usr/share/glvnd/egl_vendor.d/10_nvidia.json <<'EGLEOF'
+        {"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}
+        EGLEOF
+
+        cd /osmo/run/workspace
+        tar -xf {{input:0}}/{{ data_tar }}
+        STAGE=/osmo/run/workspace/superfly_stage
+        REPO=$STAGE/superfly
+        DN=$REPO/methods/depthnav
+
+        # ---- preflight: submodule + entry present in the tarball ----
+        [ -f $DN/examples/navigation/run_nav_level1_vel.py ] || {
+          echo "DEPTHNAV_SUBMODULE_MISSING_ABORT (stage with submodule working trees)"; exit 1; }
+        [ -d $DN/habitat-sim/src ] || {
+          echo "HABITAT_SUBMODULE_MISSING_ABORT (git submodule update --init in methods/depthnav)"; exit 1; }
+
+        # ---- dataset (shipped separately; 4.6 GB) ----
+        tar -xf {{input:1}}/{{ dataset_tar }} -C $DN/datasets/
+        [ -d $DN/datasets/depthnav_dataset/configs ] || {
+          echo "DATASET_LAYOUT_ABORT"; exit 1; }
+
+        # ---- python deps: drop the cu121-torch / numpy / cmake pins (the
+        # image's cu13 torch must survive; numba needs numpy<2.1), keep the
+        # rest pinned as depthnav tested them. boto3 for remote_store. ----
+        grep -vE '^(torch==|torchvision==|torchaudio==|numpy==|cmake==|--index-url|--extra-index-url|gdown)' \
+          $DN/requirements.txt > /tmp/req.txt
+        echo 'numpy<2.1' >> /tmp/req.txt
+        pip install --no-cache-dir -q -r /tmp/req.txt boto3 cmake ninja
+        pip install --no-cache-dir -q --no-deps -e $DN
+        pip install --no-cache-dir -q --no-deps -e $REPO
+
+        # ---- habitat-sim: restore the built cache from S3, else build from
+        # the submodule source and publish the cache for the next run ----
+        SP=$(python -c "import site; print(site.getsitepackages()[0])")
+        export PYTHONPATH=$REPO/src
+        HAVE_HABITAT=0
+        if python -m superfly.remote_store download "deps/{{ habitat_cache }}" /tmp/{{ habitat_cache }}; then
+          tar -xzf /tmp/{{ habitat_cache }} -C $SP || true
+          python -c "import habitat_sim" && HAVE_HABITAT=1 || echo "cache restore failed; building"
+        fi
+        if [ "$HAVE_HABITAT" != 1 ]; then
+          ls -1 $SP > /tmp/sp_before.txt
+          ( cd $DN/habitat-sim && \
+            python setup.py install --headless --with-cuda --build-type Release )
+          ls -1 $SP > /tmp/sp_after.txt
+          NEW=$(comm -13 /tmp/sp_before.txt /tmp/sp_after.txt)
+          [ -f $SP/easy-install.pth ] && NEW="$NEW easy-install.pth"
+          tar -czf /tmp/{{ habitat_cache }} -C $SP $NEW
+          python -m superfly.remote_store upload /tmp/{{ habitat_cache }} "deps/{{ habitat_cache }}" || \
+            echo "WARN: habitat cache upload failed (next run rebuilds)"
+          python -c "import habitat_sim"
+        fi
+
+        # ---- env preflight: real habitat render + velocity dynamics on the
+        # shipped dataset, before committing hours to the train ----
+        cd $DN
+        python - <<'PREEOF'
+        import yaml, torch as th
+        from depthnav.envs.env_aliases import env_aliases
+        cfg = yaml.safe_load(open("examples/navigation/train_cfg/nav_empty_vel.yaml"))
+        pcfg = yaml.safe_load(open("examples/navigation/policy_cfg/small_yaw_vel.yaml"))
+        cfg["env"].update(pcfg.get("update_env_kwargs", {}))
+        cfg["env"]["num_envs"] = 2
+        env = env_aliases[cfg["env_class"]](requires_grad=False, **cfg["env"])
+        obs = env.reset()
+        for _ in range(5):
+            obs, r, d, i = env.step(th.zeros(2, 4))
+        d = obs["depth"]
+        finite = float(th.isfinite(th.as_tensor(d)).float().mean())
+        print("PREFLIGHT_OK depth", tuple(d.shape), "finite", finite)
+        assert finite > 0.99
+        env.close()
+        PREEOF
+
+        # ---- train, with a 30-min background mirror of the logs dir ----
+        OUT=$REPO/checkpoints/DepthNav/{{ tag }}
+        ( while sleep 1800; do
+            tar -czf /tmp/partial_logs.tar.gz -C $DN/examples/navigation logs 2>/dev/null || continue
+            python -m superfly.remote_store upload /tmp/partial_logs.tar.gz \
+              "runs/{{ tag }}/partial_logs.tar.gz" || true
+          done ) & MIRROR_PID=$!
+        python $REPO/scripts/train_depthnav.py --out $OUT {{ vel }} \
+          --python $(which python) \
+          --level0-iters {{ l0_iters }} --level1-iters {{ l1_iters }}
+        kill $MIRROR_PID || true
+
+        # ---- mirror the run dir out (container scratch vanishes on exit) ----
+        cd $REPO/checkpoints/DepthNav
+        tar -czf /tmp/{{ tag }}.tar.gz {{ tag }}
+        python -m superfly.remote_store upload \
+          /tmp/{{ tag }}.tar.gz "runs/{{ tag }}/{{ tag }}.tar.gz"
+        echo "TRAIN_DONE"
+  resources:
+    gpu_resource:
+      # cpu 8: the habitat C++ build and the cpu-side env stepping want
+      # cores (unlike diffaero's fully-on-GPU sim). If this sits PENDING
+      # for hours the way 8/32Gi did on 2026-08-17, resubmit at 4/24Gi --
+      # the build just takes longer.
+      cpu: 8
+      gpu: 1
+      memory: 32Gi
+      # dataset tar + extracted copy + habitat build tree + pip: ~15 GB.
+      storage: 60Gi

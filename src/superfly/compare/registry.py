@@ -63,12 +63,12 @@ def method_registry():
         # Velocity-command DepthNav: same network family and same sim depth
         # camera as "depthnav", but the policy emits a velocity setpoint that
         # goes to PX4's velocity loop (SET_POSITION_TARGET_LOCAL_NED) rather
-        # than a thrust vector to the attitude loop. Trained for 0.7-1.5 m/s,
+        # than a thrust vector to the attitude loop. Trained for 0.8-1.5 m/s,
         # so --max-speed should sit in that band. Unlike "depthnav", this
         # offboard writes the "end" phase marker on goal-reach, so
-        # policy_reported_reached behaves like the other methods. Its
-        # checkpoint has never existed yet -- scripts/train_depthnav.py is
-        # what finally produces it (checkpoint_ready gates it out until then).
+        # policy_reported_reached behaves like the other methods. The
+        # checkpoint comes from scripts/train_depthnav.py --vel
+        # (checkpoint_ready gates the method out until a run is committed).
         "depthnav_vel": dict(
             policy="depthnav",               # same sim camera + UDP transport
             offboard="depthnav_vel_offboard.py",
