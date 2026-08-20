@@ -71,6 +71,10 @@ def main():
     ap.add_argument("--vel", action="store_true",
                     help="Train the velocity-command variant (small_yaw_vel, "
                          "VELOCITY_YAW, 0.8-1.5 m/s starling velocity loop)")
+    ap.add_argument("--planar", action="store_true",
+                    help="Train the PLANAR velocity-command variant "
+                         "(small_yaw_vel_planar, vz forced to zero -- the "
+                         "depthnav analog of diffaero pmv_planar; implies --vel)")
     ap.add_argument("--level0-iters", type=int, default=500)
     ap.add_argument("--level1-iters", type=int, default=20000)
     ap.add_argument("--python", default=None,
@@ -78,7 +82,10 @@ def main():
                          "falling back to this one)")
     args = ap.parse_args()
 
-    entry = ("examples/navigation/run_nav_level1_vel.py" if args.vel
+    if args.planar:
+        args.vel = True
+    entry = ("examples/navigation/run_nav_level1_vel_planar.py" if args.planar
+             else "examples/navigation/run_nav_level1_vel.py" if args.vel
              else "examples/navigation/run_nav_level1.py")
     if not (DEPTHNAV / entry).exists():
         raise SystemExit(f"methods/depthnav not present/complete at {DEPTHNAV} "
@@ -106,7 +113,8 @@ def main():
               "the thrust runner uses its built-in 500/20000", file=sys.stderr)
     sh(cmd, cwd=DEPTHNAV)
 
-    variant = "level1_vel" if args.vel else "level1"
+    variant = ("level1_vel_planar" if args.planar
+               else "level1_vel" if args.vel else "level1")
     log_dir = DEPTHNAV / "examples" / "navigation" / "logs" / variant
     final = newest_final_ckpt(log_dir, variant)
 
@@ -129,7 +137,8 @@ def main():
     meta = dict(schema="superfly-run-meta-v1", method="depthnav",
                 artifact=artifact.name,
                 produced_by=("scripts/train_depthnav.py "
-                             + ("--vel " if args.vel else "")
+                             + ("--planar " if args.planar
+                                else "--vel " if args.vel else "")
                              + f"--level0-iters {args.level0_iters} "
                              + f"--level1-iters {args.level1_iters}"),
                 submodule_sha=sha or "unknown",

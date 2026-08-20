@@ -13,7 +13,8 @@ normal commit), never rewriting history.
 | method (registry) | deployable artifact | produced by |
 |---|---|---|
 | `depthnav` | `DepthNav/level1_4/level1_4_iteration_13500.pth` | `scripts/train_depthnav.py` (legacy run predates it) |
-| `depthnav_vel` | `DepthNav/level1_vel/level1_vel.pth` — **does not exist yet** | `scripts/train_depthnav.py --vel` (Phase-3 deliverable; the registry has always pointed at this never-produced artifact) |
+| `depthnav_vel` | `DepthNav/level1_vel/level1_vel.pth` — **training (OSMO superfly-train-depthnav-7)** | `scripts/train_depthnav.py --vel` (Phase-3 deliverable; the registry has always pointed at this never-produced artifact) |
+| `depthnav_vel_planar` | `DepthNav/level1_vel_planar/level1_vel_planar.pth` — **does not exist yet** | `scripts/train_depthnav.py --planar` (vz forced to zero; deploy with `--policy-cfg small_yaw_vel_planar.yaml`) |
 | `diffaero` | `DiffAero/sha2c_pmc/checkpoints/exported_actor.pt2` | `scripts/train_diffaero.py` (wraps `script/train.py` + `script/export.py`) |
 | `diffaero_vel` | `DiffAero/sha2c_vel_cmd_oa/checkpoints/exported_actor.pt2` | as above |
 | `agile` | `AgileAutonomy/ckpt-50/ckpt-50` (TF2 prefix: `.index` + `.data-*`, no pointer file) | `scripts/train_agile.py` |

@@ -85,6 +85,31 @@ def method_registry():
                 "--max-vel-z", str(max(1.5, a.max_speed)),
             ],
         ),
+        # Planar velocity-command DepthNav (the depthnav analog of
+        # diffaero_vel_planar): same network family as depthnav_vel, but the
+        # VelocityBoundedYaw activation forces vz==0, so the policy commands
+        # horizontal velocity only and PX4's z loop holds altitude. The
+        # planar policy config MUST be passed explicitly -- with the default
+        # small_yaw_vel.yaml the untrained vz head would fly garbage
+        # vertical setpoints. Trained 0.8-1.5 m/s like depthnav_vel.
+        "depthnav_vel_planar": dict(
+            policy="depthnav",               # same sim camera + UDP transport
+            offboard="depthnav_vel_offboard.py",
+            control_hz=50.0,
+            goal_argc=3,
+            python=METHODS_DIR / "depthnav" / ".venv" / "bin" / "python",
+            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "level1_vel_planar"
+            / "level1_vel_planar.pth",
+            ckpt_kind="file",
+            speed_args=lambda a: [
+                "--target-speed", str(a.max_speed),
+                "--max-vel-xy", str(max(2.5, a.max_speed * 1.7)),
+                "--max-vel-z", str(max(1.5, a.max_speed)),
+                "--policy-cfg", str(METHODS_DIR / "depthnav" / "examples"
+                                    / "navigation" / "policy_cfg"
+                                    / "small_yaw_vel_planar.yaml"),
+            ],
+        ),
         "diffaero": dict(
             policy="diffaero",
             offboard="diffaero_offboard.py",
