@@ -4,6 +4,20 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-08-20 — Cylinder.generate z-offset bug: planar spawns 0.5 m below target — ESTABLISHED-NEGATIVE (fixed @762a2e2)
+
+`Cylinder.generate` computed `z = half*rand - 0.5 + mean` — the 0.5 is NOT
+scaled by half, which cancels only for the stock half=1.0 configs. The
+planar variant's pinned spawn (half=0) therefore spawned at mean-0.5 =
+1.0 m while targets sat at 1.5 m: with vz forced to 0 and success radius
+0.1, success_rate was mathematically pinned at 0 (superfly-train-depthnav-8,
+cancelled; the 3D run scored 0.86+ at the same phase, which is what flagged
+it). Fixed to `half*(rand-0.5)` (Uniform semantics; byte-identical
+distribution for half=1) + planar spawn-vz noise zeroed. Retrained as
+superfly-train-depthnav-9: sr 0.86 within 15 min of level1. Lesson: when a
+variant pins a distribution to a point, verify the rng actually emits the
+mean — Uniform and Cylinder had different offset conventions.
+
 ## 2026-08-19 — depthnav velocity-command variant (VELOCITY_YAW) re-implemented in the fork — SHIPPED (code); OSMO training PENDING
 
 Mirrors the diffaero pmv re-implementation: the vel variant existed only in
