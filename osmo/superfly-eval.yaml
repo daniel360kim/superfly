@@ -281,6 +281,7 @@ workflow:
           --methods {{ methods }} \
           --depthnav-python /opt/policy/bin/python \
           --depthnav_vel-python /opt/policy/bin/python \
+          --depthnav_vel_planar-python /opt/policy/bin/python \
           --diffaero-python /opt/policy/bin/python \
           --diffaero_vel-python /opt/policy/bin/python \
           --diffaero_vel_planar-python /opt/policy/bin/python \
