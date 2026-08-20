@@ -46,10 +46,9 @@ dependency order:
    aliases added to `~/.s3env`.
 3. **Training pipelines (Phase 3)**: `scripts/train_diffaero.py` DONE
    (pmv_planar_starling + pmc-starling runs committed, see ATTEMPTS.md).
-   `scripts/train_depthnav.py` written 2026-08-19 — the vel variant's
-   VELOCITY_YAW support + `small_yaw_vel.yaml` were re-implemented in the
-   fork (@4f845f5) and the first OSMO run submitted
-   (`superfly-train-depthnav-1`, `osmo/superfly-train-depthnav.yaml`);
+   `scripts/train_depthnav.py` DONE 2026-08-20: depthnav_vel AND
+   depthnav_vel_planar trained on OSMO, committed at plateau, benchmarked
+   6/6 each with videos, and TFLite-exported (see ATTEMPTS.md 2026-08-20);
    `train_agile.py` + `build_agile_dataset.py` still to write. The agile
    labels come from `superfly_expert_sampler` on airstation03; the one
    genuine gap is depth-image rendering for its rollouts (see ATTEMPTS.md

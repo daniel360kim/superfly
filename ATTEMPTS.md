@@ -4,6 +4,26 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-08-20 — depthnav_vel + depthnav_vel_planar: trained, benchmarked 6/6 each, TFLite'd — SHIPPED
+
+Both velocity-command depthnav variants (0.8–1.5 m/s starling velocity
+loop) trained on OSMO (runs -7/-9), harvested at plateau (level1 iters
+9500/9000, training-eval sr 0.94–0.98 / 0.93–0.96, collision 0 — same
+mid-run-checkpoint convention as level1_4) and committed with ONNX+TFLite
+exports beside each .pth (export_depthnav_tflite.py; ≤5e-06 vs torch,
+no recurrent error growth at rollout step 10). Benchmark `superfly-eval-8`
+(tarball superfly_stage_0820ev1 = 0817j sim payload + fresh repo,
+suite planar_lowvel_prims_v1, --max-speed 1.2, --record-video):
+**depthnav_vel 6/6, depthnav_vel_planar 6/6, zero collisions,
+policy_reported_reached everywhere**; per-trial depth.mp4 + rgb.mp4 in
+s3://superfly/runs/dnvel2/superfly_results_dnvel2.tar.gz. eval-7 died at
+the import preflight in 2 min (torchvision absent from /opt/policy — the
+2026-07 incident's gate paying for itself; torchvision now rides the cu128
+index with torch). Asset-mesh suite (planar_lowvel_v1) not yet flown —
+expect stochastic results there per the diffaero campaigns. Full 20k-iter
+training runs continue for the record; their final mirrors land in
+s3://superfly/runs/level1_vel{,_planar}/.
+
 ## 2026-08-20 — Cylinder.generate z-offset bug: planar spawns 0.5 m below target — ESTABLISHED-NEGATIVE (fixed @762a2e2)
 
 `Cylinder.generate` computed `z = half*rand - 0.5 + mean` — the 0.5 is NOT
