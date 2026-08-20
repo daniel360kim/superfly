@@ -199,8 +199,13 @@ workflow:
         # (no --system-site-packages: that is the default and the flag takes no value)
         python -m venv /opt/policy
         /opt/policy/bin/pip install --no-cache-dir -q --upgrade pip
+        # torchvision rides the same cu128 index so the pair stays matched:
+        # depthnav's extractors import `from torchvision import models`
+        # (superfly-eval-7 died at the depthnav_vel import preflight without
+        # it -- the 2026-07 torchvision incident all over again, the
+        # preflight caught it in 2 min this time).
         /opt/policy/bin/pip install --no-cache-dir -q \
-          torch --index-url https://download.pytorch.org/whl/cu128
+          torch torchvision --index-url https://download.pytorch.org/whl/cu128
         /opt/policy/bin/pip install --no-cache-dir -q \
           numpy scipy pymavlink pyyaml gymnasium opencv-python-headless
         # the superfly package itself (common layer + policy cores), no deps.
