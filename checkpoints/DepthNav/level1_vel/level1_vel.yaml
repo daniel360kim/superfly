@@ -1,0 +1,118 @@
+env_class: navigation_env
+env:
+  num_envs: 16
+  seed: 42
+  visual: true
+  single_env: true
+  base_action: [0.0, 0.0, 0.0]
+  robot_radius: 0.3
+  random_kwargs:
+    safe_spawn_radius: 0.1
+    min_starting_distance_to_target: 0.1
+    position:
+      class: cylinder
+      mean: [0.0, 0.0, 1.5]
+      half: [12.5, 12.5, 1.0]
+    velocity:
+      class: uniform
+      mean: [0.0, 0.0, 0.0]
+      half: [0.5, 0.5, 0.5]
+    rotation:
+      class: normal
+      mean: [0.0, 0.0, 0.0]
+      half: [0.0, 0.0, 0.2]
+    target:
+      class: uniform
+      mean: [0.0, 0.0, 1.5]
+      half: [0.0, 0.0, 0.0]
+    target_speed:
+      class: uniform
+      mean: [1.15]
+      half: [0.7]
+    velocity_noise:
+      class: normal
+      mean: [0.0, 0.0, 0.0]
+      half: [0.05, 0.05, 0.05]
+    rotation_noise:
+      class: normal
+      mean: [0.0, 0.0, 0.0]
+      half: [0.02, 0.02, 0.02]
+    gravity:
+      class: normal
+      mean: [0.0, 0.0, -9.81]
+      half: [0.0, 0.0, 1.5]
+  dynamics_kwargs:
+    action_type: velocity_world_frame
+    dt: 0.02
+    ctrl_dt: 0.02
+    ctrl_delay: 0.0
+    grad_decay: 0.92
+    avg_velocity_window_dt: 2.0
+    vel_smoothing_factor: 0.8
+    exp_smoothing_factor: 12.0
+    enable_ctrl_smoothing: false
+    enable_air_drag: false
+    air_drag_theta_1: 0.1
+    air_drag_theta_2: 0.1
+    vel_p_gain_xy: 1.8
+    vel_p_gain_z: 4.0
+    max_acc_xy: 17.0
+    min_acc_z: 0.5
+    max_acc_z: 19.6
+    motor_lag_lmbda: [11.8, 18.2]
+  scene_kwargs: {path: configs/level_1, reload_scenes: true, load_geodesics: true,
+    spawn_obstacles: false}
+  sensor_kwargs:
+  - sensor_type: depth
+    uuid: depth
+    resolution: [72, 128]
+    position: [0.1, -0.02, -0.04]
+    orientation: [0, 0, 0]
+    far: 20.0
+    near: 0.25
+  target_kwargs: {success_radius: 0.1}
+  reward_kwargs: {beta_1: 2.5, beta_2: -6, lambda_v: 4, lambda_c: 6, lambda_a: 0.01,
+    lambda_j: 0.001, lambda_om: 0.3, lambda_yaw: 4.0, lambda_vmax: 1.0, falloff_dis: 1.0}
+  max_episode_steps: 900
+  device: cpu
+  action_type: VELOCITY_YAW
+  inertial_frame: START
+  target_type: TARGET_VELOCITY_TARGET_DISTANCE
+train_bptt: {iterations: 20000, learning_rate_init: 0.001, learning_rate_final: 0.0005,
+  weight_decay: 0.01, horizon: 150, gamma: 1.0, log_interval: 100, checkpoint_interval: 500,
+  early_stop_reward_threshold: -150, device: cuda}
+policy_class: MultiInputPolicy
+policy:
+  feature_extractor_class: StateTargetImageExtractor
+  feature_extractor_kwargs:
+    activation_fn: leaky_relu
+    net_arch:
+      state:
+        mlp_layer: [192]
+        bn: false
+        ln: true
+      target:
+        mlp_layer: [192]
+        bn: false
+        ln: true
+      depth:
+        input_max_pool_H_W: [12, 16]
+        kernel_size: [2, 3, 3]
+        channels: [32, 64, 128]
+        padding: [0, 0, 0]
+        stride: [1, 1, 1]
+        cnn_bn: false
+        mlp_layer: [192]
+        bn: false
+        ln: true
+      concatenate: false
+  net_arch:
+    recurrent:
+      class: GRUCell
+      kwargs: {hidden_size: 192}
+    mlp_layer: [4]
+  activation_fn: leaky_relu
+  output_activation_fn: velocity_bounded_yaw
+  output_activation_kwargs: {max_vel_xy: 2.5, max_vel_z: 1.5}
+  device: cuda
+update_env_kwargs: {action_type: VELOCITY_YAW, inertial_frame: START, target_type: TARGET_VELOCITY_TARGET_DISTANCE}

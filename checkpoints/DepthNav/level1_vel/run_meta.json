@@ -1,0 +1,11 @@
+{
+  "schema": "superfly-run-meta-v1",
+  "method": "depthnav",
+  "host": "gs2",
+  "date": "2026-08-20T11:11:20+00:00",
+  "artifact": "level1_vel.pth",
+  "produced_by": "scripts/train_depthnav.py --vel --level0-iters 500 --level1-iters 20000 (OSMO superfly-train-depthnav-7; HARVESTED at level1 iteration 9500 from the S3 partial mirror -- eval plateaued sr 0.94-0.98, collision 0, avg_speed 1.07 from iter ~5000 on; the run was still improving nothing at harvest time and continues to 20000 for the record)",
+  "submodule_sha": "4f845f5",
+  "tarball": "superfly_stage_0819dn2.tar",
+  "harvest_iteration": 9500
+}
