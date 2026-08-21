@@ -10,7 +10,7 @@ Unlike diffaero_offboard.py (accel → SET_ATTITUDE_TARGET), this script feeds
 the policy's world-frame velocity setpoint straight to PX4's velocity loop.
 
   * Observation (obs_frame=local, velocity point-mass): state =
-    [target_vel_local(3), v_local(3)]. The sha2c_vel_cmd checkpoint was trained
+    [target_vel_local(3), v_local(3)]. The vel_nodepth checkpoint (ne sha2c_vel_cmd) was trained
     with env=pc (no depth); env=oa checkpoints also consume 9x16 perception.
   * Action (action_frame=local): world-frame velocity setpoint
     vel_cmd = Rz @ scaled_action, sent to PX4 as NED (vx, vy, vz).
@@ -23,7 +23,7 @@ Usage:
     # Against PX4 SITL (after running run_px4_sim.py --policy diffaero):
     python run_px4_sim.py ... --no-debug-frames   # skip camera_debug.png writes in sim
     python scripts/diffaero_vel_offboard.py \\
-        --checkpoint checkpoints/DiffAero/sha2c_vel_cmd \\
+        --checkpoint checkpoints/DiffAero/vel_depth \\
         --goal 15 0 --climb-alt 2.0 --quiet
 
     # Against real VOXL2 over UDP:

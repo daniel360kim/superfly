@@ -3,5 +3,7 @@
   "artifact": "checkpoints/exported_actor.pt2",
   "produced_by": "legacy (pre-reorg): as sha2c_pmc but with the pmclag dynamics (first-order velocity lag), 2026-06-22",
   "host": "unknown (pre-reorg)",
-  "schema": "superfly-run-meta-v1"
+  "schema": "superfly-run-meta-v1",
+  "renamed_from": "sha2c_pmc_lag_2026-06-22",
+  "renamed_date": "2026-08-21"
 }

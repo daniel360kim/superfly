@@ -55,7 +55,7 @@ def method_registry():
             control_hz=50.0,
             goal_argc=3,
             python=METHODS_DIR / "depthnav" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "level1_4"
+            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "thrust_level1_4"
             / "level1_4_iteration_13500.pth",
             ckpt_kind="file",
             speed_args=lambda a: ["--target-speed", str(a.max_speed)],
@@ -75,7 +75,7 @@ def method_registry():
             control_hz=50.0,
             goal_argc=3,
             python=METHODS_DIR / "depthnav" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "level1_vel"
+            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "vel_starling_v1"
             / "level1_vel.pth",
             ckpt_kind="file",
             speed_args=lambda a: [
@@ -98,7 +98,7 @@ def method_registry():
             control_hz=50.0,
             goal_argc=3,
             python=METHODS_DIR / "depthnav" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "level1_vel_planar"
+            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "vel_planar_starling_v1"
             / "level1_vel_planar.pth",
             ckpt_kind="file",
             speed_args=lambda a: [
@@ -116,7 +116,7 @@ def method_registry():
             control_hz=30.0,
             goal_argc=2,                     # diffaero --goal takes X Y only
             python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "sha2c_pmc",
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "thrust_pmc",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
@@ -127,7 +127,7 @@ def method_registry():
             goal_argc=2,
             python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
             # velocity-command actor (action_is_velocity); the _oa run consumes depth
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "sha2c_vel_cmd_oa",
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "vel_depth",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
@@ -151,7 +151,7 @@ def method_registry():
             # v1's 4/6 on planar_lowvel_v1, colliding on fields v1 passed
             # (eval planar2 vs planar1, 2026-08-18). Kept committed for
             # reference; do not re-try that recipe as a margin lever.
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "pmv_planar_starling_v1",
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "vel_planar_starling_v1",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),

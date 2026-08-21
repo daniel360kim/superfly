@@ -4,6 +4,22 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-08-21 — checkpoints/ runs renamed to command-family scheme — SHIPPED
+
+`<command-family>[_<qualifier>]_<version>` (thrust_*/vel_*/vel_planar_*;
+"starling" = spec-matched 0.8–1.5 m/s band). Map, also in each run's
+run_meta.json `renamed_from`: DepthNav level1_4→thrust_level1_4,
+level1_vel→vel_starling_v1, level1_vel_planar→vel_planar_starling_v1;
+DiffAero sha2c_pmc→thrust_pmc, sha2c_pmc_lag_2026-06-22→thrust_pmc_lag,
+sha2c_pmc_starling2max_v1→thrust_pmc_starling_v1,
+sha2c_vel_cmd→vel_nodepth, sha2c_vel_cmd_oa→vel_depth,
+pmv_planar_starling_v{1,2}→vel_planar_starling_v{1,2}. Agile ckpt-50
+unchanged (dir = TF prefix name). Registry paths + script docstrings
+updated in the same commit; `checkpoint_ready` verified True for all 7
+methods and both depthnav vel artifacts load through the wrapper.
+**ATTEMPTS entries below this line use the old names.** S3 runs/<tag>
+prefixes keep their original training tags.
+
 ## 2026-08-20 — depthnav_vel + depthnav_vel_planar: trained, benchmarked 6/6 each, TFLite'd — SHIPPED
 
 Both velocity-command depthnav variants (0.8–1.5 m/s starling velocity
