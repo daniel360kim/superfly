@@ -3,5 +3,7 @@
   "artifact": "checkpoints/exported_actor.pt2",
   "produced_by": "legacy (pre-reorg): velocity-command actor (action_is_velocity), env=pc (no depth)",
   "host": "unknown (pre-reorg)",
-  "schema": "superfly-run-meta-v1"
+  "schema": "superfly-run-meta-v1",
+  "renamed_from": "sha2c_vel_cmd",
+  "renamed_date": "2026-08-21"
 }

@@ -7,5 +7,7 @@
   "produced_by": "scripts/train_depthnav.py --planar --level0-iters 500 --level1-iters 20000 (OSMO superfly-train-depthnav-9; HARVESTED at level1 iteration 9000 from the S3 partial mirror -- eval plateaued sr 0.93-0.96, collision ~0, avg_speed 1.07-1.13; run continues to 20000 for the record. Run -8 predecessor was scrapped for the Cylinder z-offset bug, see ATTEMPTS.md 2026-08-20)",
   "submodule_sha": "762a2e2",
   "tarball": "superfly_stage_0820dn2.tar",
-  "harvest_iteration": 9000
+  "harvest_iteration": 9000,
+  "renamed_from": "level1_vel_planar",
+  "renamed_date": "2026-08-21"
 }

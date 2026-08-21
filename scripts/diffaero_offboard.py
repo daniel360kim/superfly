@@ -27,7 +27,7 @@ point_mass_quat and returns (acc_cmd, quat_xyzw_cmd, acc_norm).
 
 Usage:
     # Against PX4 SITL (after running run_px4_sim.py --policy diffaero):
-    python diffaero_offboard.py --checkpoint checkpoints/DiffAero/sha2c_pmc --depth \
+    python diffaero_offboard.py --checkpoint checkpoints/DiffAero/thrust_pmc --depth \
         --goal <px> <py>
 
     # Against real VOXL2 over UDP:

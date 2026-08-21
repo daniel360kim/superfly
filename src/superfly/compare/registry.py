@@ -55,7 +55,7 @@ def method_registry():
             control_hz=50.0,
             goal_argc=3,
             python=METHODS_DIR / "depthnav" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "level1_4"
+            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "thrust_level1_4"
             / "level1_4_iteration_13500.pth",
             ckpt_kind="file",
             speed_args=lambda a: ["--target-speed", str(a.max_speed)],
@@ -63,19 +63,19 @@ def method_registry():
         # Velocity-command DepthNav: same network family and same sim depth
         # camera as "depthnav", but the policy emits a velocity setpoint that
         # goes to PX4's velocity loop (SET_POSITION_TARGET_LOCAL_NED) rather
-        # than a thrust vector to the attitude loop. Trained for 0.7-1.5 m/s,
+        # than a thrust vector to the attitude loop. Trained for 0.8-1.5 m/s,
         # so --max-speed should sit in that band. Unlike "depthnav", this
         # offboard writes the "end" phase marker on goal-reach, so
-        # policy_reported_reached behaves like the other methods. Its
-        # checkpoint has never existed yet -- scripts/train_depthnav.py is
-        # what finally produces it (checkpoint_ready gates it out until then).
+        # policy_reported_reached behaves like the other methods. The
+        # checkpoint comes from scripts/train_depthnav.py --vel
+        # (checkpoint_ready gates the method out until a run is committed).
         "depthnav_vel": dict(
             policy="depthnav",               # same sim camera + UDP transport
             offboard="depthnav_vel_offboard.py",
             control_hz=50.0,
             goal_argc=3,
             python=METHODS_DIR / "depthnav" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "level1_vel"
+            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "vel_starling_v1"
             / "level1_vel.pth",
             ckpt_kind="file",
             speed_args=lambda a: [
@@ -85,13 +85,38 @@ def method_registry():
                 "--max-vel-z", str(max(1.5, a.max_speed)),
             ],
         ),
+        # Planar velocity-command DepthNav (the depthnav analog of
+        # diffaero_vel_planar): same network family as depthnav_vel, but the
+        # VelocityBoundedYaw activation forces vz==0, so the policy commands
+        # horizontal velocity only and PX4's z loop holds altitude. The
+        # planar policy config MUST be passed explicitly -- with the default
+        # small_yaw_vel.yaml the untrained vz head would fly garbage
+        # vertical setpoints. Trained 0.8-1.5 m/s like depthnav_vel.
+        "depthnav_vel_planar": dict(
+            policy="depthnav",               # same sim camera + UDP transport
+            offboard="depthnav_vel_offboard.py",
+            control_hz=50.0,
+            goal_argc=3,
+            python=METHODS_DIR / "depthnav" / ".venv" / "bin" / "python",
+            checkpoint=CHECKPOINTS_DIR / "DepthNav" / "vel_planar_starling_v1"
+            / "level1_vel_planar.pth",
+            ckpt_kind="file",
+            speed_args=lambda a: [
+                "--target-speed", str(a.max_speed),
+                "--max-vel-xy", str(max(2.5, a.max_speed * 1.7)),
+                "--max-vel-z", str(max(1.5, a.max_speed)),
+                "--policy-cfg", str(METHODS_DIR / "depthnav" / "examples"
+                                    / "navigation" / "policy_cfg"
+                                    / "small_yaw_vel_planar.yaml"),
+            ],
+        ),
         "diffaero": dict(
             policy="diffaero",
             offboard="diffaero_offboard.py",
             control_hz=30.0,
             goal_argc=2,                     # diffaero --goal takes X Y only
             python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "sha2c_pmc",
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "thrust_pmc",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
@@ -102,7 +127,7 @@ def method_registry():
             goal_argc=2,
             python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
             # velocity-command actor (action_is_velocity); the _oa run consumes depth
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "sha2c_vel_cmd_oa",
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "vel_depth",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
@@ -126,7 +151,7 @@ def method_registry():
             # v1's 4/6 on planar_lowvel_v1, colliding on fields v1 passed
             # (eval planar2 vs planar1, 2026-08-18). Kept committed for
             # reference; do not re-try that recipe as a margin lever.
-            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "pmv_planar_starling_v1",
+            checkpoint=CHECKPOINTS_DIR / "DiffAero" / "vel_planar_starling_v1",
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),

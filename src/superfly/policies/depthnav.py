@@ -18,10 +18,11 @@ Ground-truth config (saved logs/level1/level1.yaml for ckpt level1_4_iteration_1
 Velocity-command variant (action_mode="velocity", policy_cfg/small_yaw_vel.yaml):
   action_type=VELOCITY_YAW, output_activation=velocity_bounded_yaw
   -> action[:3]=velocity setpoint in m/s (START frame), action[3]=yaw
-  Trained for target_speed in [0.7, 1.5] m/s with bounds max_vel_xy=2.5,
-  max_vel_z=1.5. Send the raw output: unlike wrapper/diffaero_vel_core.py we do
-  NOT re-apply a client-side first-order lag, because the training sim already
-  models PX4's velocity loop explicitly.
+  Trained for target_speed in [0.8, 1.5] m/s (starling velocity-loop dynamics,
+  fork commit 4f845f5) with bounds max_vel_xy=2.5, max_vel_z=1.5. Send the raw
+  output: unlike wrapper/diffaero_vel_core.py we do NOT re-apply a client-side
+  first-order lag, because the training sim models PX4's velocity loop
+  explicitly (P on velocity error + starling accel box + rotor lag).
 
 Frames: depthnav uses ENU (std frame). START = world-aligned at spawn, fixed thereafter.
 We capture R_ws (world<-start) once at policy handoff; state/target/thrust are START-frame.

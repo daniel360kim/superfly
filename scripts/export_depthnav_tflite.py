@@ -57,7 +57,7 @@ verification reference.
 
 Usage (prototype):
     python scripts/export_depthnav_tflite.py \
-        checkpoints/DepthNav/level1_4/level1_4_iteration_13500.pth \
+        checkpoints/DepthNav/thrust_level1_4/level1_4_iteration_13500.pth \
         --out-dir /path/to/scratch \
         --tflite-python ~/tflite-venv/bin/python
 
@@ -463,7 +463,7 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("checkpoint",
                     help=".pth file or a run dir containing exactly one .pth "
-                         "(e.g. checkpoints/DepthNav/level1_4)")
+                         "(e.g. checkpoints/DepthNav/thrust_level1_4)")
     ap.add_argument("--cfg", default=None,
                     help="policy yaml (default: policy_cfg/small_yaw.yaml; "
                          "pass small_yaw_vel.yaml for velocity checkpoints -- "
