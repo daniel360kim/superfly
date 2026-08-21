@@ -1,69 +1,39 @@
 # checkpoints/ — committed policy weights
 
-Layout: `checkpoints/<Method>/<run>/`, one `run_meta.json` beside each run
-(method, producing command, provenance; runs written by
-`scripts/train_<method>.py` also record the submodule SHA and host).
+One folder per training run, `<Method>/<run>/`. Weights are committed on
+purpose: a fresh clone flies with no credentials. Full provenance for any
+run (training command, metrics, former name) is in its `run_meta.json`.
 
-Run naming: `<command-family>[_<qualifier>]_<version>` — `thrust_*` policies
-command a thrust/attitude vector, `vel_*` a PX4 velocity setpoint,
-`vel_planar_*` a velocity setpoint with vz ≡ 0; `starling` marks runs
-trained against the measured Starling 2 Max constants
-(`configs/vehicles/starling2max.yaml`) at the 0.8–1.5 m/s deployment band.
-Runs renamed on 2026-08-21 keep their original name in `run_meta.json`
-(`renamed_from`) — ATTEMPTS.md entries before that date use the old names.
+Naming: `thrust_*` policies command attitude/thrust, `vel_*` command PX4
+velocity setpoints, `vel_planar_*` are velocity with vz fixed to 0.
+`starling` = trained for the Starling 2 Max at 0.8–1.5 m/s. A `.tflite` /
+`.onnx` next to a `.pth` is a verified export of that same policy.
 
-**These are committed in git on purpose** — anyone who clones gets flyable
-weights with no lab credentials and no LFS. Every new run adds permanently;
-the pressure valve is pruning superseded runs (delete the run dir in a
-normal commit), never rewriting history. `checkpoint_ready()`
-(`superfly.compare.registry`) gates each method on its artifact's existence
-per `ckpt_kind`, so a missing artifact skips the method with a notice
-instead of flying garbage.
+## DepthNav
 
-TFLite/ONNX exports sit beside their source checkpoint where they exist:
-`scripts/export_tflite.py` (DiffAero, ONNX→TFLite) and
-`scripts/export_depthnav_tflite.py` (DepthNav, .pth→ONNX→TFLite; the GRU
-makes it a different pipeline). Each `.tflite` has a `.tflite.json` sidecar
-with sha256s, tool versions, and verification error stats.
+| run | what it is |
+|---|---|
+| `thrust_level1_4` | Legacy thrust policy, 2–4 m/s. The baseline `depthnav` method. |
+| `vel_starling_v1` | Velocity commands, 0.8–1.5 m/s. Benchmarked 6/6, no collisions. → `depthnav_vel` |
+| `vel_planar_starling_v1` | Same but horizontal-only (vz=0). Benchmarked 6/6, no collisions. → `depthnav_vel_planar` |
 
-## Index
+## DiffAero
 
-Speeds are the training band. "6/6" results are the
-`suites/planar_lowvel_prims_v1.json` benchmark at `--max-speed 1.2`
-(deterministic primitives, zero collisions unless noted); see ATTEMPTS.md
-for the campaigns.
+| run | what it is |
+|---|---|
+| `thrust_pmc` | Legacy thrust policy. The baseline `diffaero` method. |
+| `thrust_pmc_lag` | Old experiment (motor-lag dynamics). Reference only. |
+| `thrust_pmc_starling_v1` | Thrust policy with measured starling motor lag, 3–6 m/s. |
+| `vel_nodepth` | Old velocity policy, no depth input. Superseded by `vel_depth`. |
+| `vel_depth` | Velocity commands with depth input. → `diffaero_vel` |
+| `vel_planar_starling_v1` | Horizontal-only velocity, 0.8–1.5 m/s. Benchmarked 6/6. → `diffaero_vel_planar` |
+| `vel_planar_starling_v2` | Retrain of v1 that flew worse. **Do not deploy** — kept for reference. |
 
-### DepthNav (habitat-trained, 72×128 depth, GRU policy)
+## AgileAutonomy
 
-| run | was | registry method | artifact | what it is |
-|---|---|---|---|---|
-| `thrust_level1_4` | `level1_4` | `depthnav` | `level1_4_iteration_13500.pth` | Legacy thrust-command policy (2–4 m/s, `small_yaw.yaml`). Pre-reorg; exact training config unrecorded. |
-| `vel_starling_v1` | `level1_vel` | `depthnav_vel` | `level1_vel.pth` + `.onnx` + `.tflite` | Velocity-command, 0.8–1.5 m/s starling velocity-loop dynamics. OSMO run superfly-train-depthnav-7, harvested at plateau iter 9500 (training-eval sr 0.94–0.98, collision 0). **Benchmark 6/6.** Full 20k-iter final: `s3://superfly/runs/level1_vel/`. |
-| `vel_planar_starling_v1` | `level1_vel_planar` | `depthnav_vel_planar` | `level1_vel_planar.pth` + `.onnx` + `.tflite` | As `vel_starling_v1` but vz forced ≡ 0 (diffaero planar analog). Run superfly-train-depthnav-9, harvested iter 9000 (sr 0.93–0.96). **Benchmark 6/6.** Deploy MUST pass `--policy-cfg small_yaw_vel_planar.yaml` (the vz head is untrained). Full final: `s3://superfly/runs/level1_vel_planar/`. |
+| run | what it is |
+|---|---|
+| `ckpt-50` | Legacy TF2 checkpoint for the `agile` method (dir name = TF prefix). |
 
-Each vel run dir also carries the merged training config (`.yaml`) and the
-training-repo eval curve (`.csv`). Artifact filenames keep the trainer's
-variant names (`level1_vel*.pth`) — `scripts/train_depthnav.py` writes the
-same names into any future run dir.
-
-### DiffAero (taichi-sim-trained; deployable artifact is `checkpoints/exported_actor.pt2` in each run)
-
-| run | was | registry method | what it is |
-|---|---|---|---|
-| `thrust_pmc` | `sha2c_pmc` | `diffaero` | Legacy thrust/attitude policy (pmc dynamics, default plant). The baseline "diffaero" method. |
-| `thrust_pmc_lag` | `sha2c_pmc_lag_2026-06-22` | — | Legacy pmc variant with first-order velocity lag (pmclag), 2026-06-22. Kept for reference; not in the registry. |
-| `thrust_pmc_starling_v1` | `sha2c_pmc_starling2max_v1` | — | pmc with measured starling motor lag (lmbda 13.9, tau 72 ms), 3–6 m/s, sr 0.78 (OSMO train-18). Spec-matching experiment; not yet a registry method. |
-| `vel_nodepth` | `sha2c_vel_cmd` | — | Legacy velocity-command actor, env=pc (no depth). Superseded by `vel_depth`. |
-| `vel_depth` | `sha2c_vel_cmd_oa` | `diffaero_vel` | Legacy velocity-command actor consuming 9×16 depth. |
-| `vel_planar_starling_v1` | `pmv_planar_starling_v1` | `diffaero_vel_planar` | **The deployed planar low-speed policy** (0.8–1.5 m/s, sr 0.92): flew `planar_lowvel_prims_v1` 6/6 zero-collision (eval planar5). |
-| `vel_planar_starling_v2` | `pmv_planar_starling_v2` | — | v1 recipe + r_drone 0.3 / n_obstacles 40, meant to buy clearance margin — **REGRESSED at deploy** (1/6 vs v1's pass; ATTEMPTS 2026-08-18). Kept for reference — do not redeploy. Carries the ONNX + TFLite export (`exported_actor.tflite`, verified 1.9e-06). |
-
-### AgileAutonomy
-
-| run | registry method | what it is |
-|---|---|---|
-| `ckpt-50` | `agile` | Legacy TF2 checkpoint prefix (`.index` + `.data-*`, no pointer file; the dir name matches the prefix, a TF convention, so it keeps its original name) for the Keras re-implementation in `superfly.policies.agile`. `scripts/train_agile.py` (Phase 3) will produce successors. |
-
-Deleted, deliberately: `DiffPhysDrone/` (method removed from the harness)
-and the three `DiffAero/planar_*` symlinks (targets never committed,
-unrecoverable — see ATTEMPTS.md 2026-08-17).
+`→ name` is the method entry in `superfly.compare.registry` that flies the
+run. Runs without an arrow aren't wired into the comparison harness.
