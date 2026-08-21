@@ -1,0 +1,77 @@
+{
+  "schema": "superfly-depthnav-tflite-export-v1",
+  "source_checkpoint": "checkpoints/DepthNav/level1_vel/level1_vel.pth",
+  "source_checkpoint_sha256": "3bda5a43b1d293547cc37b14a8c3e0b4a7503740a203d5ebcf37274f5c0e9a11",
+  "random_weights": false,
+  "cfg": "methods/depthnav/examples/navigation/policy_cfg/small_yaw_vel.yaml",
+  "output_activation_fn": "velocity_bounded_yaw",
+  "source_onnx": "/tmp/claude-1000/-home-ubuntu-anyanything/a3fe1fbf-2108-49f6-b922-a7bece6b30db/scratchpad/depthnav-tflite/level1_vel.onnx",
+  "source_onnx_sha256": "1705377a5046047241b2bbea7f55fbb594ed8a4f889b2de96857c4cc3ece5d08",
+  "opset": 17,
+  "io": {
+    "inputs": {
+      "state": [
+        1,
+        7
+      ],
+      "target": [
+        1,
+        4
+      ],
+      "depth": [
+        1,
+        1,
+        72,
+        128
+      ],
+      "latent": [
+        1,
+        192
+      ]
+    },
+    "outputs": {
+      "action": [
+        1,
+        4
+      ],
+      "new_latent": [
+        1,
+        192
+      ]
+    }
+  },
+  "tool_versions": {
+    "torch": "2.13.0+cpu",
+    "onnx2tf": "1.29.24",
+    "onnxsim": "v0.6.5",
+    "tensorflow": "2.21.0",
+    "onnx": "1.20.1",
+    "onnxruntime": "1.26.0",
+    "numpy": "2.2.6"
+  },
+  "verification": {
+    "n_single_step": 64,
+    "wrapper_vs_model_max_abs_err": 9.5367431640625e-07,
+    "onnx_vs_torch_max_abs_err": 1.817941665649414e-06,
+    "tflite_vs_onnxruntime_max_abs_err": 3.5762786865234375e-06,
+    "rollout_steps": 10,
+    "rollout_tflite_vs_torch_per_step_max_abs_err": [
+      1.0728836059570312e-06,
+      1.564621925354004e-06,
+      1.996755599975586e-06,
+      1.9818544387817383e-06,
+      1.3709068298339844e-06,
+      1.6689300537109375e-06,
+      2.2798776626586914e-06,
+      1.6689300537109375e-06,
+      1.6391277313232422e-06,
+      2.726912498474121e-06
+    ],
+    "rollout_final_step_max_abs_err": 2.726912498474121e-06,
+    "fp32_atol": 0.0001,
+    "rollout_atol": 0.001
+  },
+  "tflite_bytes": 8870480,
+  "date": "2026-08-20T11:13:58+00:00",
+  "command": "/home/ubuntu/anyanything/superfly/scripts/export_depthnav_tflite.py --stage onnx2tflite checkpoints/DepthNav/level1_vel/level1_vel.pth --out-dir /tmp/claude-1000/-home-ubuntu-anyanything/a3fe1fbf-2108-49f6-b922-a7bece6b30db/scratchpad/depthnav-tflite --cfg methods/depthnav/examples/navigation/policy_cfg/small_yaw_vel.yaml"
+}
