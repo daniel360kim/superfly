@@ -1,0 +1,67 @@
+[
+  {
+    "name": "diffphys_s0",
+    "obstacles": "diffphys",
+    "seed": 0,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s1",
+    "obstacles": "diffphys",
+    "seed": 1,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s2",
+    "obstacles": "diffphys",
+    "seed": 2,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s3",
+    "obstacles": "diffphys",
+    "seed": 3,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s4",
+    "obstacles": "diffphys",
+    "seed": 4,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  }
+]
