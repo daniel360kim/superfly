@@ -52,7 +52,9 @@ def _reference():
 def _random_state(rng):
     from scipy.spatial.transform import Rotation
     pos = rng.uniform(-20, 20, 3)
-    R = Rotation.from_euler("xyz", rng.uniform(-0.6, 0.6, 3)).as_matrix()
+    # a real attitude, not a near-identity one: R must actually matter here
+    R = Rotation.from_euler("xyz", [rng.uniform(-0.6, 0.6), rng.uniform(-0.6, 0.6),
+                                    rng.uniform(-np.pi, np.pi)]).as_matrix()
     vel = rng.uniform(-4, 4, 3)
     omega_world = rng.uniform(-2, 2, 3)
     goal = rng.uniform(-40, 40, 3)
@@ -79,15 +81,18 @@ def test_student_state_encoder_matches_reference(seed):
     pos, R, vel, omega_world, goal = _random_state(rng)
     goal_speed = float(rng.choice([0.0, 1.0, 2.0, 3.0]))
 
-    obs = sim_episode.Obs(t=0.0, p=pos, v=vel, R=R, omega=omega_world,
+    # omega_body is what BOTH sides are handed: MAVLink gives a body rate, and
+    # sim_episode.run_episode's Obs.omega is already a body rate (integrated
+    # from dR = R.T @ R_new). The reference then applies R.T to it anyway, so
+    # the same body rate goes in unrotated on both sides of this comparison --
+    # no rotation is applied to the test input to make them agree.
+    omega_body = omega_world
+    obs = sim_episode.Obs(t=0.0, p=pos, v=vel, R=R, omega=omega_body,
                           goal_p=goal, goal_speed=goal_speed, depth=None)
     expected = sim_episode.OnnxPolicy.encode_state(obs)     # (1, 1, 22)
 
-    # The deployment is handed a BODY-frame angular rate (MAVLink gives body
-    # rates directly); the reference stores a world one and rotates it. Same
-    # quantity, so this is the honest mapping between the two call sites.
     got = _NoNet(goal_speed)._student_state_to_model_input(
-        pos, R, vel, R.T @ omega_world, goal)
+        pos, R, vel, omega_body, goal)
 
     assert got.shape == (1, 1, 22) == expected.shape
     np.testing.assert_allclose(got, expected, rtol=0, atol=1e-5)
@@ -323,3 +328,111 @@ def test_student_plan_is_not_velocity_rescaled(stub_mpc):
     for max_vel in (1.0, 3.0, 7.0):
         policy = AgilePolicy(ckpt, max_vel=max_vel, control_hz=30.0)
         np.testing.assert_array_equal(policy._scale_body_plan(plan), plan)
+
+
+def test_omega_channel_is_rotated_like_the_reference():
+    """Guard against silently reverting to feeding omega_body raw: the two
+    conventions differ (the whole point of finding 4), so the test must fail if
+    the R.T is dropped."""
+    from scipy.spatial.transform import Rotation
+    R = Rotation.from_euler("xyz", [0.3, -0.25, -2.0]).as_matrix()
+    omega_body = np.array([0.4, -0.2, 0.7])
+    v = _NoNet(0.0)._student_state_to_model_input(
+        np.zeros(3), R, np.zeros(3), omega_body, np.array([5.0, 0.0, 0.0]))[0, 0]
+    np.testing.assert_allclose(v[15:18], R.T @ omega_body, atol=1e-6)
+    assert not np.allclose(v[15:18], omega_body, atol=1e-3), \
+        "R.T must actually change this vector, or the test proves nothing"
+
+
+# --------------------------------------------------------------------------- #
+# 7. the MPC reference IS sim_episode's fit_cubic / eval_cubic
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("from_rest", [True, False])
+def test_mpc_reference_equals_reference_cubic(from_rest):
+    sim_episode, _ = _reference()
+    from superfly.policies.agile.mpc import (
+        fit_cubic_state, build_reference_cubic, DT, N)
+
+    rng = np.random.default_rng(3)
+    p = np.array([1.0, -2.0, 1.8])
+    v = np.zeros(3) if from_rest else np.array([2.6, 0.4, 0.0])
+    wps = p[None] + np.cumsum(rng.normal([1.4, 0.0, 0.0], 0.3, size=(10, 3)), axis=0)
+    wps[:, 2] = np.clip(wps[:, 2], 0.6, 3.9)          # inside Z_REF: no clipping here
+
+    sim_episode.set_waypoint_dt(0.5)
+    ref_c = sim_episode.fit_cubic(p, v, wps)
+    got_c = fit_cubic_state(p, v, wps, 0.5)
+    np.testing.assert_allclose(got_c, ref_c, rtol=0, atol=1e-9)
+
+    # and the reference the MPC is actually handed, sampled at its own nodes
+    yref, yterm, _ = build_reference_cubic(got_c, yaw_des=0.0)
+    for i in range(N + 1):
+        p_ref, v_ref, _ = sim_episode.eval_cubic(ref_c, i * DT)
+        row = yref[i] if i < N else yterm
+        np.testing.assert_allclose(row[:3], p_ref, rtol=0, atol=1e-9)
+        np.testing.assert_allclose(row[7:10], v_ref, rtol=0, atol=1e-9)
+
+    # the property that motivated the fix: from rest the reference commands zero
+    if from_rest:
+        np.testing.assert_allclose(yref[0][7:10], 0.0, atol=1e-12)
+
+
+def test_plan_age_offsets_the_reference():
+    from superfly.policies.agile.mpc import build_reference_cubic, DT
+    c = np.array([[0.0, 0.0, 2.0], [3.0, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.0]])
+    a, _, _ = build_reference_cubic(c, 0.0, t_offset=0.0)
+    b, _, _ = build_reference_cubic(c, 0.0, t_offset=2 * DT)
+    np.testing.assert_allclose(b[0][:3], a[2][:3], atol=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# 8. the student flies its own vertical plan
+# --------------------------------------------------------------------------- #
+def test_world_plan_z_is_clipped_to_the_reference_band(stub_mpc):
+    pytest.importorskip("onnxruntime")
+    from superfly.policies.agile.core import AgileObs, STUDENT_Z_REF
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=30.0, net_every=1,
+                         alt_follow=True, mode_select="veto")
+    # a plan that would leave the band in both directions
+    traj = np.zeros((3, 30), np.float32)
+    traj[:, 0:10] = np.arange(1, 11) * 1.5              # x
+    traj[:, 20:30] = np.linspace(-6.0, 6.0, 10)         # z, way outside Z_REF
+    policy._adopt_plan(np.array([0.1, 0.2, 0.3], np.float32), traj,
+                       np.array([0.0, 0.0, 2.0]), np.eye(3), None, np.zeros(3))
+    z = policy._world_points_per_mode[:, 1:, 2]
+    assert z.min() >= STUDENT_Z_REF[0] - 1e-9
+    assert z.max() <= STUDENT_Z_REF[1] + 1e-9
+    assert policy._cubic is not None
+
+
+def test_registry_forces_alt_follow_and_net_thread():
+    from superfly.compare.registry import method_registry, STUDENT_MAX_VEL
+
+    class _Args:
+        max_speed = 3.0
+    args = method_registry()["agile_student"]["speed_args"](_Args())
+    assert "--alt-follow" in args, "the student must fly its own vertical plan"
+    assert "--net-thread" in args, "inference must not block the control loop"
+    assert float(args[args.index("--max-vel") + 1]) == STUDENT_MAX_VEL == 3.5
+
+
+def test_non_finite_plan_keeps_the_previous_one(stub_mpc):
+    pytest.importorskip("onnxruntime")
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=30.0, alt_follow=True)
+    good = np.tile(np.arange(1, 11, dtype=np.float32), (3, 3))[:3, :30].copy()
+    policy._adopt_plan(np.float32([0.1, 0.2, 0.3]), good,
+                       np.zeros(3), np.eye(3), None, np.zeros(3))
+    kept = policy._world_points.copy()
+    bad = good.copy(); bad[1, 4] = np.nan
+    policy._adopt_plan(np.float32([0.1, 0.2, 0.3]), bad,
+                       np.ones(3), np.eye(3), None, np.zeros(3))
+    np.testing.assert_array_equal(policy._world_points, kept)
+    assert np.isfinite(policy._world_points).all()
+
+
+def test_onnx_session_threads_are_pinned():
+    pytest.importorskip("onnxruntime")
+    b = OnnxStudentBackend(CHECKPOINTS / "t5fix_s_r1" / "student.onnx")
+    assert b.intra_op_threads == OnnxStudentBackend.DEFAULT_INTRA_OP_THREADS == 8

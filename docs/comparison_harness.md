@@ -210,6 +210,9 @@ what makes `checkpoint_ready` gate it. Three things differ from `agile`:
 | state | 21-dim, **de-yawed** R, goal as a **unit direction** to a point `future_time * max_vel` ahead on the mission line | 22-dim, **raw** R, goal as the **metric** body-frame vector clamped to 10 m, plus `v_goal` (arrival speed, `--goal-speed`) |
 | plan | 10 waypoints at 0.1 s, rescaled by `max_vel / 7` | M x N waypoints (both read off the graph) in **absolute metres** at 0.5 s — **never** rescaled |
 | mode | always the lowest `\|alpha\|` | depth veto + argmin cost (`--mode-select`) |
+| altitude | PD hold on the climb altitude | **follows the plan's z** (`--alt-follow`, forced), clipped to the reference's `Z_REF` = 0.5-4.0 m |
+| omega | body rate | `R^T` x body rate — what test-5 fed (see below) |
+| reference | unconstrained cubic, position integrated from it | `sim_episode.fit_cubic`: pinned to `p(0)=p`, `p'(0)=v`, evaluated at `tau = t - t_decision` |
 
 **Rate / resampling.** The student's waypoints are *not* resampled. The MPC's
 `build_reference` uses `dt_wp` only to build the time base `t = arange(nwp) *
@@ -233,10 +236,47 @@ implementation (`superfly_expert_sampler.sim_episode.DepthVetoPolicy.blocked`)
 on a rendered wall, and that the state encoder is byte-identical to
 `OnnxPolicy.encode_state`.
 
-**Speed.** The students are labelled at a 3 m/s cruise, so the harness default
-`--max-speed 3.0` is already right; `agile`'s 4 m/s override does not apply.
-`--max-vel` only speed-*caps* the MPC reference — it no longer shrinks the
-plan.
+**Altitude.** `--alt-follow` is **forced** for `agile_student`. Without it the
+MPC reference sets `vz = 0, z = cruise_alt` and thrust becomes an altitude PD:
+the student's vertical plan is deleted while the depth veto still clears modes
+on their vertical geometry, so it can pick a climb-over and fly flat into the
+obstacle. World-frame plan z is clipped to `sim_episode.Z_REF` = (0.5, 4.0) m
+in `_adopt_plan`, before mode selection, exactly as `run_episode` does.
+
+**Reference.** The student's MPC reference is `sim_episode.fit_cubic`, not
+`np.polyfit`: it pins `p(0) = p_current` **and `p'(0) = v_current`` and
+least-squares only the quadratic/cubic terms through waypoints 1-3. The
+unconstrained polyfit the legacy path uses commands 1.36 m/s at t = 0 from
+rest, a step demand every time the vehicle is slower than the plan's mean
+speed. `mpc.build_reference_cubic` samples it at the solver's nodes, offset by
+the plan's age so the manoeuvre is consumed rather than dragged along
+(`tau = t - t_decision`).
+
+**Rate.** `--net-thread` is **forced**. One forward pass of the 5 s student
+costs 120-220 ms of CPU (measured on gs2, 32 cores under load average 39,
+median of 15-20 runs: 174 ms default session options, 124 ms at 8 intra-op
+threads, 118 ms at 12-16 — returns flatten past 8, so `OnnxStudentBackend`
+pins 8, `AGILE_ONNX_THREADS` overrides). Run inline that blocks the 100 Hz
+attitude stream to PX4 and collapses the decision rate to ~5 Hz against the
+evaluation harness's 15. Threaded, the worker is latest-only and rate-gated to
+`STUDENT_DECISION_HZ = 15` so a fast box cannot out-run the rate the policy was
+scored at; the achieved rate is printed in the offboard's verbose line with a
+`<-- BELOW 15 Hz` marker. **Check it on the target box before trusting any
+result**: on loaded gs2 the closed loop achieves 5.6 Hz.
+
+**omega.** The port feeds `R^T omega_body`, not `omega_body`. The evaluation
+harness's `Obs.omega` is already a body rate (`run_episode` integrates it from
+`dR = R^T R_new`) and `encode_state` applies `R^T` again, so `R^T omega_body` is
+what test-5 measured. It is also harmless to match: the TRAINING data's omega
+column is drawn noise, not a measured rate
+(`draw_states.synthesize_attitude`: `omega = rng.normal(0, 0.3, 3)`,
+independent of `R`), and the loader passes it through unrotated (it rotates
+velocity only), so the net learned nothing frame-dependent from that channel.
+
+**Speed.** `--max-vel` is pinned to 3.5 = `sim_episode.V_CAP`, not the harness
+default 3.0: the real student plans above 3.0 m/s (measured 3.08) and the MPC's
+speed cap would otherwise clip it chronically and bias arrival time. It never
+rescales the plan.
 
 **Interpreter.** Needs `acados_template` **and** `onnxruntime` in one
 interpreter. `scripts/agile_python.sh` targets the repo-root `.venv`; where

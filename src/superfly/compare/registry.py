@@ -41,12 +41,13 @@ DEFAULT_AGILE_MAX_SPEED = 4.0
 # `agile`; only the net, the state encoding and the mode rule differ, and all
 # three are selected by the .onnx extension (see policies/agile/model.py).
 #
-# Cruise: the students are labelled at a 3 m/s nominal cruise (sim_episode
-# CRUISE = 3.0, V_CAP = 3.5), so the harness default --max-speed of 3.0 m/s is
-# already right and agile's 4.0 m/s override does NOT apply here. --max-vel is
-# still passed because the MPC speed-caps its reference with it -- it does not
-# rescale the student's plan (agile_core._scale_body_plan is identity for a
-# student), so setting it low only clips, it never shrinks the geometry.
+# Cruise: the students are labelled at a 3 m/s nominal cruise, but the
+# evaluation harness lets them run to sim_episode.V_CAP = 3.5 m/s and the real
+# net plans above 3.0 (measured 3.08). --max-vel is the MPC's own speed cap, so
+# leaving it at the harness default 3.0 would chronically clip the student's own
+# plan and bias arrival time; pin it to V_CAP instead. It never rescales the
+# plan (agile_core._scale_body_plan is identity for a student).
+STUDENT_MAX_VEL = 3.5
 #
 # Arrival speed: v_goal, the 22nd element of the state. The harness lands at
 # the goal, so 0.0 (arrive stopped) is both the honest value and the modal one
@@ -218,13 +219,25 @@ def method_registry():
             / "student.onnx",
             ckpt_kind="onnx",
             speed_args=lambda a: [
-                "--max-vel", str(a.max_speed),
+                # V_CAP, not --max-speed: see STUDENT_MAX_VEL above.
+                "--max-vel", str(max(float(a.max_speed), STUDENT_MAX_VEL)),
                 "--max-tilt-deg", str(AGILE_MAX_TILT_DEG),
                 "--att-lp", "1.0",
                 "--control-hz", str(AGILE_CONTROL_HZ),
                 "--q-att", str(AGILE_MPC_Q_ATT),
                 "--goal-speed", str(student_goal_speed()),
                 "--mode-select", os.environ.get("AGILE_STUDENT_MODE_SELECT", "veto"),
+                # NOT optional. Without --alt-follow the MPC discards the
+                # student's vertical plan (vz=0, z=cruise_alt) while the depth
+                # veto still clears modes on their vertical geometry -- it can
+                # pick a climb-over and fly flat into the obstacle.
+                "--alt-follow",
+                # NOT optional either. One forward pass costs 120-220 ms of CPU;
+                # run inline it blocks the 100 Hz attitude stream to PX4 and the
+                # decision rate collapses to ~5 Hz against the evaluation
+                # harness's 15. The worker is latest-only and rate-gated to 15 Hz
+                # in agile_core.
+                "--net-thread",
             ] + shlex.split(os.environ.get("AGILE_STUDENT_EXTRA_ARGS", "")),
         ),
     }

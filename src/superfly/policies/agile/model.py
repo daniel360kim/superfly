@@ -18,6 +18,7 @@ ckpt-50.data-*); pass the prefix or a directory containing one.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
 from typing import Tuple
@@ -457,7 +458,20 @@ class OnnxStudentBackend:
     `out_seq_len` are discovered from the graph (static output shape when the
     exporter wrote one, otherwise a single zero-input probe run)."""
 
-    def __init__(self, checkpoint_path: str, providers=("CPUExecutionProvider",)):
+    #: Intra-op threads for the CPU provider. Measured on gs2 (32 cores, load
+    #: average 39 -- i.e. pessimistic) on t5fix_s_r1, median of 15-20 runs:
+    #:   default 174 ms | 1 thread 214 | 2: 162 | 4: 149 | 6: 136 | 8: 124
+    #:   12: 119 | 16: 118  (ORT_ENABLE_ALL: 8 -> 136, 12 -> 132)
+    #: Returns flatten past 8, and airstation03 is a shared 24-core box running
+    #: Isaac + PX4 SITL + an acados MPC in the same breath, so 8 buys nearly all
+    #: of the speed-up while leaving the rest of the machine alone. Override
+    #: with AGILE_ONNX_THREADS. Even at 8 threads one pass costs more than the
+    #: 1/15 s decision period, which is why the student runs --net-thread: the
+    #: forward pass must not block the 100 Hz attitude stream to PX4.
+    DEFAULT_INTRA_OP_THREADS = 8
+
+    def __init__(self, checkpoint_path: str, providers=("CPUExecutionProvider",),
+                 intra_op_threads: int | None = None):
         try:
             import onnxruntime as ort
         except ImportError as exc:                      # pragma: no cover
@@ -471,9 +485,17 @@ class OnnxStudentBackend:
         if not path.exists():
             raise FileNotFoundError(f"ONNX student not found: {path}")
         self.checkpoint_prefix = str(path)
-        # CPU on purpose: the offboard shares the box with Isaac + PX4 SITL, the
-        # net is ~20 MB and the 30 Hz control loop only needs ~15 Hz of it.
-        self.session = ort.InferenceSession(str(path), providers=list(providers))
+        # CPU on purpose: the offboard shares the box with Isaac + PX4 SITL.
+        if intra_op_threads is None:
+            intra_op_threads = int(os.environ.get("AGILE_ONNX_THREADS",
+                                                  self.DEFAULT_INTRA_OP_THREADS))
+        self.intra_op_threads = int(intra_op_threads)
+        opts = ort.SessionOptions()
+        if self.intra_op_threads > 0:
+            opts.intra_op_num_threads = self.intra_op_threads
+            opts.inter_op_num_threads = 1
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        self.session = ort.InferenceSession(str(path), opts, providers=list(providers))
         self._input_shapes = {i.name: list(i.shape) for i in self.session.get_inputs()}
         self._depth_input, self._state_input = self._classify_inputs()
         self.modes, self.out_seq_len = self._probe_output_shape()

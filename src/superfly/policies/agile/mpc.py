@@ -211,6 +211,79 @@ def clamp_attitude_tilt(q_pred_wxyz, max_tilt_deg, yaw_des):
     return q_clamped
 
 
+def fit_cubic_state(p_cur, v_cur, wps, dt_wp):
+    """Port of superfly_expert_sampler.sim_episode.fit_cubic: the cubic
+    p(t) = c0 + c1 t + c2 t^2 + c3 t^3 that is PINNED to the current state --
+    c0 = p, c1 = v -- with c2/c3 least-squares through waypoints 1..3 at
+    dt_wp, 2 dt_wp, 3 dt_wp. Returns (4, 3).
+
+    This is the difference that matters against np.polyfit: polyfit is
+    unconstrained, so from rest it hands the tracker a non-zero velocity at
+    t = 0 (measured: 1.36 m/s where the evaluation harness commands 0) -- a
+    step demand every time the vehicle is slower than the plan's mean speed."""
+    p_cur = np.asarray(p_cur, dtype=np.float64).reshape(3)
+    v_cur = np.asarray(v_cur, dtype=np.float64).reshape(3)
+    wps = np.asarray(wps, dtype=np.float64)
+    ts = dt_wp * np.arange(1, 4)
+    rhs = wps[:3] - p_cur[None] - np.outer(ts, v_cur)
+    A = np.stack([ts ** 2, ts ** 3], 1)
+    c23 = np.linalg.lstsq(A, rhs, rcond=None)[0]
+    return np.vstack([p_cur, v_cur, c23])
+
+
+def eval_cubic(c, t):
+    """sim_episode.eval_cubic: (p, v, a) of the cubic at time t."""
+    p = c[0] + c[1] * t + c[2] * t ** 2 + c[3] * t ** 3
+    v = c[1] + 2 * c[2] * t + 3 * c[3] * t ** 2
+    a = 2 * c[2] + 6 * c[3] * t
+    return p, v, a
+
+
+def build_reference_cubic(cubic, yaw_des, t_offset=0.0, prev_q0=None,
+                          min_alt=0.15, max_alt=None):
+    """The STUDENT's MPC reference: sample `cubic` (from fit_cubic_state) at the
+    solver's own node times, exactly as sim_episode's tracker evaluates it at
+    tau = t - t_decision.
+
+    Unlike build_reference this does NOT re-integrate position from a capped
+    velocity and does NOT speed-cap the reference velocity: the evaluation
+    harness tracks the raw cubic and limits the COMMAND instead
+    (sim_episode.clamp_command removes only the along-track acceleration above
+    V_CAP). Only the acceleration is clamped here, because it feeds the
+    differential-flatness attitude/thrust reference and a spiky cubic can
+    otherwise demand an infeasible tilt.
+
+    `t_offset` is the plan's age [s]: between net updates the manoeuvre is
+    consumed rather than dragged along with the vehicle.
+
+    Returns (yref_stages [N,14], yref_term [10], q0)."""
+    yref_stages = np.zeros((N, NY))
+    yref_term = np.zeros(NY_E)
+    prev_q = prev_q0
+    q0 = None
+    for i in range(N + 1):
+        ti = float(t_offset) + i * DT
+        p, v, a = eval_cubic(np.asarray(cubic, dtype=np.float64), ti)
+        a = np.asarray(a, dtype=np.float64).copy()
+        a_xy = float(np.hypot(a[0], a[1]))
+        if a_xy > MAX_REF_ACCEL_XY:
+            a[:2] *= MAX_REF_ACCEL_XY / a_xy
+        a[2] = float(np.clip(a[2], -MAX_REF_ACCEL_XY, MAX_REF_ACCEL_XY))
+        p = np.asarray(p, dtype=np.float64).copy()
+        p[2] = max(float(p[2]), min_alt)
+        if max_alt is not None:
+            p[2] = min(float(p[2]), max_alt)
+        q, T = flatness_attitude(a + np.array([0.0, 0.0, G]), yaw_des, prev_q)
+        prev_q = q
+        if i == 0:
+            q0 = q
+        if i < N:
+            yref_stages[i] = np.concatenate([p, q, v, [T], [0.0, 0.0, 0.0]])
+        else:
+            yref_term = np.concatenate([p, q, v])
+    return yref_stages, yref_term, q0
+
+
 def build_reference(world_pts, pos_current, cruise_alt, yaw_des, dt_wp=0.1,
                     max_vel=7.0, prev_q0=None, alt_hold=True, min_alt=0.15):
     """Net's 10 world waypoints -> per-node MPC reference over the horizon, made
@@ -343,7 +416,8 @@ class MPC:
         return _slerp_wxyz(q0, q1, frac)
 
     def compute(self, x0, world_pts, cruise_alt, yaw_des, dt_wp=0.1, max_vel=7.0,
-                obstacles_xy_r=None, alt_hold=True, att_lookahead_s=DT):
+                obstacles_xy_r=None, alt_hold=True, att_lookahead_s=DT,
+                cubic=None, t_offset=0.0, min_alt=0.15, max_alt=None):
         """High-level: build the feasible flatness reference from the selected net
         trajectory (anchored at x0's position), set the obstacle-avoidance
         constraints, and solve. Returns (u0, status, info).
@@ -356,9 +430,16 @@ class MPC:
         # LINEAR_LS residual ||q - q_ref|| can blow up when q_ref lands on the opposite
         # sign of the same attitude -> the MPC commands a violent rate to "flip" it.
         q_anchor = np.asarray(x0[3:7], dtype=np.float64)
-        yref_stages, yref_term, q0 = build_reference(
-            world_pts, x0[:3], cruise_alt, yaw_des, dt_wp, max_vel,
-            prev_q0=q_anchor, alt_hold=alt_hold)
+        if cubic is not None:
+            # Student: track the state-pinned cubic itself (see
+            # build_reference_cubic); world_pts is then only a diagnostic.
+            yref_stages, yref_term, q0 = build_reference_cubic(
+                cubic, yaw_des, t_offset=t_offset, prev_q0=q_anchor,
+                min_alt=min_alt, max_alt=max_alt)
+        else:
+            yref_stages, yref_term, q0 = build_reference(
+                world_pts, x0[:3], cruise_alt, yaw_des, dt_wp, max_vel,
+                prev_q0=q_anchor, alt_hold=alt_hold)
         self._prev_q0 = q0
         # SQP-RTI is one iteration per call; the VERY FIRST command would otherwise be
         # a cold/half-converged transient (saturated rates) at the CLIMB->POLICY

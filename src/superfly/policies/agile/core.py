@@ -33,7 +33,7 @@ from superfly.policies.agile.model import (
     OnnxStudentBackend, is_onnx_checkpoint,
 )
 from superfly.policies.agile.mpc import (
-    MPC, state_x0, clamp_attitude_tilt, flatness_attitude, G,
+    MPC, state_x0, clamp_attitude_tilt, flatness_attitude, G, fit_cubic_state,
 )
 
 # Sim depth camera (run_px4_sim.py --policy agile): 640x480 render bilinear-downsampled
@@ -81,6 +81,15 @@ STUDENT_VETO_MARGIN_M = 0.15
 STUDENT_VETO_RADIUS_M = 0.35
 # Upstream agile_autonomy accept_thresh, used by the veto's tie rule.
 STUDENT_ACCEPT = 0.9
+# sim_episode.Z_REF: the evaluation harness clips every mode's WORLD z into this
+# band before it selects between them, and then flies the clipped plan. Same
+# frame here -- PX4's local z is height above the arming point, i.e. above the
+# ground, which is what the reference's world z is.
+STUDENT_Z_REF = (0.5, 4.0)
+# Decision rate of the evaluation harness (sim_episode.DECISION_HZ). The student
+# submits inference no faster than this, so a fast box cannot out-run the rate
+# the policy was scored at; a slow one is reported in the log.
+STUDENT_DECISION_HZ = 15.0
 # The render pinhole the students were trained against (render_depth.Camera):
 # 640x480 at 91 deg hfov, principal point at the centre of the PIXEL GRID
 # ((w-1)/2, not w/2), bilinear-resized to 224x224. The resize is anisotropic --
@@ -191,6 +200,7 @@ class AgileCmd:
     alphas: np.ndarray = field(default_factory=lambda: np.zeros(3))
     # depth-veto worst signed clearance per mode (None unless --mode-select veto)
     veto_scores: np.ndarray | None = None
+    net_hz: float = 0.0          # achieved decision rate (student only)
 
 
 class AgilePolicy:
@@ -275,6 +285,8 @@ class AgilePolicy:
         # Legacy: all 10 of the net's 0.1 s waypoints (a 0.9 s span). Student:
         # the current position plus the first three 0.5 s waypoints.
         self.mpc_waypoints = STUDENT_MPC_WAYPOINTS if self.is_student else None
+        # Cap on the threaded inference submission rate (0 = uncapped).
+        self.net_decision_hz = STUDENT_DECISION_HZ if self.is_student else 0.0
         # 2026-07-30 margin-tuning campaign knobs (see notes/robust_2026-07/
         # agile_diagnosis.md in gs_drone_sim):
         #  - depth_inflate_px: odd minimum-filter kernel on the 224x224 depth fed
@@ -299,6 +311,7 @@ class AgilePolicy:
         self._net_req = None          # latest pending (depth_in, state_in, pos, R)
         self._net_res = None          # latest finished (alphas, trajs, pos, R)
         self._net_event = threading.Event()
+        self._net_stop = threading.Event()
         self._net_worker = None
 
         # altitude-hold thrust PD + slow integrator. The I-term matters: the
@@ -324,6 +337,17 @@ class AgilePolicy:
         d = np.stack([np.ones_like(yy), yy, zz], axis=-1)
         self._rays = (d / np.linalg.norm(d, axis=-1, keepdims=True)).astype(np.float32)
 
+        if self.is_student and not self.alt_follow:
+            # Without --alt-follow the MPC reference forces vz = 0 / z = cruise
+            # alt and thrust becomes an altitude PD: the student's vertical plan
+            # is deleted while the depth veto still judges modes on their
+            # vertical geometry, so it can pick a climb-over and fly flat into
+            # the obstacle. The agile_student registry entry always passes it.
+            print("[agile] WARNING: student without --alt-follow -- its vertical "
+                  "plan is discarded and altitude is a PD hold on the climb "
+                  "altitude. This is NOT how the student was evaluated.",
+                  flush=True)
+
         self.reset()
 
     def reset(self):
@@ -333,6 +357,10 @@ class AgilePolicy:
         self._alphas = np.zeros(self.config.modes, dtype=np.float32)
         self._mode_idx = 0
         self._veto_scores = None             # last depth-veto clearances (modes,)
+        self._cubic = None                   # state-pinned cubic of the live plan
+        self._plan_time = None               # wall time the live plan was adopted
+        self._net_submit_t = 0.0             # last threaded inference submission
+        self._net_stamps = []                # recent adoption times, for net_hz
         self._prev_mode_world = None         # last tracked mode's world waypoints
         self._prev_q = None                  # low-pass state for the sent attitude
         self._ref_start = None               # mission reference line (set on first tick)
@@ -403,7 +431,17 @@ class AgilePolicy:
             np.asarray(pos_enu, np.float64).reshape(3),
             R_enu.reshape(-1),
             R_enu.T @ np.asarray(vel_enu, np.float64).reshape(3),
-            np.asarray(angular_body, np.float64).reshape(3),
+            # R^T omega, NOT omega. The evaluation harness's Obs.omega is
+            # ALREADY a body rate (sim_episode.run_episode integrates it from
+            # dR = R^T R_new) and encode_state then applies R^T again, so what
+            # the student was scored with is R^T omega_body. Physically odd, but
+            # it is also harmless: the TRAINING data's omega column is drawn
+            # noise, not a measured rate (draw_states.synthesize_attitude:
+            # omega = rng.normal(0, 0.3, 3), independent of R) and the loader
+            # passes it through unrotated (data_loader rotates velocity only),
+            # so the net learned nothing frame-dependent from this channel.
+            # Matching test-5 is therefore the only tie-break, and this is it.
+            R_enu.T @ np.asarray(angular_body, np.float64).reshape(3),
             g,
             [self.goal_speed],
         ]).astype(np.float32)
@@ -549,9 +587,20 @@ class AgilePolicy:
     # ------------------------------------------------------------------ #
     # Net plan adoption + optional worker thread (--net-thread)
     # ------------------------------------------------------------------ #
-    def _adopt_plan(self, alphas, trajectories, pos, R_enu, depth_hw):
-        """Turn a net output into the cached world-frame plan. pos/R_enu must be
-        the SNAPSHOT the net input was built from (matters in threaded mode)."""
+    def _adopt_plan(self, alphas, trajectories, pos, R_enu, depth_hw, vel=None):
+        """Turn a net output into the cached world-frame plan. pos/R_enu/vel must
+        be the SNAPSHOT the net input was built from (matters in threaded mode)."""
+        if not np.isfinite(np.asarray(trajectories)).all() or not np.isfinite(
+                np.asarray(alphas)).all():
+            # A non-finite plan would propagate NaN through build_reference into
+            # the attitude quaternion streamed to PX4, and the veto would pass it
+            # (min of a NaN window is NaN, NaN < -margin is False). Keep flying
+            # the previous plan instead; it is at most one decision period old.
+            print("[agile] net returned a non-finite plan; keeping the previous one.",
+                  flush=True)
+            if self._world_points is not None:
+                return
+            raise RuntimeError("[agile] first net output is non-finite")
         local_per_mode = [np.asarray(t, np.float64).reshape(
             self.config.state_dim, self.config.out_seq_len) for t in trajectories]
         # World-frame waypoints first: the veto's tie rule needs them, and the
@@ -559,6 +608,12 @@ class AgilePolicy:
         wp_per_mode = np.stack(
             [pos[None, :] + (R_enu @ self._scale_body_plan(m)).T
              for m in local_per_mode], axis=0)                     # (modes, N, 3)
+        if self.is_student:
+            # sim_episode.run_episode clips the WORLD z of every mode into Z_REF
+            # before select_mode and flies the clipped plan. Do it here, in the
+            # same order and the same frame. The veto still runs on the RAW body
+            # waypoints, exactly as DepthVetoPolicy does.
+            wp_per_mode[..., 2] = np.clip(wp_per_mode[..., 2], *STUDENT_Z_REF)
         self._mode_idx = self._select_mode(local_per_mode, depth_hw, alphas,
                                            wp_per_mode)
         if self.is_student:
@@ -572,27 +627,40 @@ class AgilePolicy:
         self._world_points = self._world_points_per_mode[self._mode_idx]
         self._prev_mode_world = wp_per_mode[self._mode_idx].copy()
         self._alphas = alphas
+        if self.is_student:
+            # sim_episode.fit_cubic(p, v, modes_w[sel]) -- pinned to the state
+            # the plan was made from, tracked from there at tau = t - t_decision.
+            v0 = np.zeros(3) if vel is None else np.asarray(vel, np.float64)
+            self._cubic = fit_cubic_state(pos, v0, wp_per_mode[self._mode_idx],
+                                          self.waypoint_dt)
+            now = time.time()
+            self._plan_time = now
+            self._net_stamps.append(now)
+            if len(self._net_stamps) > 16:
+                del self._net_stamps[:-16]
 
     def _net_worker_loop(self):
         """Latest-only inference worker: always consumes the freshest snapshot,
         so the effective net rate saturates at 1/forward-time (~16 Hz on this
         CPU) instead of being gated AND blocked by the control loop."""
-        while True:
+        while not self._net_stop.is_set():
             self._net_event.wait()
+            if self._net_stop.is_set():
+                return
             with self._net_lock:
                 req = self._net_req
                 self._net_req = None
                 self._net_event.clear()
             if req is None:
                 continue
-            depth_in, state_in, pos, R_enu, depth_hw = req
+            depth_in, state_in, pos, R_enu, depth_hw, vel = req
             try:
                 alphas, trajs = self.net.infer(depth_in, state_in)
             except Exception as exc:      # never kill the worker
                 print(f"[agile] net worker infer failed: {exc}", flush=True)
                 continue
             with self._net_lock:
-                self._net_res = (alphas, trajs, pos, R_enu, depth_hw)
+                self._net_res = (alphas, trajs, pos, R_enu, depth_hw, vel)
 
     def _encode_state(self, pos, R_enu, vel, angular_body, goal_enu, goal_dir):
         """Student -> the 22-dim metric encoding; TF checkpoint -> the legacy
@@ -602,6 +670,28 @@ class AgilePolicy:
                 pos, R_enu, vel, angular_body, goal_enu)
         return self._state_to_model_input(pos, R_enu, vel, angular_body, goal_dir)
 
+    def shutdown(self):
+        """Stop the inference worker and join it. onnxruntime tears its thread
+        pool down from a daemon thread mid-run with `terminate called without an
+        active exception` -- a SIGABRT that the comparison harness would score as
+        a trial error. The offboard calls this from its finally block."""
+        self._net_stop.set()
+        self._net_event.set()
+        w = self._net_worker
+        if w is not None and w.is_alive():
+            w.join(timeout=2.0)
+        self._net_worker = None
+
+    def net_hz(self) -> float:
+        """Achieved decision rate over the last few plans (0 until there are two).
+        The offboard logs this: one forward pass costs 120-220 ms of CPU, so the
+        student can fall short of sim_episode's 15 Hz on a loaded box and any
+        result has to be read knowing which it was."""
+        if len(self._net_stamps) < 2:
+            return 0.0
+        span = self._net_stamps[-1] - self._net_stamps[0]
+        return (len(self._net_stamps) - 1) / span if span > 1e-6 else 0.0
+
     def _net_tick_threaded(self, obs, pos, R_enu, vel, goal_enu, goal_dir):
         """Submit the freshest observation, adopt the latest finished plan.
         Blocks only on the very first call (no plan exists yet)."""
@@ -609,12 +699,23 @@ class AgilePolicy:
             self._net_worker = threading.Thread(target=self._net_worker_loop,
                                                 daemon=True)
             self._net_worker.start()
-        depth_in = self._depth_to_model_input(obs.depth)
-        state_in = self._encode_state(pos, R_enu, vel, obs.angular_rate_body,
-                                      goal_enu, goal_dir)
+        # Submit no faster than the rate the student was scored at: the worker
+        # is latest-only, so without this gate a fast box would decide at
+        # 1/forward_time instead of sim_episode's DECISION_HZ.
+        now = time.time()
+        submit = (now - self._net_submit_t) >= (1.0 / self.net_decision_hz) \
+            if self.net_decision_hz > 0 else True
+        res = None
+        if submit:
+            depth_in = self._depth_to_model_input(obs.depth)
+            state_in = self._encode_state(pos, R_enu, vel, obs.angular_rate_body,
+                                          goal_enu, goal_dir)
+            self._net_submit_t = now
         with self._net_lock:
-            self._net_req = (depth_in, state_in, pos.copy(), R_enu.copy(), obs.depth)
-            self._net_event.set()
+            if submit:
+                self._net_req = (depth_in, state_in, pos.copy(), R_enu.copy(),
+                                 obs.depth, vel.copy())
+                self._net_event.set()
             res, self._net_res = self._net_res, None
         if res is not None:
             self._adopt_plan(*res)
@@ -658,7 +759,7 @@ class AgilePolicy:
             state_in = self._encode_state(pos, R_enu, vel, obs.angular_rate_body,
                                           goal, goal_dir)
             alphas, trajectories = self.net.infer(depth_in, state_in)
-            self._adopt_plan(alphas, trajectories, pos, R_enu, obs.depth)
+            self._adopt_plan(alphas, trajectories, pos, R_enu, obs.depth, vel)
 
         world_points = self._world_points
         # Points the MPC's reference cubic is fitted through (see
@@ -678,7 +779,16 @@ class AgilePolicy:
                 x0, mpc_points.astype(np.float64), self._cruise_alt, yaw_des,
                 dt_wp=self.waypoint_dt, max_vel=self.max_vel,
                 obstacles_xy_r=keepout, alt_hold=not self.alt_follow,
-                att_lookahead_s=self.att_lookahead_s)
+                att_lookahead_s=self.att_lookahead_s,
+                # Student: track the state-pinned cubic itself, offset by the
+                # plan's age so the manoeuvre is consumed between net updates
+                # rather than dragged along with the vehicle (sim_episode
+                # evaluates at tau = t - t_decision).
+                cubic=self._cubic if self.is_student else None,
+                t_offset=(0.0 if self._plan_time is None
+                          else max(0.0, now - self._plan_time)),
+                min_alt=STUDENT_Z_REF[0] if self.is_student else 0.15,
+                max_alt=STUDENT_Z_REF[1] if self.is_student else None)
             if status in (0, 2):
                 attitude_q = np.asarray(minfo["q_pred"], dtype=np.float64)
                 if self.max_tilt_deg < 89.0:
@@ -690,8 +800,12 @@ class AgilePolicy:
                     # Slave the altitude-hold thrust PD to the stage-1 reference
                     # z (the net's clamped vertical plan) so cyl_h obstacles can
                     # be over/under-flown; band-limited around the cruise alt.
-                    alt_target = float(np.clip(minfo["p_ref1"][2], 1.0,
-                                               self._cruise_alt + 3.0))
+                    # Student: the reference's own Z_REF band, not a band
+                    # relative to the climb altitude -- the whole point of
+                    # following the plan's z is that it may leave that band.
+                    lo, hi = (STUDENT_Z_REF if self.is_student
+                              else (1.0, self._cruise_alt + 3.0))
+                    alt_target = float(np.clip(minfo["p_ref1"][2], lo, hi))
         except Exception as exc:
             if self._tick < 3 or self._tick % 300 == 0:
                 print(f"[agile] MPC solve raised ({exc}); PD fallback this tick.",
@@ -748,6 +862,7 @@ class AgilePolicy:
             tilt_cmd_deg=tilt_cmd,
             alphas=self._alphas,
             veto_scores=self._veto_scores,
+            net_hz=self.net_hz(),
         )
 
     def debug_frame(self, pos_enu, R_enu, tracker: str) -> dict | None:

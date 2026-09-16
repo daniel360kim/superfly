@@ -419,7 +419,12 @@ def main():
                             f"thrust={cmd.thrust_norm:.3f} mode={cmd.mode_idx} "
                             f"alphas={np.round(cmd.alphas, 3)} keepout={cmd.n_keepout}"
                             + ("" if cmd.veto_scores is None else
-                               f" veto={np.round(cmd.veto_scores, 2)}") + "\n"
+                               f" veto={np.round(cmd.veto_scores, 2)}")
+                            + ("" if cmd.net_hz <= 0 else
+                               f"\n  net {cmd.net_hz:.1f} Hz (evaluation harness "
+                               f"decides at 15 Hz)"
+                               + ("  <-- BELOW 15 Hz" if cmd.net_hz < 13.5 else ""))
+                            + "\n"
                             f"  msg rates: {rate_str} "
                             f"(want {stream_hz:.0f}; ~1 Hz position = stale-state limit cycle)\n"
                             f"  cur RPY(ENU)={np.round(cur_rpy, 1)} armed={state.armed} "
@@ -445,6 +450,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        policy.shutdown()      # join the inference worker before the interpreter
         stop_event.set()
         mav.mav.command_long_send(
             mav.target_system, mav.target_component,
