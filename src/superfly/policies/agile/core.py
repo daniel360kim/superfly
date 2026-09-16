@@ -34,6 +34,7 @@ from superfly.policies.agile.model import (
 )
 from superfly.policies.agile.mpc import (
     MPC, state_x0, clamp_attitude_tilt, flatness_attitude, G, fit_cubic_state,
+    eval_cubic,
 )
 
 # Sim depth camera (run_px4_sim.py --policy agile): 640x480 render bilinear-downsampled
@@ -98,6 +99,43 @@ STUDENT_ACCEPT = 0.9
 STUDENT_Z_REF = (0.5, 4.0)
 #: Headroom kept above the handover altitude when it is outside STUDENT_Z_REF.
 STUDENT_Z_HEADROOM = 2.0
+
+# ---------------------------------------------------------------------------
+# Hover throttle
+# ---------------------------------------------------------------------------
+# The offboard's default hover_thrust is G / MAX_ACCEL = 0.490, but the Iris in
+# the 2026-09-16 airstation03 trial hovers at ~0.577 (read off that log: level
+# segments at t = 20.8-23.8 s sit at thrust 0.580-0.582 with vz ~ +0.05). An 18 %
+# throttle-model error is invisible to the evaluation simulator, which applies
+# f = a_cmd + g exactly (sim_episode.clamp_command), but on PX4 it has to be
+# balanced by something. With --alt-follow and an alt_target re-pinned to the
+# vehicle every replan, the only term that can supply it is -kd_alt * vz, i.e.
+# a PERMANENT sink of -G (h_true/h_assumed - 1) / kd_alt = -0.43 m/s -- the
+# -0.40/-0.49 m/s observed, and the reason the student flew the whole field at
+# 0.1-0.6 m instead of 2 m. Both halves of the fix live here:
+#   (1) _alt_sp: an ABSOLUTE altitude setpoint advanced by the reference's own
+#       vertical velocity, so a sag produces a real error (see compute()).
+#   (2) this parameter, a bigger ki_alt, and an online estimate that replaces
+#       the parameter once the vehicle has held level flight.
+STUDENT_HOVER_THRUST = 0.577
+#: Integral gain while following a vertical plan. 0.4 (the legacy value) takes
+#: ~5 s to absorb an 18 % throttle error; 1.5 takes ~1 s.
+STUDENT_KI_ALT = 1.5
+#: Online hover-throttle estimator: sample the commanded vertical throttle only
+#: in near-equilibrium (at equilibrium thrust*cos_tilt IS the true hover
+#: throttle, whatever parameter was assumed -- the integrator supplies the
+#: difference), EMA it, and adopt it after enough samples.
+# The gate has to mean SETTLED, not merely "passing through level": sampling
+# during the integrator's wind-up averages in throttles that are still wrong
+# (measured: an 0.577 airframe estimated at 0.564, and the bumpless rebase then
+# left a 0.25 m overshoot). Hence a tight error window as well as a tight
+# velocity one, and enough consecutive settled samples to outlast a transient.
+HOVER_EST_VZ_TOL = 0.05        # [m/s]
+HOVER_EST_ERR_TOL = 0.05       # [m]
+HOVER_EST_ALPHA = 0.02         # EMA weight per sample
+HOVER_EST_MIN_SAMPLES = 200    # 2 s of settled flight at 100 Hz per adoption
+HOVER_EST_ADOPT_STEP = 0.005   # don't re-adopt for less than this
+HOVER_EST_BOUNDS = (0.20, 0.85)
 
 
 def student_z_band(cruise_alt: float | None) -> tuple[float, float]:
@@ -223,6 +261,8 @@ class AgileCmd:
     veto_scores: np.ndarray | None = None
     depth_probe: dict | None = None      # metres at a few pixels of the frame the net saw (debug)
     net_hz: float = 0.0          # achieved decision rate (student only)
+    alt_sp: float = 0.0          # absolute altitude setpoint being tracked [m]
+    hover_thrust: float = 0.0    # hover throttle in use (measured once converged)
 
 
 class AgilePolicy:
@@ -247,7 +287,7 @@ class AgilePolicy:
                               # depth-lag misregistration, on top of OBS_MARGIN)
 
     def __init__(self, checkpoint_path: str, max_vel: float = 7.0,
-                 hover_thrust: float = G / 20.0, control_hz: float = 30.0,
+                 hover_thrust: float | None = None, control_hz: float = 30.0,
                  net_every: int = 2, max_tilt_deg: float = 90.0,
                  att_lp: float = 1.0, ref_lookahead_s: float = REF_LOOKAHEAD_S,
                  use_keepout: bool = False, att_lookahead_s: float | None = None,
@@ -283,7 +323,13 @@ class AgilePolicy:
         print("[agile] MPC ready.", flush=True)
 
         self.max_vel = float(max_vel)
-        self.hover_thrust = float(hover_thrust)
+        # hover_thrust None -> the student's measured value, else the legacy
+        # G/MAX_ACCEL assumption. AGILE_HOVER_THRUST overrides both.
+        if hover_thrust is None:
+            hover_thrust = (STUDENT_HOVER_THRUST if self.is_student else G / 20.0)
+        self.hover_thrust = float(os.environ.get("AGILE_HOVER_THRUST", hover_thrust))
+        self.hover_thrust_param = self.hover_thrust     # what was configured
+        self.hover_estimate_enabled = True
         self.control_dt = 1.0 / float(control_hz)
         self.net_every = max(1, int(net_every))
         self.max_tilt_deg = float(max_tilt_deg)
@@ -340,7 +386,15 @@ class AgilePolicy:
         # nominal hover_thrust (g/20) is below the Iris's true hover point, and
         # a pure PD equilibrates ~0.5 m BELOW cruise_alt (observed live) --
         # enough to keep a 3D goal check from ever firing.
-        self.kp_alt, self.kd_alt, self.ki_alt = 4.0, 4.0, 0.4
+        self.kp_alt, self.kd_alt = 4.0, 4.0
+        # A vertical plan needs an integrator fast enough to absorb a throttle
+        # model error within a decision or two, not within the whole flight.
+        self.ki_alt = STUDENT_KI_ALT if self.is_student else 0.4
+        # ...and enough integrator authority to actually hold it. Covering an
+        # h_true/h_assumed ratio r costs az_ss = G(r - 1): the legacy +-2 m/s^2
+        # clamp saturates at r = 1.20, and the trial's own airframe is already
+        # at 1.18. +-4 covers r = 1.41.
+        self.alt_i_limit = 4.0 if self.is_student else 2.0
         # PD fallback tracker gains (only used when an MPC solve fails)
         self.kp_pos, self.kd_vel = 6.0, 4.0
         # PD-fallback lookahead index: 0.5 s ahead in both plans (legacy index
@@ -380,6 +434,7 @@ class AgilePolicy:
         self._mode_idx = 0
         self._veto_scores = None             # last depth-veto clearances (modes,)
         self._cubic = None                   # state-pinned cubic of the live plan
+        self._plan_z = None                  # (times, world z) of the live plan
         self._plan_time = None               # wall time the live plan was adopted
         self._net_submit_t = 0.0             # last threaded inference submission
         self._net_stamps = []                # recent adoption times, for net_hz
@@ -390,6 +445,10 @@ class AgilePolicy:
         self._cruise_alt = None
         self._obs_cells: dict[tuple[int, int], float] = {}   # (ix,iy) -> last-seen ts
         self._alt_i = 0.0                    # altitude integrator [m/s^2]
+        self._alt_sp = None                  # ABSOLUTE altitude setpoint [m]
+        self._hover_est = None               # EMA of the observed hover throttle
+        self._hover_n = 0                    # samples in that EMA
+        self._hover_adopted = False
         self.mpc._warmed = False             # re-converge the first solve
         if getattr(self, "_net_stop", None) is not None:
             self._net_stop.clear()           # a policy reused after shutdown()
@@ -663,6 +722,11 @@ class AgilePolicy:
             v0 = np.zeros(3) if vel is None else np.asarray(vel, np.float64)
             self._cubic = fit_cubic_state(pos, v0, wp_per_mode[self._mode_idx],
                                           self.waypoint_dt)
+            # The plan's vertical profile, origin-prefixed: times 0, dt, 2dt...
+            # against the CLIPPED world z. _reference_vz differentiates this.
+            z_prof = self._world_points_per_mode[self._mode_idx][:, 2]
+            self._plan_z = (self.waypoint_dt * np.arange(len(z_prof)),
+                            np.asarray(z_prof, np.float64).copy())
             # The cubic is pinned to the state the net INPUT was built from, so
             # the plan's clock starts there -- not at adoption. In threaded mode
             # those differ by one forward pass (~140 ms), which at 3 m/s would
@@ -705,6 +769,86 @@ class AgilePolicy:
             return self._student_state_to_model_input(
                 pos, R_enu, vel, angular_body, goal_enu)
         return self._state_to_model_input(pos, R_enu, vel, angular_body, goal_dir)
+
+    def _reference_vz(self, minfo) -> float:
+        """The vertical velocity of the reference being tracked this tick.
+
+        Student: the cubic's own vz at the time the tracker is at
+        (tau = plan age + one control period, where the setpoint lands). Legacy
+        --alt-follow: the MPC's stage-1 reference velocity if it reports one,
+        else a finite difference against the current setpoint."""
+        if self.is_student and self._plan_z is not None:
+            # NOT the cubic's vz: the cubic is pinned to p'(0) = v_current, so
+            # for the first half-second of every plan its vertical velocity IS
+            # the vehicle's own. Advancing the setpoint with that makes it chase
+            # the vehicle again -- slower than p_ref1 did, but the same disease
+            # (measured: a level plan ratcheted the setpoint up 0.28 m during
+            # the recovery climb and stayed there).
+            #
+            # The plan's vertical INTENT is the shape of its waypoint z profile,
+            # which is a difference and so carries none of the vehicle's sag or
+            # velocity. Level plan -> exactly 0; a climb-over -> its climb rate.
+            t, z = self._plan_z
+            tau = self.control_dt
+            if self._plan_time is not None:
+                tau += max(0.0, time.time() - self._plan_time)
+            return float((np.interp(tau + self.control_dt, t, z)
+                          - np.interp(tau, t, z)) / self.control_dt)
+        v_ref1 = minfo.get("v_ref1") if isinstance(minfo, dict) else None
+        if v_ref1 is not None:
+            return float(np.asarray(v_ref1, np.float64)[2])
+        if self._alt_sp is not None:
+            return (float(minfo["p_ref1"][2]) - self._alt_sp) / max(self.control_dt, 1e-6)
+        return 0.0
+
+    def _advance_alt_setpoint(self, minfo, lo: float, hi: float) -> float:
+        if self._alt_sp is None:
+            # Start where the policy took over, not at the plan's first node:
+            # the handover altitude is the only absolute the vehicle agrees on.
+            self._alt_sp = float(np.clip(self._cruise_alt, lo, hi))
+        vz_ref = self._reference_vz(minfo)
+        self._alt_sp = float(np.clip(self._alt_sp + vz_ref * self.control_dt, lo, hi))
+        return self._alt_sp
+
+    def _update_hover_estimate(self, thrust: float, cos_tilt: float,
+                               vz: float, alt_err: float) -> None:
+        """At equilibrium the commanded vertical throttle IS the true hover
+        throttle -- whatever parameter was assumed, the integrator has supplied
+        the difference. Sample only there, EMA, and adopt once converged. The
+        integrator is rebased on adoption so the swap is bumpless."""
+        if not self.hover_estimate_enabled:
+            return
+        if abs(vz) > HOVER_EST_VZ_TOL or abs(alt_err) > HOVER_EST_ERR_TOL:
+            self._hover_n = 0          # consecutive settled samples only
+            return
+        sample = float(thrust) * float(cos_tilt)
+        if not (HOVER_EST_BOUNDS[0] <= sample <= HOVER_EST_BOUNDS[1]):
+            self._hover_n = 0
+            return
+        self._hover_est = (sample if self._hover_est is None else
+                           (1 - HOVER_EST_ALPHA) * self._hover_est
+                           + HOVER_EST_ALPHA * sample)
+        self._hover_n += 1
+        if self._hover_n < HOVER_EST_MIN_SAMPLES:
+            return
+        old, new = self.hover_thrust, float(self._hover_est)
+        if abs(new - old) < HOVER_EST_ADOPT_STEP:
+            return
+        # Each adoption costs the loop a transient, so make the next one earn
+        # another full settled window rather than re-rebasing every tick.
+        n_settled, self._hover_n = self._hover_n, 0
+        # Rebase the integrator: it was holding az_ss = G (h_true/h_old - 1) to
+        # cover the old parameter's error; with the new parameter that demand is
+        # gone, so remove it rather than letting it drive a climb.
+        self._alt_i = float(np.clip(self._alt_i - G * (new / max(old, 1e-6) - 1.0),
+                                    -self.alt_i_limit, self.alt_i_limit))
+        self.hover_thrust = new
+        if not self._hover_adopted:
+            self._hover_adopted = True
+            print(f"[agile] hover throttle: configured {self.hover_thrust_param:.3f}, "
+                  f"measured {new:.3f} over {n_settled} settled samples -- using "
+                  f"the measurement. (Too low a hover throttle with --alt-follow "
+                  f"shows up as a steady sink, not as an offset.)", flush=True)
 
     def z_band(self) -> tuple[float, float]:
         """The student's vertical band for this flight (see student_z_band)."""
@@ -848,15 +992,18 @@ class AgilePolicy:
                         dtype=np.float64)
                 tracker = "mpc"
                 if self.alt_follow:
-                    # Slave the altitude-hold thrust PD to the stage-1 reference
-                    # z (the net's clamped vertical plan) so cyl_h obstacles can
-                    # be over/under-flown; band-limited around the cruise alt.
-                    # Student: the reference's own Z_REF band, not a band
-                    # relative to the climb altitude -- the whole point of
-                    # following the plan's z is that it may leave that band.
+                    # Follow the plan's vertical profile WITHOUT losing the
+                    # absolute reference. p_ref1[2] is node 1 of a cubic pinned
+                    # to the vehicle's own position at every replan, so using it
+                    # directly makes alt_err ~ 0 by construction no matter how
+                    # far the vehicle has sagged, and a steady throttle-model
+                    # error can then only be balanced by a permanent sink.
+                    # Instead: integrate an ABSOLUTE setpoint at the reference's
+                    # own vertical velocity. Climbs and dives in the plan are
+                    # still tracked; a sag is now a real error kp/ki can remove.
                     lo, hi = (self.z_band() if self.is_student
                               else (1.0, self._cruise_alt + 3.0))
-                    alt_target = float(np.clip(minfo["p_ref1"][2], lo, hi))
+                    alt_target = self._advance_alt_setpoint(minfo, lo, hi)
         except Exception as exc:
             if self._tick < 3 or self._tick % 300 == 0:
                 print(f"[agile] MPC solve raised ({exc}); PD fallback this tick.",
@@ -889,19 +1036,23 @@ class AgilePolicy:
             attitude_q /= np.linalg.norm(attitude_q) + 1e-12
         self._prev_q = attitude_q.copy()
 
-        # Thrust: altitude-hold PD on cruise_alt, tilt-compensated, normalized by
-        # the hover throttle (the MPC only steers laterally; z never follows the
-        # net's unreliable vertical plan).
+        # Thrust: altitude PD+I on alt_target, tilt-compensated, normalized by
+        # the hover throttle. alt_target is the cruise altitude without
+        # --alt-follow, and the absolute _alt_sp (advanced by the plan's own vz)
+        # with it -- never a target re-pinned to the vehicle, which would make
+        # the error identically zero and leave a throttle-model error to be
+        # balanced by a permanent sink.
         R_cmd = Rotation.from_quat(
             [attitude_q[1], attitude_q[2], attitude_q[3], attitude_q[0]]).as_matrix()
         alt_err = alt_target - float(pos[2])
         self._alt_i = float(np.clip(self._alt_i + self.ki_alt * alt_err * self.control_dt,
-                                    -2.0, 2.0))
+                                    -self.alt_i_limit, self.alt_i_limit))
         az = float(np.clip(
             self.kp_alt * alt_err - self.kd_alt * float(vel[2]) + self._alt_i,
             -4.0, 8.0))
         cos_tilt = max(0.5, float(R_cmd[2, 2]))
         thrust = float(np.clip((az + G) / cos_tilt / G * self.hover_thrust, 0.05, 0.9))
+        self._update_hover_estimate(thrust, cos_tilt, float(vel[2]), alt_err)
         tilt_cmd = math.degrees(math.acos(float(np.clip(R_cmd[2, 2], -1.0, 1.0))))
 
         return AgileCmd(
@@ -915,6 +1066,8 @@ class AgilePolicy:
             veto_scores=self._veto_scores,
             depth_probe=getattr(self, '_depth_probe', None),
             net_hz=self.net_hz(),
+            alt_sp=float(alt_target),
+            hover_thrust=self.hover_thrust,
         )
 
     def debug_frame(self, pos_enu, R_enu, tracker: str) -> dict | None:

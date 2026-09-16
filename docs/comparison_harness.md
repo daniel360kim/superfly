@@ -262,6 +262,43 @@ first decision. Two guards:
   anyway, so a scenario forced above the band still never flies a commanded
   dive; the startup log says loudly when that happened.
 
+**Altitude hold, and the hover throttle.** `--alt-follow` alone is not enough:
+the evaluation simulator applies `f = a_cmd + g` exactly, so it has no
+throttle-mapping error, while PX4 has one. The offboard used to assume
+`hover_thrust = G / MAX_ACCEL = 0.490`; the Iris in the 2026-09-16 airstation03
+trial hovers at **0.577**. With an `alt_target` re-pinned to the vehicle at every
+replan, `alt_err` is ~0 by construction and that 18 % gap can only be balanced by
+`-kd_alt * vz` — a permanent sink of
+`-G(h_true/h_assumed - 1)/kd_alt = -0.43 m/s`, which is why the first trial flew
+the whole field at 0.1-0.6 m. Two halves, both in:
+
+* `core._advance_alt_setpoint`: an **absolute** setpoint `_alt_sp`, initialised
+  at the handover altitude and advanced each control tick by the *plan's* own
+  vertical velocity, clipped to `z_band()`. It is advanced by the waypoint-z
+  profile, **not** by the cubic's `vz` — the cubic is pinned to
+  `p'(0) = v_current`, so using it would let the setpoint chase the vehicle
+  again (measured: a level plan ratcheted it up 0.28 m during a recovery climb).
+* `--hover-thrust` / `AGILE_HOVER_THRUST` (registry default **0.577**),
+  `ki_alt` 0.4 → 1.5, an integrator limit of ±4 m/s² (±2 saturates at an
+  `h_true/h_assumed` ratio of 1.20, and this airframe is already at 1.18), and
+  an **online estimate**: at equilibrium `thrust * cos_tilt` *is* the true hover
+  throttle whatever parameter was assumed, so it is EMA'd over consecutive
+  settled samples (|vz| < 0.05, |alt_err| < 0.05, 2 s worth) and adopted, with
+  the integrator rebased so the swap is bumpless. Logged once on adoption, and
+  `alt sp=` / `hover=` appear in each verbose line.
+
+Verified against the reviewer's PX4 plant (`a_z = G*thrust/h_true - G`) from a
+1.96 m handover, `tests/test_agile_student.py`:
+
+| case | z after 20 s | vz |
+|---|---|---|
+| level plan, assumed 0.490 vs true 0.577 (**was 0.24 m / −0.45 m/s**) | 1.960 | +0.000 |
+| same, estimator disabled | 1.960 | +0.000 |
+| same, parameter calibrated to 0.577 | 1.960 | +0.000 |
+| a true 0.63 airframe, estimator off | 1.960 | +0.000 |
+| the net's own −0.11 m/s sink | tracks the setpoint to 0.016 m (both walk to the band floor) | |
+| a genuine +0.8 m/s climb-over | follows it to the band ceiling | |
+
 **Reference.** The student's MPC reference is `sim_episode.fit_cubic`, not
 `np.polyfit`: it pins `p(0) = p_current` **and `p'(0) = v_current`` and
 least-squares only the quadratic/cubic terms through waypoints 1-3. The

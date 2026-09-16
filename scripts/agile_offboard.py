@@ -196,6 +196,18 @@ def main():
                              "0.9 accept-threshold nearest-to-previous tie break. "
                              "auto (default) = veto for a .onnx student, cost for "
                              "the TF checkpoint.")
+    parser.add_argument("--hover-thrust", type=float, default=None,
+                        help="Normalised throttle at which the airframe hovers. "
+                             "Default: the student's measured 0.577 for a .onnx "
+                             "checkpoint, else the legacy G/MAX_ACCEL = 0.490 "
+                             "assumption. Getting this wrong matters ONLY with "
+                             "--alt-follow, where it cannot show up as an "
+                             "altitude offset and instead becomes a steady sink "
+                             "of -G(h_true/h_assumed - 1)/kd_alt m/s (measured "
+                             "-0.43 m/s on the 2026-09-16 Iris trial). The policy "
+                             "also estimates it online from level flight and "
+                             "adopts the measurement. AGILE_HOVER_THRUST "
+                             "overrides.")
     parser.add_argument("--veto-look-m", type=float, default=3.5,
                         help="Depth-veto path length walked from the body [m].")
     parser.add_argument("--veto-margin-m", type=float, default=0.15,
@@ -252,7 +264,10 @@ def main():
                                    daemon=True)
     recv_thread.start()
 
-    hover_thrust = float(np.clip(G / MAX_ACCEL, 0.0, 1.0))
+    # G/MAX_ACCEL is an ASSUMPTION about the airframe, not a measurement; pass
+    # None through so AgilePolicy can pick the student's measured value.
+    hover_thrust = (None if args.hover_thrust is None
+                    else float(np.clip(args.hover_thrust, 0.05, 0.95)))
     # Keep the expensive net forward pass near NET_HZ regardless of control rate.
     net_every = max(1, round(control_hz / NET_HZ))
     print(f"Control loop @ {control_hz:.0f} Hz, state stream @ {stream_hz:.0f} Hz, "
@@ -281,8 +296,8 @@ def main():
     if debug_pub is not None:
         print("Agile debug viz publisher active (sim writes agile_overhead_debug.png).")
 
-    print(f"Setting PX4 MPC_THR_HOVER = {hover_thrust:.3f} ...")
-    set_param_float(mav, "MPC_THR_HOVER", hover_thrust)
+    print(f"Setting PX4 MPC_THR_HOVER = {policy.hover_thrust:.3f} ...")
+    set_param_float(mav, "MPC_THR_HOVER", float(np.clip(policy.hover_thrust, 0.0, 1.0)))
     time.sleep(0.2)
 
     # Pre-arm: stream POSITION setpoints (hold + climb) so PX4 accepts OFFBOARD.
@@ -424,6 +439,7 @@ def main():
                                "\n  depth(m) top={top:.2f} centre={centre:.2f} low={low:.2f} bottom={bottom:.2f} "
                                "min={min:.2f} median={median:.2f} shape={shape}".format(**cmd.depth_probe))
                             + ("" if cmd.net_hz <= 0 else
+                               f"\n  alt sp={cmd.alt_sp:.2f} m hover={cmd.hover_thrust:.3f}"
                                f"\n  net {cmd.net_hz:.1f} Hz (evaluation harness "
                                f"decides at 15 Hz)"
                                + ("  <-- BELOW 15 Hz" if cmd.net_hz < 13.5 else ""))

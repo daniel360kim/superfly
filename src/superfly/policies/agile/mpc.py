@@ -464,7 +464,11 @@ class MPC:
                 "q_pred": q_pred, "u0": np.asarray(u0, dtype=np.float64),
                 # stage-1 position reference (used by agile_core's --alt-follow to
                 # slave the altitude-hold thrust PD to the reference z).
-                "p_ref1": np.asarray(yref_stages[min(1, N - 1)][:3], dtype=np.float64)}
+                "p_ref1": np.asarray(yref_stages[min(1, N - 1)][:3], dtype=np.float64),
+                # stage-1 reference VELOCITY: agile_core advances its absolute
+                # altitude setpoint at this rate rather than snapping it to
+                # p_ref1, which is pinned to the vehicle every replan.
+                "v_ref1": np.asarray(yref_stages[min(1, N - 1)][7:10], dtype=np.float64)}
         return np.asarray(u0, dtype=np.float64), status, info
 
 

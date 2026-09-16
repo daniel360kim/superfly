@@ -523,3 +523,203 @@ def test_backend_reports_a_measured_forward_time():
     pytest.importorskip("onnxruntime")
     b = OnnxStudentBackend(CHECKPOINTS / "t5fix_s_r1" / "student.onnx")
     assert b.forward_ms > 0.0
+
+
+# --------------------------------------------------------------------------- #
+# 10. the Isaac-only steady descent (reviewer's descent.py plant)
+# --------------------------------------------------------------------------- #
+# The evaluation simulator applies f = a_cmd + g exactly, so it has no
+# throttle-mapping error. PX4 does: a_z = G*(thrust*cos_tilt/hover_true) - G.
+# With --alt-follow and an alt_target re-pinned to the vehicle at every replan,
+# alt_err is ~0 by construction and the only term that can cover a hover-throttle
+# error is -kd_alt*vz -- a PERMANENT sink. These tests are that plant.
+HOVER_TRUE = 0.577                 # measured on the 2026-09-16 airstation03 Iris
+HOVER_ASSUMED = 9.8066 / 20.0      # the legacy G/MAX_ACCEL assumption = 0.490
+
+
+class _LevelNet:
+    """A plan with a prescribed constant vertical velocity (0 = perfectly level),
+    so nothing the real network does can explain a descent."""
+
+    def __init__(self, modes, out_seq_len, sink=0.0, climb=0.0):
+        from superfly.policies.agile.model import StudentModelConfig
+        self.config = StudentModelConfig(modes=modes, out_seq_len=out_seq_len)
+        self.sink, self.climb = sink, climb
+        self.forward_ms = 1.0
+
+    def infer(self, depth, imu):
+        n = self.config.out_seq_len
+        t = 0.5 * np.arange(1, n + 1)
+        z = self.sink * t + self.climb * np.minimum(t, 2.0)
+        flat = np.concatenate([3.0 * t, 0.0 * t, z])
+        return (np.arange(1, self.config.modes + 1, dtype=np.float32) * 0.1,
+                np.tile(flat, (self.config.modes, 1)).astype(np.float32))
+
+
+class _RefMPC:
+    """The real build_reference_cubic; attitude level so the plant is 1-D."""
+    _warmed = False
+
+    def compute(self, x0, world_pts, cruise_alt, yaw_des, dt_wp=0.1, max_vel=7.0,
+                obstacles_xy_r=None, alt_hold=True, att_lookahead_s=0.1,
+                cubic=None, t_offset=0.0, min_alt=0.15, max_alt=None):
+        from superfly.policies.agile.mpc import build_reference_cubic, N
+        ys, yt, q0 = build_reference_cubic(cubic, yaw_des, t_offset=t_offset,
+                                           min_alt=min_alt, max_alt=max_alt)
+        info = {"q_pred": np.array([1.0, 0.0, 0.0, 0.0]),
+                "p_ref1": ys[min(1, N - 1)][:3],
+                "v_ref1": ys[min(1, N - 1)][7:10],
+                "q_ref0": q0, "T_ref0": float(ys[0][10]), "status": 0}
+        return np.zeros(4), 0, info
+
+
+def _fly_vertical(monkeypatch, seconds=20.0, z0=1.96, sink=0.0, climb=0.0,
+                  hover_thrust=None, hover_true=HOVER_TRUE, control_hz=100.0,
+                  estimate=True):
+    """Drive the REAL AgilePolicy.compute against the PX4 vertical plant."""
+    pytest.importorskip("onnxruntime")
+    import superfly.policies.agile.core as core
+    monkeypatch.setattr(core, "MPC", _RefMPC)
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=control_hz, net_every=7,
+                         alt_follow=True, mode_select="cost",
+                         hover_thrust=hover_thrust)
+    policy.net = _LevelNet(2, 10, sink=sink, climb=climb)
+    policy.config = policy.net.config
+    policy.hover_estimate_enabled = estimate
+
+    dt = 1.0 / control_hz
+    p = np.array([0.0, 0.0, float(z0)])
+    v = np.zeros(3)
+    depth = np.full((224, 224), 20.0, np.float32)
+    trace = []
+    for _ in range(int(seconds * control_hz)):
+        cmd = policy.compute(core.AgileObs(p.copy(), v.copy(), np.eye(3),
+                                           np.zeros(3),
+                                           np.array([0.0, 60.0, z0]), depth))
+        a_z = 9.8066 * (cmd.thrust_norm / hover_true) - 9.8066
+        v[2] += a_z * dt
+        p[2] += v[2] * dt
+        p[1] += 3.0 * dt
+        trace.append((p[2], v[2], cmd.thrust_norm, cmd.alt_sp))
+    return policy, np.array(trace)
+
+
+def test_level_plan_holds_altitude_against_a_wrong_hover_throttle(monkeypatch):
+    """The headline case: shipped hover assumption (0.490) vs a 0.577 airframe.
+    Before the fix this sank at -0.45 m/s to the band floor."""
+    policy, tr = _fly_vertical(monkeypatch, seconds=20.0, z0=1.96,
+                               hover_thrust=HOVER_ASSUMED)
+    z, vz = tr[-1][0], tr[-1][1]
+    assert abs(z - 1.96) < 0.05, f"held {z:.3f} m, want 1.96 +- 0.05"
+    assert abs(vz) < 0.05, f"steady vz {vz:+.3f} m/s"
+    assert tr[int(2 * 100):, 0].min() > 1.5, "never dips far below the setpoint"
+
+
+def test_level_plan_holds_with_the_measured_hover_throttle(monkeypatch):
+    _policy, tr = _fly_vertical(monkeypatch, seconds=20.0, z0=1.96,
+                                hover_thrust=HOVER_TRUE)
+    assert abs(tr[-1][0] - 1.96) < 0.05
+
+
+def test_the_nets_own_sink_bias_is_held_within_a_tenth(monkeypatch):
+    """A plan that really does descend at 0.11 m/s: the setpoint follows it, so
+    the vehicle tracks the plan rather than running away from it."""
+    _policy, tr = _fly_vertical(monkeypatch, seconds=20.0, z0=1.96, sink=-0.11,
+                                hover_thrust=HOVER_ASSUMED)
+    z, sp = tr[-1][0], tr[-1][3]
+    assert abs(z - sp) < 0.1, f"z {z:.3f} vs setpoint {sp:.3f}"
+    assert sp < 1.96, "a descending plan must lower the setpoint"
+
+
+def test_a_genuine_climb_over_is_still_followed(monkeypatch):
+    """The reason --alt-follow exists: a mode that goes OVER an obstacle must
+    actually climb. The absolute setpoint follows the reference's vz."""
+    _policy, tr = _fly_vertical(monkeypatch, seconds=6.0, z0=1.96, climb=+0.8,
+                                hover_thrust=HOVER_ASSUMED)
+    z, sp = tr[-1][0], tr[-1][3]
+    assert sp > 2.4, f"setpoint only reached {sp:.2f} m"
+    assert z > 2.3, f"vehicle only reached {z:.2f} m"
+    assert abs(z - sp) < 0.25
+
+
+def test_hover_throttle_is_estimated_online_and_adopted(monkeypatch):
+    policy, tr = _fly_vertical(monkeypatch, seconds=20.0, z0=1.96,
+                               hover_thrust=HOVER_ASSUMED)
+    assert policy._hover_adopted, "the estimator never converged"
+    assert abs(policy.hover_thrust - HOVER_TRUE) < 0.02, policy.hover_thrust
+    assert policy.hover_thrust_param == pytest.approx(HOVER_ASSUMED)
+    # and adopting it did not bump the vehicle
+    assert abs(tr[-1][0] - 1.96) < 0.05
+
+
+def test_estimator_can_be_disabled_and_the_parameter_still_holds(monkeypatch):
+    """Half (1) + a correct parameter must hold on its own, with no estimator."""
+    policy, tr = _fly_vertical(monkeypatch, seconds=20.0, z0=1.96,
+                               hover_thrust=HOVER_TRUE, estimate=False)
+    assert not policy._hover_adopted
+    assert abs(tr[-1][0] - 1.96) < 0.05
+
+
+def test_student_defaults_to_the_measured_hover_throttle_and_fast_integrator():
+    pytest.importorskip("onnxruntime")
+    from superfly.policies.agile.core import (
+        STUDENT_HOVER_THRUST, STUDENT_KI_ALT, AgilePolicy as _P)
+    import superfly.policies.agile.core as core
+
+    class _NullMPC:
+        _warmed = False
+    orig, core.MPC = core.MPC, lambda: _NullMPC()
+    try:
+        p = _P(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"), alt_follow=True)
+    finally:
+        core.MPC = orig
+    assert p.hover_thrust == STUDENT_HOVER_THRUST == 0.577
+    assert p.ki_alt == STUDENT_KI_ALT == 1.5
+
+
+def test_registry_passes_the_measured_hover_throttle():
+    from superfly.compare.registry import method_registry
+
+    class _Args:
+        max_speed = 3.0
+    args = method_registry()["agile_student"]["speed_args"](_Args())
+    assert float(args[args.index("--hover-thrust") + 1]) == 0.577
+
+
+def test_integrator_has_authority_for_a_worse_airframe(monkeypatch):
+    """Half (1) only works while the integrator can actually supply
+    G*(h_true/h_assumed - 1). The legacy +-2 m/s^2 clamp saturates at a ratio of
+    1.20 and the trial's own airframe is already at 1.18."""
+    _policy, tr = _fly_vertical(monkeypatch, seconds=20.0, z0=1.96,
+                                hover_thrust=HOVER_ASSUMED, hover_true=0.63,
+                                estimate=False)
+    assert abs(tr[-1][0] - 1.96) < 0.05, f"held {tr[-1][0]:.3f} m"
+
+
+def test_alt_setpoint_is_not_dragged_by_the_vehicles_own_velocity(monkeypatch):
+    """The subtle half of the bug: the cubic is pinned to p'(0) = v_current, so
+    advancing the setpoint with the CUBIC's vz makes it chase the vehicle again.
+    It must be advanced by the plan's waypoint-z profile instead."""
+    pytest.importorskip("onnxruntime")
+    import superfly.policies.agile.core as core
+    monkeypatch.setattr(core, "MPC", _RefMPC)
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=100.0, net_every=1,
+                         alt_follow=True, mode_select="cost",
+                         hover_thrust=HOVER_ASSUMED)
+    policy.net = _LevelNet(2, 10, sink=0.0)
+    policy.config = policy.net.config
+    depth = np.full((224, 224), 20.0, np.float32)
+    # a vehicle that is sagging fast, with a perfectly LEVEL plan
+    p = np.array([0.0, 0.0, 1.70])
+    v = np.array([3.0, 0.0, -0.8])
+    policy.compute(core.AgileObs(p, v, np.eye(3), np.zeros(3),
+                                 np.array([0.0, 60.0, 1.96]), depth))
+    sp0 = policy._alt_sp
+    for _ in range(100):                      # 1 s of the same sagging state
+        policy.compute(core.AgileObs(p, v, np.eye(3), np.zeros(3),
+                                     np.array([0.0, 60.0, 1.96]), depth))
+    assert abs(policy._alt_sp - sp0) < 0.02, (
+        f"a level plan moved the setpoint {policy._alt_sp - sp0:+.3f} m while the "
+        "vehicle sagged at -0.8 m/s")

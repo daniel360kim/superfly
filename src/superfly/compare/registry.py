@@ -262,6 +262,14 @@ def method_registry():
                 "--q-att", str(AGILE_MPC_Q_ATT),
                 "--goal-speed", str(student_goal_speed()),
                 "--mode-select", os.environ.get("AGILE_STUDENT_MODE_SELECT", "veto"),
+                # Measured hover throttle of the Iris in the 2026-09-16
+                # airstation03 trial (level segments at t = 20.8-23.8 s sit at
+                # thrust 0.580-0.582 with vz ~ +0.05), against the 0.490 the
+                # offboard otherwise assumes. With --alt-follow that 18 % gap
+                # cannot appear as an altitude offset -- it becomes a steady
+                # -0.43 m/s sink. agile_core also estimates it online and
+                # adopts the measurement; this is the starting point.
+                "--hover-thrust", os.environ.get("AGILE_HOVER_THRUST", "0.577"),
                 # NOT optional. Without --alt-follow the MPC discards the
                 # student's vertical plan (vz=0, z=cruise_alt) while the depth
                 # veto still clears modes on their vertical geometry -- it can
