@@ -221,6 +221,7 @@ class AgileCmd:
     alphas: np.ndarray = field(default_factory=lambda: np.zeros(3))
     # depth-veto worst signed clearance per mode (None unless --mode-select veto)
     veto_scores: np.ndarray | None = None
+    depth_probe: dict | None = None      # metres at a few pixels of the frame the net saw (debug)
     net_hz: float = 0.0          # achieved decision rate (student only)
 
 
@@ -415,6 +416,11 @@ class AgilePolicy:
             depth_m = minimum_filter(depth_m, size=self.depth_inflate_px,
                                      mode="nearest")
         depth_mm = np.clip(depth_m * 1000.0, 0.0, AGILE_FAR * 1000.0)
+        if depth_m.shape[0] >= 224 and depth_m.shape[1] >= 224:
+            h, w = depth_m.shape[:2]
+            self._depth_probe = {"top": float(depth_m[h // 6, w // 2]), "centre": float(depth_m[h // 2, w // 2]),
+                                 "low": float(depth_m[3 * h // 4, w // 2]), "bottom": float(depth_m[h - 12, w // 2]),
+                                 "min": float(depth_m.min()), "median": float(np.median(depth_m)), "shape": [int(h), int(w)]}
         # The sim already bilinear-downsamples to the net's 224x224 input (matching
         # Loquercio's training loader), so no resize here in the common case. Keep a
         # nearest-neighbour fallback only for an unexpected off-size frame.
@@ -907,6 +913,7 @@ class AgilePolicy:
             tilt_cmd_deg=tilt_cmd,
             alphas=self._alphas,
             veto_scores=self._veto_scores,
+            depth_probe=getattr(self, '_depth_probe', None),
             net_hz=self.net_hz(),
         )
 

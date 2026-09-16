@@ -420,6 +420,9 @@ def main():
                             f"alphas={np.round(cmd.alphas, 3)} keepout={cmd.n_keepout}"
                             + ("" if cmd.veto_scores is None else
                                f" veto={np.round(cmd.veto_scores, 2)}")
+                            + ("" if not getattr(cmd, "depth_probe", None) else
+                               "\n  depth(m) top={top:.2f} centre={centre:.2f} low={low:.2f} bottom={bottom:.2f} "
+                               "min={min:.2f} median={median:.2f} shape={shape}".format(**cmd.depth_probe))
                             + ("" if cmd.net_hz <= 0 else
                                f"\n  net {cmd.net_hz:.1f} Hz (evaluation harness "
                                f"decides at 15 Hz)"
