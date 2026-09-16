@@ -506,7 +506,17 @@ class PegasusApp:
         that 180 deg yaw a positive Y-pitch tilts the view UP, so pitch_deg is
         negated to pitch DOWN. The horizontal FOV is forced to match training
         exactly; fov_y_deg None means square pixels (fy = fx)."""
-        cam = POLICY_CAMERAS[self.policy]
+        cam = dict(POLICY_CAMERAS[self.policy])
+        # SUPERFLY_CAM_PITCH_DEG overrides the row's pitch (degrees, positive =
+        # down). Measured 2026-09-16 on airstation03: with pitch_deg 0 the agile
+        # depth frame matches the training renderer only at ~13 deg nose-down --
+        # the ground reads 40 % nearer than a level camera would see it -- so the
+        # student is fed a view it never trained on. Kept as an override until the
+        # mount is understood, so the other methods' rows are untouched.
+        _ovr = os.environ.get("SUPERFLY_CAM_PITCH_DEG")
+        if _ovr not in (None, ""):
+            print(f"[camera] pitch_deg {cam['pitch_deg']} -> {float(_ovr)} (SUPERFLY_CAM_PITCH_DEG)")
+            cam["pitch_deg"] = float(_ovr)
         w, h = cam["resolution"]
         config = {
             "depth": True,
