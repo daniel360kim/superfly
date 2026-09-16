@@ -591,6 +591,13 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
     # the offboards fly on LOCAL_POSITION_NED, origin at the arming point),
     # so it needs no world-frame shift even for elevated spawns.
     climb_alt = scenario["climb_alt"] if scenario["climb_alt"] is not None else args.climb_alt
+    # A method may pin its own handover altitude (agile_student: its labels only
+    # cover 0.5-4.0 m, and most scenarios climb to 5). Explicit in the printed
+    # argv and in metrics.json "commands" like every other argument.
+    if cfg.get("climb_alt") is not None and float(cfg["climb_alt"]) != float(climb_alt):
+        print(f"  [{method}] climb-alt {climb_alt} -> {cfg['climb_alt']} "
+              f"(method override; set AGILE_STUDENT_CLIMB_ALT=scenario to disable)")
+        climb_alt = cfg["climb_alt"]
     off_cmd = [off_python, cfg["offboard"],
                "--checkpoint", str(ckpt),
                "--connect", args.connect,

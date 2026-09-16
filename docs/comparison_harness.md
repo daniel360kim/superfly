@@ -243,6 +243,25 @@ on their vertical geometry, so it can pick a climb-over and fly flat into the
 obstacle. World-frame plan z is clipped to `sim_episode.Z_REF` = (0.5, 4.0) m
 in `_adopt_plan`, before mode selection, exactly as `run_episode` does.
 
+That band only means anything if it *contains the vehicle*, and 12 shipped
+scenarios climb to 5 m (4 to 3 m): clipping a level plan to 4.0 m while the
+prepended origin sits at 5.0 makes the cubic command a ~2 m/s dive from the
+first decision. Two guards:
+
+* `agile_student`'s registry row carries **`climb_alt = 2.0`**, which
+  `build_commands` lets override the scenario's — the student hands over inside
+  the band its labels cover. This was chosen over a `--student-climb-alt` CLI
+  flag because it is registry *data* (how CLAUDE.md says a method is
+  configured), needs no new CLI surface, and applies to every scenario file
+  automatically. The override is printed at dry-run/launch and lands in each
+  trial's `metrics.json` `commands` like any other argument. Disable it with
+  `AGILE_STUDENT_CLIMB_ALT=scenario`, or set a number to change it. **Caveat:
+  `agile_student` then flies a given scenario lower than the other methods** —
+  deliberate, but say so when comparing.
+* `core.student_z_band()` widens the ceiling to `max(4.0, handover + 2.0)`
+  anyway, so a scenario forced above the band still never flies a commanded
+  dive; the startup log says loudly when that happened.
+
 **Reference.** The student's MPC reference is `sim_episode.fit_cubic`, not
 `np.polyfit`: it pins `p(0) = p_current` **and `p'(0) = v_current`` and
 least-squares only the quadratic/cubic terms through waypoints 1-3. The
@@ -261,8 +280,18 @@ attitude stream to PX4 and collapses the decision rate to ~5 Hz against the
 evaluation harness's 15. Threaded, the worker is latest-only and rate-gated to
 `STUDENT_DECISION_HZ = 15` so a fast box cannot out-run the rate the policy was
 scored at; the achieved rate is printed in the offboard's verbose line with a
-`<-- BELOW 15 Hz` marker. **Check it on the target box before trusting any
-result**: on loaded gs2 the closed loop achieves 5.6 Hz.
+`<-- BELOW 15 Hz` marker, and the *measured single-forward time* is logged once
+at startup (`[agile] onnx forward NNN ms ... -> at most N.N Hz of decisions on
+this box`). **Check that line on the target box before trusting any result**:
+loaded gs2 measures 140 ms / 7.1 Hz ceiling and achieves 5.4-7.3 Hz closed loop.
+
+The plan's clock starts at the state the net input was built from, not at
+adoption — in threaded mode those differ by one forward pass, which at 3 m/s
+would park the reference's t=0 point ~0.4 m behind the vehicle for the plan's
+whole life (chronic braking).
+
+A non-finite net output keeps the previous plan; a non-finite *first* plan
+raises and the trial is scored as an error.
 
 **omega.** The port feeds `R^T omega_body`, not `omega_body`. The evaluation
 harness's `Obs.omega` is already a body rate (`run_episode` integrates it from

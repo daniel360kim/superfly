@@ -436,3 +436,90 @@ def test_onnx_session_threads_are_pinned():
     pytest.importorskip("onnxruntime")
     b = OnnxStudentBackend(CHECKPOINTS / "t5fix_s_r1" / "student.onnx")
     assert b.intra_op_threads == OnnxStudentBackend.DEFAULT_INTRA_OP_THREADS == 8
+
+
+# --------------------------------------------------------------------------- #
+# 9. re-review regressions R1/R2/R3
+# --------------------------------------------------------------------------- #
+def test_z_band_always_contains_the_handover_altitude():
+    """R1: 12 shipped scenarios climb to 5 m and 4 to 3 m. A band that stops at
+    4.0 m would pull a level plan below the vehicle and command a dive."""
+    from superfly.policies.agile.core import (
+        student_z_band, STUDENT_Z_REF, STUDENT_Z_HEADROOM)
+    assert student_z_band(None) == STUDENT_Z_REF
+    assert student_z_band(2.0) == STUDENT_Z_REF          # inside: untouched
+    for alt in (3.0, 5.0):
+        lo, hi = student_z_band(alt)
+        assert lo == STUDENT_Z_REF[0]
+        assert hi >= alt + STUDENT_Z_HEADROOM
+        assert lo < alt < hi, "the band must contain the vehicle"
+
+
+def test_level_plan_at_high_climb_alt_is_not_pulled_into_a_dive(stub_mpc):
+    pytest.importorskip("onnxruntime")
+    from superfly.policies.agile.core import AgileObs
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=30.0, alt_follow=True)
+    policy._cruise_alt = 5.0                              # a climb_alt-5 scenario
+    traj = np.zeros((3, 30), np.float32)
+    traj[:, 0:10] = np.arange(1, 11) * 1.5                # level, straight ahead
+    pos = np.array([0.0, 0.0, 5.0])
+    policy._adopt_plan(np.float32([0.1, 0.2, 0.3]), traj, pos, np.eye(3), None,
+                       np.zeros(3))
+    z = policy._world_points_per_mode[..., 2]
+    np.testing.assert_allclose(z, 5.0, atol=1e-9)         # nothing clipped
+    assert abs(float(policy._cubic[1][2])) < 1e-9         # and no vz demanded
+
+
+def test_registry_pins_the_student_handover_altitude():
+    from superfly.compare.registry import (
+        method_registry, DEFAULT_STUDENT_CLIMB_ALT, STUDENT_Z_REF_NOTE)
+    cfg = method_registry()["agile_student"]
+    assert cfg["climb_alt"] == DEFAULT_STUDENT_CLIMB_ALT == 2.0
+    assert STUDENT_Z_REF_NOTE            # the choice is documented in the module
+    for m, c in method_registry().items():
+        if m != "agile_student":
+            assert c.get("climb_alt") is None, f"{m} must keep the scenario's"
+
+
+def test_plan_clock_starts_at_the_snapshot_not_at_adoption(stub_mpc):
+    """R2: in threaded mode adoption is one forward pass (~140 ms) after the
+    state the cubic is pinned to; at 3 m/s that is 0.4 m of built-in lag."""
+    pytest.importorskip("onnxruntime")
+    import time
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=30.0, alt_follow=True)
+    traj = np.zeros((3, 30), np.float32)
+    traj[:, 0:10] = np.arange(1, 11) * 1.5
+    t_submit = time.time() - 0.14                          # a 140 ms old snapshot
+    policy._adopt_plan(np.float32([0.1, 0.2, 0.3]), traj, np.zeros(3), np.eye(3),
+                       None, np.zeros(3), t_submit)
+    assert policy._plan_time == pytest.approx(t_submit, abs=1e-9)
+    assert time.time() - policy._plan_time >= 0.13
+
+
+def test_reference_vz_is_clipped_with_z():
+    """R3: at the band edge the position and velocity references must agree."""
+    from superfly.policies.agile.mpc import build_reference_cubic, N
+    # a cubic climbing hard through the ceiling
+    c = np.array([[0.0, 0.0, 3.9], [3.0, 0.0, 4.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    yref, yterm, _ = build_reference_cubic(c, 0.0, min_alt=0.5, max_alt=4.0)
+    for i in range(N + 1):
+        row = yref[i] if i < N else yterm
+        pz, vz = float(row[2]), float(row[9])
+        assert pz <= 4.0 + 1e-9
+        if pz >= 4.0 - 1e-9:
+            assert vz <= 1e-9, "no upward vz demanded at the ceiling"
+    # and the mirror case at the floor
+    c = np.array([[0.0, 0.0, 0.6], [3.0, 0.0, -4.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    yref, yterm, _ = build_reference_cubic(c, 0.0, min_alt=0.5, max_alt=4.0)
+    for i in range(N + 1):
+        row = yref[i] if i < N else yterm
+        if float(row[2]) <= 0.5 + 1e-9:
+            assert float(row[9]) >= -1e-9
+
+
+def test_backend_reports_a_measured_forward_time():
+    pytest.importorskip("onnxruntime")
+    b = OnnxStudentBackend(CHECKPOINTS / "t5fix_s_r1" / "student.onnx")
+    assert b.forward_ms > 0.0

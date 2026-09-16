@@ -85,7 +85,28 @@ STUDENT_ACCEPT = 0.9
 # band before it selects between them, and then flies the clipped plan. Same
 # frame here -- PX4's local z is height above the arming point, i.e. above the
 # ground, which is what the reference's world z is.
+#
+# The band is only meaningful if it CONTAINS the vehicle. Several shipped
+# scenarios climb to 5 m (and some to 3): clipping a level plan to 4.0 m while
+# the prepended origin sits at 5.0 makes the fitted cubic command a ~2 m/s
+# descent from the first decision, and caps alt_target at the ceiling -- the
+# student dives and then flies pinned to it. So the ceiling is raised to keep
+# 2 m of headroom above wherever the policy actually takes over
+# (student_z_band). The right answer is still to hand over INSIDE the band --
+# see AGILE_STUDENT_CLIMB_ALT in compare/registry.py, which defaults the method
+# to a 2.0 m handover.
 STUDENT_Z_REF = (0.5, 4.0)
+#: Headroom kept above the handover altitude when it is outside STUDENT_Z_REF.
+STUDENT_Z_HEADROOM = 2.0
+
+
+def student_z_band(cruise_alt: float | None) -> tuple[float, float]:
+    """sim_episode.Z_REF, widened upward so it always contains the handover
+    altitude with STUDENT_Z_HEADROOM to spare."""
+    lo, hi = STUDENT_Z_REF
+    if cruise_alt is not None:
+        hi = max(hi, float(cruise_alt) + STUDENT_Z_HEADROOM)
+    return lo, hi
 # Decision rate of the evaluation harness (sim_episode.DECISION_HZ). The student
 # submits inference no faster than this, so a fast box cannot out-run the rate
 # the policy was scored at; a slow one is reported in the log.
@@ -369,6 +390,8 @@ class AgilePolicy:
         self._obs_cells: dict[tuple[int, int], float] = {}   # (ix,iy) -> last-seen ts
         self._alt_i = 0.0                    # altitude integrator [m/s^2]
         self.mpc._warmed = False             # re-converge the first solve
+        if getattr(self, "_net_stop", None) is not None:
+            self._net_stop.clear()           # a policy reused after shutdown()
         if getattr(self, "_net_lock", None) is not None:     # drop stale net i/o
             with self._net_lock:
                 self._net_req = None
@@ -587,7 +610,8 @@ class AgilePolicy:
     # ------------------------------------------------------------------ #
     # Net plan adoption + optional worker thread (--net-thread)
     # ------------------------------------------------------------------ #
-    def _adopt_plan(self, alphas, trajectories, pos, R_enu, depth_hw, vel=None):
+    def _adopt_plan(self, alphas, trajectories, pos, R_enu, depth_hw, vel=None,
+                    t_stamp=None):
         """Turn a net output into the cached world-frame plan. pos/R_enu/vel must
         be the SNAPSHOT the net input was built from (matters in threaded mode)."""
         if not np.isfinite(np.asarray(trajectories)).all() or not np.isfinite(
@@ -613,7 +637,7 @@ class AgilePolicy:
             # before select_mode and flies the clipped plan. Do it here, in the
             # same order and the same frame. The veto still runs on the RAW body
             # waypoints, exactly as DepthVetoPolicy does.
-            wp_per_mode[..., 2] = np.clip(wp_per_mode[..., 2], *STUDENT_Z_REF)
+            wp_per_mode[..., 2] = np.clip(wp_per_mode[..., 2], *self.z_band())
         self._mode_idx = self._select_mode(local_per_mode, depth_hw, alphas,
                                            wp_per_mode)
         if self.is_student:
@@ -633,7 +657,13 @@ class AgilePolicy:
             v0 = np.zeros(3) if vel is None else np.asarray(vel, np.float64)
             self._cubic = fit_cubic_state(pos, v0, wp_per_mode[self._mode_idx],
                                           self.waypoint_dt)
-            now = time.time()
+            # The cubic is pinned to the state the net INPUT was built from, so
+            # the plan's clock starts there -- not at adoption. In threaded mode
+            # those differ by one forward pass (~140 ms), which at 3 m/s would
+            # park the reference's t=0 point ~0.4 m behind the vehicle for the
+            # plan's whole life: a constant backwards position error into the
+            # MPC, i.e. chronic braking.
+            now = time.time() if t_stamp is None else float(t_stamp)
             self._plan_time = now
             self._net_stamps.append(now)
             if len(self._net_stamps) > 16:
@@ -653,14 +683,14 @@ class AgilePolicy:
                 self._net_event.clear()
             if req is None:
                 continue
-            depth_in, state_in, pos, R_enu, depth_hw, vel = req
+            depth_in, state_in, pos, R_enu, depth_hw, vel, t_submit = req
             try:
                 alphas, trajs = self.net.infer(depth_in, state_in)
             except Exception as exc:      # never kill the worker
                 print(f"[agile] net worker infer failed: {exc}", flush=True)
                 continue
             with self._net_lock:
-                self._net_res = (alphas, trajs, pos, R_enu, depth_hw, vel)
+                self._net_res = (alphas, trajs, pos, R_enu, depth_hw, vel, t_submit)
 
     def _encode_state(self, pos, R_enu, vel, angular_body, goal_enu, goal_dir):
         """Student -> the 22-dim metric encoding; TF checkpoint -> the legacy
@@ -669,6 +699,10 @@ class AgilePolicy:
             return self._student_state_to_model_input(
                 pos, R_enu, vel, angular_body, goal_enu)
         return self._state_to_model_input(pos, R_enu, vel, angular_body, goal_dir)
+
+    def z_band(self) -> tuple[float, float]:
+        """The student's vertical band for this flight (see student_z_band)."""
+        return student_z_band(self._cruise_alt)
 
     def shutdown(self):
         """Stop the inference worker and join it. onnxruntime tears its thread
@@ -714,7 +748,7 @@ class AgilePolicy:
         with self._net_lock:
             if submit:
                 self._net_req = (depth_in, state_in, pos.copy(), R_enu.copy(),
-                                 obs.depth, vel.copy())
+                                 obs.depth, vel.copy(), now)
                 self._net_event.set()
             res, self._net_res = self._net_res, None
         if res is not None:
@@ -744,6 +778,15 @@ class AgilePolicy:
         if self._cruise_alt is None:
             # POLICY handoff happens at climb altitude; hold that for the cruise.
             self._cruise_alt = float(pos[2])
+            if self.is_student:
+                lo, hi = self.z_band()
+                print(f"[agile] student vertical band {lo:.2f}-{hi:.2f} m "
+                      f"(handover at {self._cruise_alt:.2f} m; the labels flew "
+                      f"{STUDENT_Z_REF[0]:.1f}-{STUDENT_Z_REF[1]:.1f} m"
+                      + ("" if hi <= STUDENT_Z_REF[1] + 1e-9 else
+                         " -- HANDOVER IS ABOVE THE TRAINING BAND, the ceiling "
+                         "was raised to contain it; prefer a lower --climb-alt")
+                      + ").", flush=True)
 
         goal_dir = self._goal_dir(pos, goal)
         yaw_des = math.atan2(float(goal_dir[1]), float(goal_dir[0]))
@@ -758,8 +801,10 @@ class AgilePolicy:
             depth_in = self._depth_to_model_input(obs.depth)
             state_in = self._encode_state(pos, R_enu, vel, obs.angular_rate_body,
                                           goal, goal_dir)
+            t_submit = time.time()
             alphas, trajectories = self.net.infer(depth_in, state_in)
-            self._adopt_plan(alphas, trajectories, pos, R_enu, obs.depth, vel)
+            self._adopt_plan(alphas, trajectories, pos, R_enu, obs.depth, vel,
+                             t_submit)
 
         world_points = self._world_points
         # Points the MPC's reference cubic is fitted through (see
@@ -787,8 +832,8 @@ class AgilePolicy:
                 cubic=self._cubic if self.is_student else None,
                 t_offset=(0.0 if self._plan_time is None
                           else max(0.0, now - self._plan_time)),
-                min_alt=STUDENT_Z_REF[0] if self.is_student else 0.15,
-                max_alt=STUDENT_Z_REF[1] if self.is_student else None)
+                min_alt=self.z_band()[0] if self.is_student else 0.15,
+                max_alt=self.z_band()[1] if self.is_student else None)
             if status in (0, 2):
                 attitude_q = np.asarray(minfo["q_pred"], dtype=np.float64)
                 if self.max_tilt_deg < 89.0:
@@ -803,7 +848,7 @@ class AgilePolicy:
                     # Student: the reference's own Z_REF band, not a band
                     # relative to the climb altitude -- the whole point of
                     # following the plan's z is that it may leave that band.
-                    lo, hi = (STUDENT_Z_REF if self.is_student
+                    lo, hi = (self.z_band() if self.is_student
                               else (1.0, self._cruise_alt + 3.0))
                     alt_target = float(np.clip(minfo["p_ref1"][2], lo, hi))
         except Exception as exc:

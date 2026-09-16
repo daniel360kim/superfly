@@ -56,9 +56,41 @@ STUDENT_MAX_VEL = 3.5
 DEFAULT_STUDENT_GOAL_SPEED = 0.0
 DEFAULT_STUDENT_RUN = "t5fix_s_r1"
 
+# Handover altitude. The student's labels flew z in 0.5-4.0 m
+# (sim_episode.Z_REF) and it clips its own plan into that band, so handing over
+# at a scenario's climb_alt of 5 m puts the vehicle ABOVE its whole vertical
+# plan: a level plan is pulled down to the ceiling and the fitted cubic
+# commands a descent from the first decision. 12 of the shipped scenarios climb
+# to 5 m and 4 to 3 m, so this is the common case, not the corner.
+#
+# Chosen fix: a `climb_alt` field on the method row, which build_commands lets
+# override the scenario's. It is data in the registry (the way CLAUDE.md says a
+# method is configured), it needs no new CLI surface, and it travels with every
+# scenario file automatically. The cost is that agile_student flies a given
+# scenario ~3 m lower than the other methods -- deliberate, and recorded in each
+# trial's metrics.json "commands" like every other argument. Set
+# AGILE_STUDENT_CLIMB_ALT to change it, or to "" / "scenario" to disable the
+# override and take the scenario's value.
+DEFAULT_STUDENT_CLIMB_ALT = 2.0
+#: One line of the above, kept as data so a test can assert the choice is
+#: recorded rather than incidental.
+STUDENT_Z_REF_NOTE = ("agile_student hands over at 2.0 m: its labels only cover "
+                      "0.5-4.0 m, and most scenarios climb to 5. Set "
+                      "AGILE_STUDENT_CLIMB_ALT=scenario to use the scenario value.")
+
 
 def student_goal_speed() -> float:
     return float(os.environ.get("AGILE_STUDENT_GOAL_SPEED", DEFAULT_STUDENT_GOAL_SPEED))
+
+
+def student_climb_alt():
+    """The method's handover altitude, or None to use the scenario's."""
+    raw = os.environ.get("AGILE_STUDENT_CLIMB_ALT")
+    if raw is None:
+        return DEFAULT_STUDENT_CLIMB_ALT
+    if raw.strip().lower() in ("", "scenario", "none"):
+        return None
+    return float(raw)
 AGILE_MAX_TILT_DEG = 30.0
 AGILE_CONTROL_HZ = 100.0
 AGILE_MPC_Q_ATT = 200.0
@@ -218,6 +250,9 @@ def method_registry():
             checkpoint=CHECKPOINTS_DIR / "Student" / DEFAULT_STUDENT_RUN
             / "student.onnx",
             ckpt_kind="onnx",
+            # Override the scenario's climb_alt: hand over inside the band the
+            # student was trained and evaluated in (see DEFAULT_STUDENT_CLIMB_ALT).
+            climb_alt=student_climb_alt(),
             speed_args=lambda a: [
                 # V_CAP, not --max-speed: see STUDENT_MAX_VEL above.
                 "--max-vel", str(max(float(a.max_speed), STUDENT_MAX_VEL)),

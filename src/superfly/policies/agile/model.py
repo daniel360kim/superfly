@@ -501,6 +501,28 @@ class OnnxStudentBackend:
         self.modes, self.out_seq_len = self._probe_output_shape()
         self.config = StudentModelConfig(modes=self.modes, out_seq_len=self.out_seq_len)
         self.loaded_weight_count = len(self.session.get_inputs())   # diagnostic only
+        self.forward_ms = self._time_one_forward()
+        print(f"[agile] onnx forward {self.forward_ms:.0f} ms "
+              f"({self.intra_op_threads} intra-op threads) -> at most "
+              f"{1000.0 / max(self.forward_ms, 1e-6):.1f} Hz of decisions on this "
+              f"box; the evaluation harness decides at 15 Hz.", flush=True)
+
+    def _time_one_forward(self) -> float:
+        """Median of a few zero-input passes, logged at startup: the decision
+        rate is the number that decides whether a flight is comparable to the
+        test-5 evaluation, and it is a property of the box, not of the code."""
+        import time as _time
+        depth = np.zeros((1, 1, 224, 224, 3), dtype=np.float32)
+        imu = np.zeros((1, 1, self.config.raw_state_dim), dtype=np.float32)
+        feed = {self._depth_input: depth, self._state_input: imu}
+        for _ in range(2):
+            self.session.run(None, feed)
+        ts = []
+        for _ in range(5):
+            t0 = _time.perf_counter()
+            self.session.run(None, feed)
+            ts.append((_time.perf_counter() - t0) * 1e3)
+        return float(np.median(ts))
 
     def _classify_inputs(self):
         """Same rule as sim_episode.OnnxPolicy.__call__: the 5-D (or

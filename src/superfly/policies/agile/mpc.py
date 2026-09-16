@@ -270,9 +270,17 @@ def build_reference_cubic(cubic, yaw_des, t_offset=0.0, prev_q0=None,
             a[:2] *= MAX_REF_ACCEL_XY / a_xy
         a[2] = float(np.clip(a[2], -MAX_REF_ACCEL_XY, MAX_REF_ACCEL_XY))
         p = np.asarray(p, dtype=np.float64).copy()
-        p[2] = max(float(p[2]), min_alt)
-        if max_alt is not None:
-            p[2] = min(float(p[2]), max_alt)
+        v = np.asarray(v, dtype=np.float64).copy()
+        # Clip z, and zero vz at the boundary: leaving vz unclipped makes the
+        # position and velocity references disagree exactly where the clip
+        # bites, and the MPC then chases a climb/descent the position reference
+        # forbids.
+        if p[2] < min_alt:
+            p[2] = min_alt
+            v[2] = max(v[2], 0.0)
+        if max_alt is not None and p[2] > max_alt:
+            p[2] = max_alt
+            v[2] = min(v[2], 0.0)
         q, T = flatness_attitude(a + np.array([0.0, 0.0, G]), yaw_des, prev_q)
         prev_q = q
         if i == 0:
