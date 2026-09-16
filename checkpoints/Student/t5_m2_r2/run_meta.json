@@ -1,0 +1,10 @@
+{
+  "schema": "superfly-run-meta-v1",
+  "method": "agile_student",
+  "artifact": "student.onnx",
+  "host": "gs2",
+  "date": "2026-09-16T00:00:00+00:00",
+  "produced_by": "anyanything TRAINING: two-mode ablation, config/ours_t5_modes2.yaml, seed r2, 30 epochs on OSMO (run_t5_m2_r2/20260916-053528/train/ckpt-30); launcher scratch_t5_prm/launch_modes2.sh",
+  "source_path": "/home/ubuntu/anyanything/scratch_t5_prm/models_modes2/t5_m2_r2/student.onnx",
+  "config_notes": "2 modes x (1 alpha + 3x10 waypoints @ 0.5 s) = 5 s horizon; output (1,2,31)."
+}

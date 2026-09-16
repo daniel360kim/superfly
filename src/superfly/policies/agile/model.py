@@ -371,3 +371,143 @@ class TensorFlowLoquercioBackend:
         alphas = np.abs(pred[0, :, 0])
         trajectories = pred[0, :, 1:]
         return alphas.astype(np.float32), trajectories.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# ONNX student backend (anyanything TRAINING, test-5 students)
+# ---------------------------------------------------------------------------
+# The students trained in `anyanything` are exported to ONNX with the contract
+# in ~/anyanything/agile_student/INPUTS.md:
+#
+#   inputs   imu   (1, 1, 22) = [pos(3), R(9), v_body(3), omega_body(3),
+#                                goal_body(3), v_goal(1)]
+#            depth (1, 1, 224, 224, 3) = mm/80, clipped at 20 m, tiled x3
+#   output   (1, M, 1 + 3N) per mode [alpha, x_1..N, y_1..N, z_1..N] in the
+#            body frame at t = 0.5 j s (ABSOLUTE metres, not speed-normalised)
+#
+# M (modes) and N (waypoints) vary by run -- the shipped students are
+# (M=2, N=10), (M=3, N=5) and (M=3, N=10) -- so both come from the graph, never
+# from a hard-coded config. The reference decoder this mirrors byte-for-byte is
+# superfly_expert_sampler.sim_episode.OnnxPolicy.decode_output (the test-5
+# evaluation harness); tests/test_agile_student.py asserts they agree.
+
+
+@dataclass(frozen=True)
+class StudentModelConfig:
+    """LoquercioModelConfig's shape for the student: 22-dim state, and mode /
+    waypoint counts read off the ONNX graph rather than fixed at 3 / 10."""
+    modes: int = 3
+    out_seq_len: int = 10
+    img_width: int = 224
+    img_height: int = 224
+    seq_len: int = 1
+    state_dim: int = 3
+    use_rgb: bool = False
+    use_depth: bool = True
+    use_position: bool = False
+    use_attitude: bool = True
+    use_bodyrates: bool = True
+    freeze_backbone: bool = False
+
+    @property
+    def raw_state_dim(self) -> int:
+        return 22
+
+    @property
+    def output_dim_per_mode(self) -> int:
+        return 1 + self.state_dim * self.out_seq_len
+
+
+def is_onnx_checkpoint(path) -> bool:
+    """The student is selected purely by artifact extension, so nothing in the
+    harness has to special-case a method name."""
+    return str(path).lower().endswith(".onnx")
+
+
+def decode_student_output(out) -> Tuple[np.ndarray, np.ndarray]:
+    """(1, M, 1+3N) -> (alphas (M,), trajectories (M, 3N)), modes sorted
+    ascending by |alpha| so index 0 is the net's lowest-cost prediction --
+    the same ordering TensorFlowLoquercioBackend.infer returns, and the same
+    ordering sim_episode.select_mode's argsort produces.
+
+    `trajectories` keeps the flat [x_1..N | y_1..N | z_1..N] layout, which is
+    what agile_core._adopt_plan reshapes as (state_dim=3, out_seq_len).
+    A two-tensor graph (modes (1,M,N,3), costs (1,M)) is accepted too, matching
+    sim_episode.OnnxPolicy.decode_output."""
+    if isinstance(out, (list, tuple)) and len(out) >= 2:
+        m = np.asarray(out[0], dtype=np.float64)[0]
+        modes = m.shape[0]
+        wps = m.reshape(modes, m.size // (3 * modes), 3)          # (M, N, 3)
+        alpha = np.abs(np.asarray(out[1], dtype=np.float64)[0].reshape(modes))
+        flat = np.transpose(wps, (0, 2, 1)).reshape(modes, -1)    # -> [x..|y..|z..]
+    else:
+        o = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float64)
+        o = o.reshape(-1, o.shape[-1])
+        alpha = np.abs(o[:, 0])
+        flat = o[:, 1:]
+    order = np.argsort(alpha, kind="stable")
+    return (alpha[order].astype(np.float32), flat[order].astype(np.float32))
+
+
+class OnnxStudentBackend:
+    """onnxruntime (CPU) drop-in for TensorFlowLoquercioBackend.
+
+    Exposes the same `infer(depth, imu) -> (alphas, trajectories)` contract, so
+    agile_core's plan pipeline is unchanged apart from the encoders. `modes` and
+    `out_seq_len` are discovered from the graph (static output shape when the
+    exporter wrote one, otherwise a single zero-input probe run)."""
+
+    def __init__(self, checkpoint_path: str, providers=("CPUExecutionProvider",)):
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:                      # pragma: no cover
+            raise RuntimeError(
+                "onnxruntime is required for the agile_student method. Install it "
+                "into the agile venv: <repo>/.venv/bin/python -m pip install onnxruntime"
+            ) from exc
+        path = Path(checkpoint_path)
+        if path.is_dir():                               # accept the run folder too
+            path = path / "student.onnx"
+        if not path.exists():
+            raise FileNotFoundError(f"ONNX student not found: {path}")
+        self.checkpoint_prefix = str(path)
+        # CPU on purpose: the offboard shares the box with Isaac + PX4 SITL, the
+        # net is ~20 MB and the 30 Hz control loop only needs ~15 Hz of it.
+        self.session = ort.InferenceSession(str(path), providers=list(providers))
+        self._input_shapes = {i.name: list(i.shape) for i in self.session.get_inputs()}
+        self._depth_input, self._state_input = self._classify_inputs()
+        self.modes, self.out_seq_len = self._probe_output_shape()
+        self.config = StudentModelConfig(modes=self.modes, out_seq_len=self.out_seq_len)
+        self.loaded_weight_count = len(self.session.get_inputs())   # diagnostic only
+
+    def _classify_inputs(self):
+        """Same rule as sim_episode.OnnxPolicy.__call__: the 5-D (or
+        depth/img-named) tensor is the image, the other one is the state."""
+        depth_name = state_name = None
+        for name, shape in self._input_shapes.items():
+            if "depth" in name.lower() or "img" in name.lower() or len(shape) == 5:
+                depth_name = name
+            else:
+                state_name = name
+        if depth_name is None or state_name is None:
+            raise ValueError(
+                f"cannot classify ONNX inputs {list(self._input_shapes)} into "
+                "(depth, state); expected one 5-D image tensor and one state vector")
+        return depth_name, state_name
+
+    def _probe_output_shape(self):
+        shape = list(self.session.get_outputs()[0].shape)
+        if len(shape) == 3 and all(isinstance(d, int) and d > 0 for d in shape[1:]):
+            modes, width = int(shape[1]), int(shape[2])
+            return modes, (width - 1) // 3
+        # dynamic axes: one zero-input forward pass settles it
+        depth = np.zeros((1, 1, 224, 224, 3), dtype=np.float32)
+        imu = np.zeros((1, 1, 22), dtype=np.float32)
+        alphas, trajectories = self.infer(depth, imu, _bootstrap=True)
+        return int(alphas.shape[0]), int(trajectories.shape[1] // 3)
+
+    def infer(self, depth: np.ndarray, imu: np.ndarray, _bootstrap: bool = False):
+        """(alphas (M,), trajectories (M, 3*out_seq_len)) sorted by |alpha|."""
+        feed = {self._depth_input: np.ascontiguousarray(depth, dtype=np.float32),
+                self._state_input: np.ascontiguousarray(imu, dtype=np.float32)}
+        return decode_student_output(self.session.run(None, feed))

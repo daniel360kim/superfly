@@ -7,6 +7,7 @@ special-cases method names:
     hydra_dir  a DiffAero Hydra run dir holding checkpoints/exported_actor.pt2
     tf_prefix  a TF2 checkpoint PREFIX (<prefix>.index alongside; no
                `checkpoint` pointer file) -- never a plain file
+    onnx       a single exported .onnx graph
 
 Interpreters resolve from each method submodule's own venv
 (methods/<repo>/.venv); agile goes through scripts/agile_python.sh, an exec
@@ -34,6 +35,29 @@ DEFAULT_MAX_SPEED = 3.0
 # achievable and avoid the stale-state limit cycle (see agile-oscillation-fix
 # / agile-autonomy-integration memory notes for the full history).
 DEFAULT_AGILE_MAX_SPEED = 4.0
+
+# --- agile_student ---------------------------------------------------------
+# The anyanything student flies the SAME offboard, MPC and PX4 plumbing as
+# `agile`; only the net, the state encoding and the mode rule differ, and all
+# three are selected by the .onnx extension (see policies/agile/model.py).
+#
+# Cruise: the students are labelled at a 3 m/s nominal cruise (sim_episode
+# CRUISE = 3.0, V_CAP = 3.5), so the harness default --max-speed of 3.0 m/s is
+# already right and agile's 4.0 m/s override does NOT apply here. --max-vel is
+# still passed because the MPC speed-caps its reference with it -- it does not
+# rescale the student's plan (agile_core._scale_body_plan is identity for a
+# student), so setting it low only clips, it never shrinks the geometry.
+#
+# Arrival speed: v_goal, the 22nd element of the state. The harness lands at
+# the goal, so 0.0 (arrive stopped) is both the honest value and the modal one
+# in the test-5 evaluation set (501 of 882 episodes). Override per run with
+# AGILE_STUDENT_GOAL_SPEED.
+DEFAULT_STUDENT_GOAL_SPEED = 0.0
+DEFAULT_STUDENT_RUN = "t5fix_s_r1"
+
+
+def student_goal_speed() -> float:
+    return float(os.environ.get("AGILE_STUDENT_GOAL_SPEED", DEFAULT_STUDENT_GOAL_SPEED))
 AGILE_MAX_TILT_DEG = 30.0
 AGILE_CONTROL_HZ = 100.0
 AGILE_MPC_Q_ATT = 200.0
@@ -175,6 +199,34 @@ def method_registry():
                 # trial's metrics.json "commands" like every other arg.
             ] + shlex.split(os.environ.get("AGILE_EXTRA_ARGS", "")),
         ),
+        # The anyanything student (test-5 recipe v2 labels) exported to ONNX.
+        # Same policy="agile" sim camera (640x480 @ 91 deg -> 224x224, 20 m),
+        # same offboard script, same acados MPC; the .onnx checkpoint switches
+        # agile_core to the 22-dim state, the unscaled metric 0.5 s plan and the
+        # depth-veto mode rule. Runs under the agile interpreter because acados
+        # is still in the loop -- plus onnxruntime (CPU).
+        "agile_student": dict(
+            policy="agile",
+            offboard="agile_offboard.py",
+            # 30.0 like `agile`: this field is the method's nominal rate; the
+            # offboard's real loop rate is the validated AGILE_CONTROL_HZ passed
+            # through speed_args below, exactly as `agile` does it.
+            control_hz=30.0,
+            goal_argc=2,                     # agile --goal takes X Y only
+            python=SCRIPTS_DIR / "agile_python.sh",
+            checkpoint=CHECKPOINTS_DIR / "Student" / DEFAULT_STUDENT_RUN
+            / "student.onnx",
+            ckpt_kind="onnx",
+            speed_args=lambda a: [
+                "--max-vel", str(a.max_speed),
+                "--max-tilt-deg", str(AGILE_MAX_TILT_DEG),
+                "--att-lp", "1.0",
+                "--control-hz", str(AGILE_CONTROL_HZ),
+                "--q-att", str(AGILE_MPC_Q_ATT),
+                "--goal-speed", str(student_goal_speed()),
+                "--mode-select", os.environ.get("AGILE_STUDENT_MODE_SELECT", "veto"),
+            ] + shlex.split(os.environ.get("AGILE_STUDENT_EXTRA_ARGS", "")),
+        ),
     }
 
 
@@ -185,6 +237,8 @@ def checkpoint_ready(cfg, ckpt: Path) -> bool:
         return (ckpt / "checkpoints" / "exported_actor.pt2").exists()
     if kind == "tf_prefix":
         return Path(str(ckpt) + ".index").exists()
+    if kind == "onnx":
+        return ckpt.suffix == ".onnx" and ckpt.exists()
     return ckpt.exists()
 
 

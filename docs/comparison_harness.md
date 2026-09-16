@@ -1,7 +1,8 @@
 # Policy Comparison Harness
 
 Flies **DepthNav**, **DiffAero**, and **Agile Autonomy** (plus their
-velocity-command variants) through the *same* Isaac-Sim + PX4-SITL scenarios and scores them on the same metrics, without
+velocity-command variants, plus the `anyanything` ONNX student as
+`agile_student`) through the *same* Isaac-Sim + PX4-SITL scenarios and scores them on the same metrics, without
 retraining or modifying any method. Each trial launches the shared simulator
 (`scripts/run_px4_sim.py --log-traj`) plus the method's own
 `scripts/*_offboard.py`, waits for
@@ -195,6 +196,63 @@ checkpoint is overridable with `--<method>-python` / `--<method>-checkpoint`;
 Methods whose checkpoint is missing are skipped with a message (see
 `checkpoints/README.md` for which artifacts exist today). Select a subset
 with `--methods diffaero depthnav`.
+
+## `agile_student` — flying an anyanything ONNX student
+
+`agile_student` is the `anyanything` end-to-end student (test-5 recipe-v2
+labels) flown through the *same* offboard, acados MPC and PX4 plumbing as
+`agile`. Nothing is duplicated: the `.onnx` extension of `--checkpoint` is
+what switches `superfly.policies.agile.core` over, and `ckpt_kind: onnx` is
+what makes `checkpoint_ready` gate it. Three things differ from `agile`:
+
+| | `agile` (ckpt-50) | `agile_student` (.onnx) |
+|---|---|---|
+| state | 21-dim, **de-yawed** R, goal as a **unit direction** to a point `future_time * max_vel` ahead on the mission line | 22-dim, **raw** R, goal as the **metric** body-frame vector clamped to 10 m, plus `v_goal` (arrival speed, `--goal-speed`) |
+| plan | 10 waypoints at 0.1 s, rescaled by `max_vel / 7` | M x N waypoints (both read off the graph) in **absolute metres** at 0.5 s — **never** rescaled |
+| mode | always the lowest `\|alpha\|` | depth veto + argmin cost (`--mode-select`) |
+
+**Rate / resampling.** The student's waypoints are *not* resampled. The MPC's
+`build_reference` uses `dt_wp` only to build the time base `t = arange(nwp) *
+dt_wp` for a cubic, which it then samples at the solver's own nodes (N=10 x
+0.1 s = a 1.0 s horizon), so passing the true 0.5 s spacing is exact. What is
+changed is *how many* points the cubic is fitted through: a least-squares
+cubic over the whole 5 s plan is a poor local fit for the first second, so the
+student feeds it the current position (t=0, the waypoint the student does not
+emit) plus waypoints 1-3 (t = 0.5, 1.0, 1.5 s) — four points, one
+exactly-determined cubic, the same window the test-5 evaluation harness fits
+(`sim_episode.fit_cubic`). `STUDENT_MPC_WAYPOINTS` in `policies/agile/core.py`.
+
+**Depth veto** (`--mode-select veto`, the default for a student): each mode's
+next 3.5 m of body-frame path is projected into the 224x224 depth frame the
+policy was just given, with the render pinhole (640x480 @ 91 deg, principal
+point at `(w-1)/2`, anisotropically resized 640->224 / 480->224); a mode with
+a sample behind the depth surface by more than 0.15 m is given an infinite
+cost. `--mode-select cost` restores upstream's always-mode-0 rule.
+`tests/test_agile_student.py` asserts this agrees with the reference
+implementation (`superfly_expert_sampler.sim_episode.DepthVetoPolicy.blocked`)
+on a rendered wall, and that the state encoder is byte-identical to
+`OnnxPolicy.encode_state`.
+
+**Speed.** The students are labelled at a 3 m/s cruise, so the harness default
+`--max-speed 3.0` is already right; `agile`'s 4 m/s override does not apply.
+`--max-vel` only speed-*caps* the MPC reference — it no longer shrinks the
+plan.
+
+**Interpreter.** Needs `acados_template` **and** `onnxruntime` in one
+interpreter. `scripts/agile_python.sh` targets the repo-root `.venv`; where
+that was never built, point it elsewhere with `AGILE_PYTHON=<python>` (it
+still exports the ACADOS env vars, which a bare `--agile_student-python`
+would not).
+
+```bash
+python scripts/run_comparison.py configs/scenarios/probes/diffaero_field.json \
+    --methods agile_student --headless --record-video --report \
+    --sim-python <isaacsim>/python.sh
+# a different student:
+#   --agile_student-checkpoint checkpoints/Student/t5_m2_r2/student.onnx
+# a non-zero arrival speed:  AGILE_STUDENT_GOAL_SPEED=2.0
+# upstream mode rule:        AGILE_STUDENT_MODE_SELECT=cost
+```
 
 ## Key options
 

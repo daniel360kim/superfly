@@ -18,6 +18,12 @@ PX4's GCS link, which by default streams position at 1 Hz and attitude at
 Learned reactive policies tolerate that staleness; a stiff model-based
 tracker does not.
 
+Also flies an anyanything ONNX student (method `agile_student`): pass a
+`.onnx` --checkpoint and the policy core switches to the 22-dim student state
+encoding, keeps the student's metric 0.5 s waypoints unscaled, and picks the
+tracked mode with the depth veto (--mode-select). Everything downstream -- the
+acados MPC, the altitude hold, the PX4 plumbing, the phase machine -- is shared.
+
 Usage (after running run_px4_sim.py --policy agile):
     ./agile_python.sh agile_offboard.py \
         --checkpoint ../checkpoints/AgileAutonomy/ckpt-50 --depth \
@@ -69,7 +75,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True,
                         help="TF2 checkpoint PREFIX (e.g. .../ckpt-50, with "
-                             "ckpt-50.index alongside) or a directory containing one")
+                             "ckpt-50.index alongside) or a directory containing "
+                             "one; OR a .onnx anyanything student (22-dim state, "
+                             "metric 0.5 s waypoints) -- the extension selects "
+                             "the backend and the state encoding.")
     parser.add_argument("--connect", default="udp:localhost:14550",
                         help="MAVLink connection string")
     parser.add_argument("--goal", type=float, nargs=2, default=None, metavar=("X", "Y"),
@@ -168,6 +177,31 @@ def main():
                         help=f"Rate [Hz] to request PX4 stream state (default {STREAM_HZ:.0f}). "
                              f"Automatically raised to at least --control-hz so no MPC solve "
                              f"runs on stale state.")
+    parser.add_argument("--goal-speed", type=float, default=0.0,
+                        help="Student only: the arrival speed v_goal [m/s] the "
+                             "22-dim state is conditioned on (the last element of "
+                             "the imu vector). 0 = arrive stopped, which is what "
+                             "this harness does (it lands at the goal) and what "
+                             "the majority of the test-5 evaluation episodes use "
+                             "(501/882 at 0.0; the rest are 1/2/3 m/s "
+                             "pass-throughs). Ignored by the TF checkpoint.")
+    parser.add_argument("--mode-select", choices=["auto", "cost", "veto"],
+                        default="auto",
+                        help="How the tracked mode is picked. cost = upstream "
+                             "agile_autonomy (always the lowest |alpha|). veto = "
+                             "the test-5 deployment rule: project each mode's next "
+                             "3.5 m into the depth frame the policy just saw, drop "
+                             "any mode that goes behind the surface by >0.15 m, "
+                             "then argmin cost over the survivors with upstream's "
+                             "0.9 accept-threshold nearest-to-previous tie break. "
+                             "auto (default) = veto for a .onnx student, cost for "
+                             "the TF checkpoint.")
+    parser.add_argument("--veto-look-m", type=float, default=3.5,
+                        help="Depth-veto path length walked from the body [m].")
+    parser.add_argument("--veto-margin-m", type=float, default=0.15,
+                        help="Depth-veto depth-behind-surface tolerance [m].")
+    parser.add_argument("--veto-radius-m", type=float, default=0.35,
+                        help="Depth-veto pixel-window radius around each sample [m].")
     parser.add_argument("--no-debug-viz", action="store_true",
                         help="Disable UDP debug frames for sim overhead trajectory viz.")
     args = parser.parse_args()
@@ -237,6 +271,11 @@ def main():
         depth_inflate_px=args.depth_inflate_px,
         alt_follow=args.alt_follow,
         net_thread=args.net_thread,
+        goal_speed=args.goal_speed,
+        mode_select=args.mode_select,
+        veto_look_m=args.veto_look_m,
+        veto_margin_m=args.veto_margin_m,
+        veto_radius_m=args.veto_radius_m,
     )
     debug_pub = None if args.no_debug_viz else AgileDebugPublisher()
     if debug_pub is not None:
@@ -378,7 +417,9 @@ def main():
                             f"goal={np.round(goal_enu, 2)}\n"
                             f"  tilt cmd/meas={cmd.tilt_cmd_deg:.1f}/{meas_tilt:.1f} deg "
                             f"thrust={cmd.thrust_norm:.3f} mode={cmd.mode_idx} "
-                            f"alphas={np.round(cmd.alphas, 3)} keepout={cmd.n_keepout}\n"
+                            f"alphas={np.round(cmd.alphas, 3)} keepout={cmd.n_keepout}"
+                            + ("" if cmd.veto_scores is None else
+                               f" veto={np.round(cmd.veto_scores, 2)}") + "\n"
                             f"  msg rates: {rate_str} "
                             f"(want {stream_hz:.0f}; ~1 Hz position = stale-state limit cycle)\n"
                             f"  cur RPY(ENU)={np.round(cur_rpy, 1)} armed={state.armed} "

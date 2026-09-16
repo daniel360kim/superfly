@@ -37,3 +37,21 @@ velocity setpoints, `vel_planar_*` are velocity with vz fixed to 0.
 
 `→ name` is the method entry in `superfly.compare.registry` that flies the
 run. Runs without an arrow aren't wired into the comparison harness.
+
+## Student
+
+The `anyanything` end-to-end student (agile_autonomy `planner_learning` with
+the `ours:` block), exported to ONNX. I/O contract:
+`~/anyanything/agile_student/INPUTS.md` — `imu` (1,1,22), `depth`
+(1,1,224,224,3), output (1, M, 1+3N) = per mode `[alpha, x_1..N, y_1..N,
+z_1..N]` in **absolute body-frame metres** at t = 0.5 j s. M and N are read
+off the graph, so all three run here fly through the same code path.
+
+| run | what it is |
+|---|---|
+| `t5fix_s_r1` | 3 modes x 10 waypoints (5 s horizon). The deployed `agile_student`. → `agile_student` |
+| `t5_m2_r2` | Two-mode ablation, 10 waypoints. Reference only. |
+| `t5_h25_local` | 2.5 s horizon ablation (3 modes x 5 waypoints). Reference only. |
+
+Fly a non-default one with `--agile_student-checkpoint
+checkpoints/Student/<run>/student.onnx`.

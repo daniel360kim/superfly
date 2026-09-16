@@ -28,7 +28,10 @@ import numpy as np
 from scipy.ndimage import minimum_filter
 from scipy.spatial.transform import Rotation
 
-from superfly.policies.agile.model import LoquercioModelConfig, TensorFlowLoquercioBackend
+from superfly.policies.agile.model import (
+    LoquercioModelConfig, TensorFlowLoquercioBackend,
+    OnnxStudentBackend, is_onnx_checkpoint,
+)
 from superfly.policies.agile.mpc import (
     MPC, state_x0, clamp_attitude_tilt, flatness_attitude, G,
 )
@@ -50,6 +53,40 @@ WAYPOINT_DT = 0.1
 # max_vel is below this so the spatial horizon matches the commanded cruise speed.
 NATIVE_PLAN_SPEED = 7.0
 
+# ---------------------------------------------------------------------------
+# anyanything student (ONNX) constants
+# ---------------------------------------------------------------------------
+# The student's waypoints are ABSOLUTE body-frame metres at a 0.5 s spacing
+# (agile_student/INPUTS.md; waypoint j is at t_j = 0.5 j s, waypoint 0 is the
+# state itself and is NOT emitted). Two consequences, both handled explicitly:
+#   * no _scale_body_plan rescaling -- the metric plan already encodes the speed
+#     the labeller chose, and shrinking it would slow the student by max_vel/7.
+#   * the MPC's dt_wp is 0.5, not 0.1. build_reference() only ever uses dt_wp to
+#     build the time base `t = arange(nwp) * dt_wp` for its cubic fit, and then
+#     samples that cubic at the solver's own nodes (N=10 x DT=0.1 s = a 1.0 s
+#     horizon), so passing the true spacing is exact and NO resampling of the
+#     waypoints themselves is needed or wanted.
+STUDENT_WAYPOINT_DT = 0.5
+# ...but a cubic least-squares fitted over the student's whole 5 s plan is a bad
+# local fit for the MPC's first 1.0 s. Feed build_reference the current position
+# (t=0) plus the first three waypoints (t = 0.5, 1.0, 1.5 s): four points, one
+# exactly-determined cubic, covering the 1.0 s horizon with 0.5 s of margin --
+# the same window the test-5 evaluation harness fits
+# (sim_episode.fit_cubic: a cubic through the state and waypoints 1-3).
+STUDENT_MPC_WAYPOINTS = 4
+# Depth-veto defaults = sim_episode.DepthVetoPolicy's (the deployed rule).
+STUDENT_VETO_LOOK_M = 3.5
+STUDENT_VETO_STEP_M = 0.25
+STUDENT_VETO_MARGIN_M = 0.15
+STUDENT_VETO_RADIUS_M = 0.35
+# Upstream agile_autonomy accept_thresh, used by the veto's tie rule.
+STUDENT_ACCEPT = 0.9
+# The render pinhole the students were trained against (render_depth.Camera):
+# 640x480 at 91 deg hfov, principal point at the centre of the PIXEL GRID
+# ((w-1)/2, not w/2), bilinear-resized to 224x224. The resize is anisotropic --
+# 640 -> 224 horizontally, 480 -> 224 vertically -- so there are two scales.
+STUDENT_CAM_W, STUDENT_CAM_H, STUDENT_CAM_HFOV_DEG = 640, 480, 91.0
+
 # ENU inertial -> NED inertial and FLU body -> FRD body (Pegasus convention).
 _rot_ENU_to_NED = Rotation.from_quat([0.70711, 0.70711, 0.0, 0.0])
 _rot_FLU_to_FRD = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])
@@ -59,6 +96,69 @@ def quat_enu_flu_to_ned_frd_wxyz(R_enu_flu: np.ndarray) -> np.ndarray:
     rot = _rot_ENU_to_NED * Rotation.from_matrix(R_enu_flu) * _rot_FLU_to_FRD
     q = rot.as_quat()
     return np.array([q[3], q[0], q[1], q[2]])
+
+
+def depth_veto_blocked(depth: np.ndarray, modes_body: np.ndarray,
+                       look_m: float = STUDENT_VETO_LOOK_M,
+                       step_m: float = STUDENT_VETO_STEP_M,
+                       margin: float = STUDENT_VETO_MARGIN_M,
+                       radius_m: float = STUDENT_VETO_RADIUS_M):
+    """Port of sim_episode.DepthVetoPolicy.blocked -- the test-5 deployment's
+    mode gate, using nothing the vehicle does not already have.
+
+    `modes_body` is (M, N, 3) body-frame waypoints (FLU: x forward, y left,
+    z up), WITHOUT the implicit waypoint 0 at the origin. Each mode's path is
+    walked from the body out to `look_m` metres in `step_m` steps and every
+    sample is projected into the 224x224 depth frame with the render pinhole;
+    a mode whose sample sits behind the depth surface on its own ray by more
+    than `margin` metres (taking the nearest return in a `radius_m` window
+    around the pixel) is vetoed. Only the NEAR path is walked: a far point can
+    be occluded by an obstacle the path flies over or around, which is not a
+    collision. Samples outside the frame never veto.
+
+    Returns (blocked (M,) bool, scores (M,) float = worst signed clearance)."""
+    depth = np.asarray(depth, dtype=np.float64)
+    modes_body = np.asarray(modes_body, dtype=np.float64)
+    H, W = depth.shape
+    f = 0.5 * STUDENT_CAM_W / math.tan(math.radians(STUDENT_CAM_HFOV_DEG) / 2)
+    cx, cy = (STUDENT_CAM_W - 1) / 2.0, (STUDENT_CAM_H - 1) / 2.0
+    sx, sy = W / float(STUDENT_CAM_W), H / float(STUDENT_CAM_H)
+    out = np.zeros(modes_body.shape[0], bool)
+    scores = np.full(modes_body.shape[0], np.inf)
+    for k, wps in enumerate(modes_body):
+        pts = np.vstack([np.zeros((1, 3)), wps])
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        s = np.arange(step_m, min(look_m, cum[-1]) + 1e-9, step_m)
+        worst = np.inf
+        for si in s:
+            j = int(np.searchsorted(cum, si, side="right") - 1)
+            j = min(j, len(seg) - 1)
+            frac = (si - cum[j]) / seg[j] if seg[j] > 1e-9 else 0.0
+            pb = pts[j] + frac * (pts[j + 1] - pts[j])
+            zc = pb[0]                      # camera z = body x (forward)
+            if zc < 0.2:
+                continue
+            xc, yc = -pb[1], -pb[2]         # camera x = -body y, camera y = -body z
+            u = (f * xc / zc + cx) * sx
+            v = (f * yc / zc + cy) * sy
+            if not (0 <= u < W and 0 <= v < H):
+                continue
+            r = int(np.ceil(f * radius_m / zc * sx))
+            u0, u1 = max(0, int(u) - r), min(W, int(u) + r + 1)
+            v0, v1 = max(0, int(v) - r), min(H, int(v) + r + 1)
+            worst = min(worst, float(np.min(depth[v0:v1, u0:u1])) - zc)
+        scores[k] = worst
+        out[k] = worst < -margin
+    return out, scores
+
+
+def _pad3(a) -> np.ndarray:
+    """The debug transport carries exactly three alphas; students have 1-3."""
+    out = np.zeros(3, dtype=np.float64)
+    a = np.asarray(a, dtype=np.float64).ravel()[:3]
+    out[:a.size] = a
+    return out
 
 
 def _unit(v, fallback=(1.0, 0.0, 0.0)):
@@ -89,6 +189,8 @@ class AgileCmd:
     n_keepout: int = 0
     tilt_cmd_deg: float = 0.0
     alphas: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # depth-veto worst signed clearance per mode (None unless --mode-select veto)
+    veto_scores: np.ndarray | None = None
 
 
 class AgilePolicy:
@@ -118,12 +220,33 @@ class AgilePolicy:
                  att_lp: float = 1.0, ref_lookahead_s: float = REF_LOOKAHEAD_S,
                  use_keepout: bool = False, att_lookahead_s: float | None = None,
                  depth_inflate_px: int = 0, alt_follow: bool = False,
-                 net_thread: bool = False):
-        self.config = LoquercioModelConfig()
-        print(f"[agile] loading PlaNet checkpoint from {checkpoint_path} ...", flush=True)
-        self.net = TensorFlowLoquercioBackend(checkpoint_path, self.config)
-        print(f"[agile] {self.net.loaded_weight_count} weights loaded from "
-              f"{self.net.checkpoint_prefix}; building acados MPC ...", flush=True)
+                 net_thread: bool = False, goal_speed: float = 0.0,
+                 mode_select: str = "auto",
+                 veto_look_m: float = STUDENT_VETO_LOOK_M,
+                 veto_step_m: float = STUDENT_VETO_STEP_M,
+                 veto_margin_m: float = STUDENT_VETO_MARGIN_M,
+                 veto_radius_m: float = STUDENT_VETO_RADIUS_M):
+        # Which net: a .onnx artifact is an anyanything student (22-dim state,
+        # metric 0.5 s waypoints, any mode/waypoint count); anything else is
+        # the legacy TF2 PlaNet checkpoint prefix (21-dim state, 0.1 s plan).
+        self.is_student = is_onnx_checkpoint(checkpoint_path)
+        if self.is_student:
+            print(f"[agile] loading ONNX student from {checkpoint_path} ...", flush=True)
+            self.net = OnnxStudentBackend(checkpoint_path)
+            self.config = self.net.config
+            self.waypoint_dt = STUDENT_WAYPOINT_DT
+            print(f"[agile] student: {self.config.modes} modes x "
+                  f"{self.config.out_seq_len} waypoints @ {self.waypoint_dt:g} s "
+                  f"({self.config.out_seq_len * self.waypoint_dt:g} s horizon), "
+                  f"state dim {self.config.raw_state_dim}; building acados MPC ...",
+                  flush=True)
+        else:
+            self.config = LoquercioModelConfig()
+            self.waypoint_dt = WAYPOINT_DT
+            print(f"[agile] loading PlaNet checkpoint from {checkpoint_path} ...", flush=True)
+            self.net = TensorFlowLoquercioBackend(checkpoint_path, self.config)
+            print(f"[agile] {self.net.loaded_weight_count} weights loaded from "
+                  f"{self.net.checkpoint_prefix}; building acados MPC ...", flush=True)
         self.mpc = MPC()
         print("[agile] MPC ready.", flush=True)
 
@@ -135,6 +258,23 @@ class AgilePolicy:
         self.att_lp = float(att_lp)
         self.ref_lookahead_s = float(ref_lookahead_s)
         self.use_keepout = bool(use_keepout)
+        # Student knobs. goal_speed is the ARRIVAL speed v_goal the student was
+        # conditioned on (agile_student/INPUTS.md); mode_select "auto" means
+        # veto for the student, upstream cost-only for the TF checkpoint.
+        self.goal_speed = float(goal_speed)
+        if mode_select == "auto":
+            mode_select = "veto" if self.is_student else "cost"
+        if mode_select not in ("cost", "veto"):
+            raise ValueError(f"mode_select must be cost|veto|auto, got {mode_select!r}")
+        self.mode_select = mode_select
+        self.veto_look_m = float(veto_look_m)
+        self.veto_step_m = float(veto_step_m)
+        self.veto_margin_m = float(veto_margin_m)
+        self.veto_radius_m = float(veto_radius_m)
+        # How many plan points the MPC's reference cubic is fitted through.
+        # Legacy: all 10 of the net's 0.1 s waypoints (a 0.9 s span). Student:
+        # the current position plus the first three 0.5 s waypoints.
+        self.mpc_waypoints = STUDENT_MPC_WAYPOINTS if self.is_student else None
         # 2026-07-30 margin-tuning campaign knobs (see notes/robust_2026-07/
         # agile_diagnosis.md in gs_drone_sim):
         #  - depth_inflate_px: odd minimum-filter kernel on the 224x224 depth fed
@@ -168,7 +308,9 @@ class AgilePolicy:
         self.kp_alt, self.kd_alt, self.ki_alt = 4.0, 4.0, 0.4
         # PD fallback tracker gains (only used when an MPC solve fails)
         self.kp_pos, self.kd_vel = 6.0, 4.0
-        self.pd_lookahead = 5     # waypoint index for the PD fallback
+        # PD-fallback lookahead index: 0.5 s ahead in both plans (legacy index
+        # 5 x 0.1 s; student index 1 on the origin-prefixed 0.5 s plan).
+        self.pd_lookahead = 1 if self.is_student else 5
 
         # depth-camera geometry (square image, fx == fy)
         n = AGILE_IMG_SIZE
@@ -190,6 +332,8 @@ class AgilePolicy:
         self._world_points_per_mode = None   # all candidate trajectories (modes, T, 3)
         self._alphas = np.zeros(self.config.modes, dtype=np.float32)
         self._mode_idx = 0
+        self._veto_scores = None             # last depth-veto clearances (modes,)
+        self._prev_mode_world = None         # last tracked mode's world waypoints
         self._prev_q = None                  # low-pass state for the sent attitude
         self._ref_start = None               # mission reference line (set on first tick)
         self._ref_goal = None
@@ -231,6 +375,39 @@ class AgilePolicy:
         normalized = depth_mm / 80.0
         model_depth = np.repeat(normalized[..., None], 3, axis=-1)
         return model_depth.reshape((1, 1, size, size, 3)).astype(np.float32)
+
+    def _student_state_to_model_input(self, pos_enu, R_enu, vel_enu, angular_body,
+                                      goal_enu) -> np.ndarray:
+        """The 22-dim student state of agile_student/INPUTS.md:
+        [pos(3), R(9) row-major, v_body(3), omega_body(3), goal_body(3), v_goal].
+
+        Three deliberate differences from the legacy 21-dim encoding:
+          * R is the RAW body->world matrix, not de-yawed. The de-yaw is a
+            workaround for the ckpt-50 checkpoint, which was trained only on
+            near-zero-yaw flights; the students are trained on drawn states at
+            every yaw, and de-yawing here would rotate the goal out of the
+            frame the net learned.
+          * the goal is the METRIC body-frame vector to the real goal, clamped
+            to 10 m (Obs.goal_body), not a unit direction to a look-ahead point
+            on the mission line.
+          * a trailing v_goal = the arrival speed the student is conditioned on.
+        Byte-for-byte the same vector as
+        superfly_expert_sampler.sim_episode.OnnxPolicy.encode_state -- asserted
+        in tests/test_agile_student.py."""
+        R_enu = np.asarray(R_enu, np.float64)
+        g = R_enu.T @ (np.asarray(goal_enu, np.float64) - np.asarray(pos_enu, np.float64))
+        n = float(np.linalg.norm(g))
+        if n > 1e-9:
+            g = g * (min(n, 10.0) / n)
+        state = np.concatenate([
+            np.asarray(pos_enu, np.float64).reshape(3),
+            R_enu.reshape(-1),
+            R_enu.T @ np.asarray(vel_enu, np.float64).reshape(3),
+            np.asarray(angular_body, np.float64).reshape(3),
+            g,
+            [self.goal_speed],
+        ]).astype(np.float32)
+        return state.reshape((1, 1, self.config.raw_state_dim))
 
     def _state_to_model_input(self, pos_enu, R_enu, vel_enu, angular_body,
                               goal_dir_world) -> np.ndarray:
@@ -276,14 +453,60 @@ class AgilePolicy:
 
     def _scale_body_plan(self, local_xyz: np.ndarray) -> np.ndarray:
         """Shrink the net's body-frame plan when flying below training speed."""
+        # The student's waypoints are absolute metres at a known 0.5 s spacing:
+        # the geometry IS the schedule, so rescaling would both slow it down and
+        # move the waypoints off the times the MPC reference assumes. Identity.
+        if self.is_student:
+            return local_xyz
         if self.max_vel <= 0.0 or self.max_vel >= NATIVE_PLAN_SPEED:
             return local_xyz
         return local_xyz * (self.max_vel / NATIVE_PLAN_SPEED)
 
     # ------------------------------------------------------------------ #
-    def _select_mode(self, local_xyz_per_mode, depth_hw) -> int:
-        """Upstream agile_autonomy always tracks mode 0 (lowest alpha)."""
-        return 0
+    def _select_mode(self, local_xyz_per_mode, depth_hw, alphas=None,
+                     world_per_mode=None) -> int:
+        """`cost`: upstream agile_autonomy always tracks mode 0 (lowest alpha).
+
+        `veto`: the test-5 deployment rule (sim_episode.DepthVetoPolicy +
+        select_mode). The cost head is not reliably learnable from these labels,
+        so each mode's near path is projected into the depth frame the policy
+        was just given and any mode that goes behind the surface is given an
+        infinite cost; the choice is then argmin cost over the survivors, with
+        upstream's ACCEPT=0.9 "sent set" and the nearest-to-previously-tracked
+        tie break. A veto that would reject EVERY mode is ignored (there is no
+        better option to fall back to), exactly as the reference does."""
+        if self.mode_select == "cost" or alphas is None:
+            return 0
+        n_modes = len(local_xyz_per_mode)
+        if n_modes == 1:
+            return 0
+        costs = np.abs(np.asarray(alphas, np.float64)).reshape(n_modes).copy()
+        self._veto_scores = None
+        if depth_hw is not None:
+            # (3, N) per mode -> (M, N, 3) body-frame waypoints for the veto.
+            modes_body = np.stack([np.asarray(m, np.float64).T
+                                   for m in local_xyz_per_mode], axis=0)
+            bad, scores = depth_veto_blocked(
+                depth_hw, modes_body, self.veto_look_m, self.veto_step_m,
+                self.veto_margin_m, self.veto_radius_m)
+            self._veto_scores = scores
+            if bad.any() and not bad.all():
+                costs = np.where(bad, np.inf, costs)
+        order = np.argsort(costs, kind="stable")
+        best = int(order[0])
+        sent = [best]
+        for k in order[1:]:
+            if not np.isfinite(costs[k]):
+                continue
+            if (costs[best] + 1e-6) / (costs[k] + 1e-6) > STUDENT_ACCEPT:
+                sent.append(int(k))
+        if self._prev_mode_world is None or len(sent) == 1 or world_per_mode is None:
+            return best
+        prev = self._prev_mode_world
+        n = min(len(prev), world_per_mode.shape[1])
+        d = [float(np.sum(np.linalg.norm(world_per_mode[k][:n] - prev[:n], axis=1)))
+             for k in sent]
+        return int(sent[int(np.argmin(d))])
 
     # ------------------------------------------------------------------ #
     # Obstacle memory: depth -> world XY keep-out cells with a TTL
@@ -329,15 +552,25 @@ class AgilePolicy:
     def _adopt_plan(self, alphas, trajectories, pos, R_enu, depth_hw):
         """Turn a net output into the cached world-frame plan. pos/R_enu must be
         the SNAPSHOT the net input was built from (matters in threaded mode)."""
-        local_per_mode = [t.reshape(self.config.state_dim, self.config.out_seq_len)
-                          for t in trajectories]
-        self._mode_idx = self._select_mode(local_per_mode, depth_hw)
-        per_mode = []
-        for local_xyz in local_per_mode:
-            local_xyz = self._scale_body_plan(local_xyz)
-            per_mode.append(pos[None, :] + (R_enu @ local_xyz).T)
-        self._world_points_per_mode = np.stack(per_mode, axis=0)  # (modes, T, 3)
+        local_per_mode = [np.asarray(t, np.float64).reshape(
+            self.config.state_dim, self.config.out_seq_len) for t in trajectories]
+        # World-frame waypoints first: the veto's tie rule needs them, and the
+        # selection must not change the plans it is choosing between.
+        wp_per_mode = np.stack(
+            [pos[None, :] + (R_enu @ self._scale_body_plan(m)).T
+             for m in local_per_mode], axis=0)                     # (modes, N, 3)
+        self._mode_idx = self._select_mode(local_per_mode, depth_hw, alphas,
+                                           wp_per_mode)
+        if self.is_student:
+            # The student emits waypoints 1..N at t = 0.5 j s; waypoint 0 is the
+            # state itself, which it does not emit. Prepend it so the MPC's time
+            # base `t = arange(nwp) * dt_wp` lines up with the real schedule.
+            origin = np.repeat(pos[None, None, :], wp_per_mode.shape[0], axis=0)
+            self._world_points_per_mode = np.concatenate([origin, wp_per_mode], axis=1)
+        else:
+            self._world_points_per_mode = wp_per_mode             # (modes, T, 3)
         self._world_points = self._world_points_per_mode[self._mode_idx]
+        self._prev_mode_world = wp_per_mode[self._mode_idx].copy()
         self._alphas = alphas
 
     def _net_worker_loop(self):
@@ -361,7 +594,15 @@ class AgilePolicy:
             with self._net_lock:
                 self._net_res = (alphas, trajs, pos, R_enu, depth_hw)
 
-    def _net_tick_threaded(self, obs, pos, R_enu, vel, goal_dir):
+    def _encode_state(self, pos, R_enu, vel, angular_body, goal_enu, goal_dir):
+        """Student -> the 22-dim metric encoding; TF checkpoint -> the legacy
+        21-dim de-yawed/look-ahead-direction one."""
+        if self.is_student:
+            return self._student_state_to_model_input(
+                pos, R_enu, vel, angular_body, goal_enu)
+        return self._state_to_model_input(pos, R_enu, vel, angular_body, goal_dir)
+
+    def _net_tick_threaded(self, obs, pos, R_enu, vel, goal_enu, goal_dir):
         """Submit the freshest observation, adopt the latest finished plan.
         Blocks only on the very first call (no plan exists yet)."""
         if self._net_worker is None:
@@ -369,8 +610,8 @@ class AgilePolicy:
                                                 daemon=True)
             self._net_worker.start()
         depth_in = self._depth_to_model_input(obs.depth)
-        state_in = self._state_to_model_input(
-            pos, R_enu, vel, obs.angular_rate_body, goal_dir)
+        state_in = self._encode_state(pos, R_enu, vel, obs.angular_rate_body,
+                                      goal_enu, goal_dir)
         with self._net_lock:
             self._net_req = (depth_in, state_in, pos.copy(), R_enu.copy(), obs.depth)
             self._net_event.set()
@@ -411,15 +652,20 @@ class AgilePolicy:
 
         # --- net inference (decimated; optionally off-loop in a worker thread) ---
         if self.net_thread:
-            self._net_tick_threaded(obs, pos, R_enu, vel, goal_dir)
+            self._net_tick_threaded(obs, pos, R_enu, vel, goal, goal_dir)
         elif self._world_points is None or (self._tick % self.net_every) == 0:
             depth_in = self._depth_to_model_input(obs.depth)
-            state_in = self._state_to_model_input(
-                pos, R_enu, vel, obs.angular_rate_body, goal_dir)
+            state_in = self._encode_state(pos, R_enu, vel, obs.angular_rate_body,
+                                          goal, goal_dir)
             alphas, trajectories = self.net.infer(depth_in, state_in)
             self._adopt_plan(alphas, trajectories, pos, R_enu, obs.depth)
 
         world_points = self._world_points
+        # Points the MPC's reference cubic is fitted through (see
+        # STUDENT_MPC_WAYPOINTS): the whole plan for the legacy net, the first
+        # four (t = 0, 0.5, 1.0, 1.5 s) for the student.
+        mpc_points = (world_points if self.mpc_waypoints is None
+                      else world_points[:self.mpc_waypoints])
 
         # --- MPC tracking (every tick) ---
         attitude_q = None
@@ -429,8 +675,8 @@ class AgilePolicy:
         x0 = state_x0(pos, R_enu, vel)
         try:
             _u0, status, minfo = self.mpc.compute(
-                x0, world_points.astype(np.float64), self._cruise_alt, yaw_des,
-                dt_wp=WAYPOINT_DT, max_vel=self.max_vel,
+                x0, mpc_points.astype(np.float64), self._cruise_alt, yaw_des,
+                dt_wp=self.waypoint_dt, max_vel=self.max_vel,
                 obstacles_xy_r=keepout, alt_hold=not self.alt_follow,
                 att_lookahead_s=self.att_lookahead_s)
             if status in (0, 2):
@@ -457,7 +703,7 @@ class AgilePolicy:
             k = min(self.pd_lookahead, world_points.shape[0] - 1)
             p_ref = world_points[k]
             nxt, prv = min(k + 1, world_points.shape[0] - 1), max(k - 1, 0)
-            v_ref = (world_points[nxt] - world_points[prv]) / (max(nxt - prv, 1) * WAYPOINT_DT)
+            v_ref = (world_points[nxt] - world_points[prv]) / (max(nxt - prv, 1) * self.waypoint_dt)
             s = float(np.linalg.norm(v_ref))
             if s > self.max_vel > 0.0:
                 v_ref *= self.max_vel / s
@@ -501,6 +747,7 @@ class AgilePolicy:
             n_keepout=len(self._obs_cells),
             tilt_cmd_deg=tilt_cmd,
             alphas=self._alphas,
+            veto_scores=self._veto_scores,
         )
 
     def debug_frame(self, pos_enu, R_enu, tracker: str) -> dict | None:
@@ -511,7 +758,7 @@ class AgilePolicy:
         return dict(
             pos_local=np.asarray(pos_enu, dtype=np.float64).reshape(3),
             yaw=yaw,
-            alphas=np.asarray(self._alphas, dtype=np.float64).reshape(3),
+            alphas=_pad3(self._alphas),
             trajectories_local=np.asarray(self._world_points_per_mode, dtype=np.float64),
             mode_idx=int(self._mode_idx),
             tracker=tracker,

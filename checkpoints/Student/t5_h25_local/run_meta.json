@@ -1,0 +1,10 @@
+{
+  "schema": "superfly-run-meta-v1",
+  "method": "agile_student",
+  "artifact": "student.onnx",
+  "host": "gs2",
+  "date": "2026-09-16T00:00:00+00:00",
+  "produced_by": "anyanything TRAINING: 2.5 s horizon ablation, seed 2, 30 epochs on the airstation03 5090; launcher scratch_t5_prm/launch_horizon.sh",
+  "source_path": "/home/ubuntu/anyanything/scratch_t5_prm/models/t5_h25_local/student.onnx",
+  "config_notes": "3 modes x (1 alpha + 3x5 waypoints @ 0.5 s) = 2.5 s horizon; output (1,3,16)."
+}

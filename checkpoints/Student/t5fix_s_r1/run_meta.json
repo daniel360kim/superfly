@@ -1,0 +1,11 @@
+{
+  "schema": "superfly-run-meta-v1",
+  "method": "agile_student",
+  "artifact": "student.onnx",
+  "host": "gs2",
+  "date": "2026-09-16T00:00:00+00:00",
+  "produced_by": "anyanything TRAINING: agile_student fork (branch student-ours) planner_learning/train.py on the t5_0914_prm/merged recipe-v2 label set (masked/'fix' variant, seed r1), exported with scripts/export_onnx.py; staged+trained via scratch_t5_prm/launch_fixes_queue.sh",
+  "source_path": "/home/ubuntu/anyanything/scratch_t5_prm/models_mask/t5fix_s_r1/student.onnx",
+  "config_notes": "3 modes x (1 alpha + 3x10 waypoints @ 0.5 s) = 5 s horizon, ABSOLUTE body-frame metres; state (1,1,22) = [pos3, R9, v_body3, omega_body3, goal_body3 (clamped 10 m), v_goal]; depth (1,1,224,224,3) = mm/80 clipped at 20 m, tiled. Contract: ~/anyanything/agile_student/INPUTS.md.",
+  "default_for": "agile_student (registry.DEFAULT_STUDENT_RUN)"
+}
