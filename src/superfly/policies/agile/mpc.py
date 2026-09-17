@@ -213,6 +213,54 @@ def clamp_attitude_tilt(q_pred_wxyz, max_tilt_deg, yaw_des):
     return q_clamped
 
 
+def clamp_speed_command(q_cmd_wxyz, vel_enu, max_vel, yaw_des):
+    """sim_episode.clamp_command's V_CAP rule, applied to the ATTITUDE command
+    this port actually streams.
+
+    The evaluation harness commands an acceleration and, whenever the VEHICLE is
+    above V_CAP, deletes the positive along-track component of it: above the cap
+    the tracker may still turn and still brake, but it may not add any more
+    speed along its own direction of travel. That is what bounds the labelled
+    student's speed -- not its plan, not its reference.
+
+    This port commands an attitude (plus a thrust from the altitude loop), so
+    the same rule has to act there. The commanded body-z IS the direction of the
+    commanded specific force, so removing the along-track part of its HORIZONTAL
+    component removes exactly the along-track acceleration. The vertical share is
+    left to the altitude loop, which recomputes thrust from this attitude's own
+    cos(tilt) immediately afterwards -- hence horizontal-only, where upstream
+    uses the full 3-D velocity: a fast descent must not be allowed to freeze the
+    horizontal tracker.
+
+    Why the reference cap is not enough (measured, 2026-09-17 Isaac re-runs):
+    the MPC weights position 100 against velocity 10, and its position reference
+    runs a whole horizon (1.0 s, up to 3.5 m) ahead of the vehicle, so a lagging
+    vehicle is told to close that gap and overshoots the capped speed to do it.
+    On top of that the streamed thrust is the altitude PD's, not the MPC's: in a
+    climb it reached 0.748 against a 0.577 hover, so the horizontal acceleration
+    at a given tilt was 1.30x what the MPC solved for. Both are bounded by this
+    clamp regardless of their cause.
+
+    Returns a wxyz quaternion (unchanged below the cap)."""
+    v = np.asarray(vel_enu, dtype=np.float64).reshape(3)[:2]
+    sp = float(np.linalg.norm(v))
+    q = np.asarray(q_cmd_wxyz, dtype=np.float64)
+    if max_vel is None or max_vel <= 0.0 or sp <= max_vel or sp < 1e-9:
+        return q
+    R = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    z = R[:, 2].copy()
+    vh = v / sp
+    along = float(z[:2] @ vh)
+    if along <= 0.0:                     # already braking or purely turning
+        return q
+    z[0] -= along * vh[0]
+    z[1] -= along * vh[1]
+    z[2] = float(np.sqrt(max(1e-6, 1.0 - float(z[0] ** 2 + z[1] ** 2))))
+    z /= np.linalg.norm(z)
+    q_clamped, _ = flatness_attitude(z, yaw_des)
+    return q_clamped
+
+
 def fit_cubic_state(p_cur, v_cur, wps, dt_wp):
     """Port of superfly_expert_sampler.sim_episode.fit_cubic: the cubic
     p(t) = c0 + c1 t + c2 t^2 + c3 t^3 that is PINNED to the current state --

@@ -33,7 +33,8 @@ from superfly.policies.agile.model import (
     OnnxStudentBackend, is_onnx_checkpoint,
 )
 from superfly.policies.agile.mpc import (
-    MPC, state_x0, clamp_attitude_tilt, flatness_attitude, G, fit_cubic_state,
+    MPC, state_x0, clamp_attitude_tilt, clamp_speed_command, flatness_attitude,
+    G, fit_cubic_state,
     eval_cubic,
 )
 
@@ -937,6 +938,11 @@ class AgilePolicy:
                          " -- HANDOVER IS ABOVE THE TRAINING BAND, the ceiling "
                          "was raised to contain it; prefer a lower --climb-alt")
                       + ").", flush=True)
+                # Named at launch so a log says, without inference, that the cap
+                # reached the paths that matter (both were silently inert once).
+                print(f"[agile] student speed cap {self.max_vel:.2f} m/s: "
+                      f"MPC reference velocity + along-track command clamp "
+                      f"(sim_episode.V_CAP = 3.50).", flush=True)
 
         goal_dir = self._goal_dir(pos, goal)
         yaw_des = math.atan2(float(goal_dir[1]), float(goal_dir[0]))
@@ -1027,6 +1033,19 @@ class AgilePolicy:
                 attitude_q = np.asarray(
                     clamp_attitude_tilt(attitude_q, self.max_tilt_deg, yaw_des),
                     dtype=np.float64)
+
+        # sim_episode.clamp_command, at the only place this port has a command
+        # to clamp. Above V_CAP the tracker may turn and brake but may not add
+        # more speed along its own direction of travel -- the rule that bounds
+        # the labelled student's speed, and the one thing neither the capped
+        # reference (the MPC trades velocity error against a position reference
+        # a whole horizon ahead, 100 vs 10) nor the MPC's input bounds enforce.
+        # Student only: the legacy `agile` net is scored against upstream's own
+        # tracker, which has no such rule.
+        if self.is_student:
+            attitude_q = np.asarray(
+                clamp_speed_command(attitude_q, vel, self.max_vel, yaw_des),
+                dtype=np.float64)
 
         # Optional low-pass on the attitude sent to PX4 (disabled when att_lp>=1).
         if self.att_lp < 1.0 and self._prev_q is not None:
