@@ -14,7 +14,9 @@ faithful acados re-implementation of uzh-rpg/rpg_mpc:
 The reference is the SELECTED network trajectory through the differential-
 flatness map. When build_reference speed-caps the reference velocity to max_vel,
 only the velocity is scaled (upstream / rpg style); acceleration follows the
-cubic fit of the net waypoints.
+cubic fit of the net waypoints. build_reference_cubic (the student's reference)
+caps the same way and additionally drops the along-track reference acceleration
+while the cap binds, which is sim_episode.clamp_command's rule.
 
 Obstacle keep-outs: the K_OBS nearest (x, y, r) cylinders are soft (slacked)
 path constraints, set per solve via compute(obstacles_xy_r=...). agile_core
@@ -240,18 +242,37 @@ def eval_cubic(c, t):
 
 
 def build_reference_cubic(cubic, yaw_des, t_offset=0.0, prev_q0=None,
-                          min_alt=0.15, max_alt=None):
+                          min_alt=0.15, max_alt=None, max_vel=None):
     """The STUDENT's MPC reference: sample `cubic` (from fit_cubic_state) at the
     solver's own node times, exactly as sim_episode's tracker evaluates it at
     tau = t - t_decision.
 
-    Unlike build_reference this does NOT re-integrate position from a capped
-    velocity and does NOT speed-cap the reference velocity: the evaluation
-    harness tracks the raw cubic and limits the COMMAND instead
-    (sim_episode.clamp_command removes only the along-track acceleration above
-    V_CAP). Only the acceleration is clamped here, because it feeds the
-    differential-flatness attitude/thrust reference and a spiky cubic can
-    otherwise demand an infeasible tilt.
+    Unlike build_reference this does NOT re-integrate position from an
+    independently capped velocity: the position reference IS the cubic's, so
+    the manoeuvre is tracked as the evaluation harness tracks it.
+
+    `max_vel` (= sim_episode.V_CAP) is the ONE thing that must still be
+    enforced here, and the reason is a difference in WHERE the two trackers
+    read the cubic. sim_episode evaluates it only at tau <= one decision period
+    (1/15 s) and then limits the COMMAND -- clamp_command strips the positive
+    along-track acceleration whenever the VEHICLE is above V_CAP, so the
+    vehicle can never exceed it. This port has no command-level clamp (the MPC
+    thrust is discarded and only the attitude is streamed), and it samples the
+    SAME cubic over the solver's whole 1.0 s horizon, i.e. straight through the
+    mid-horizon velocity bulge that a cubic pinned to (p, v) and forced through
+    waypoints 1-3 always has. Measured on a plan whose waypoints are a uniform
+    3.0 m/s: |v_ref| peaks at 3.9 m/s (straight, from 1 m/s), 4.5 m/s (90 deg
+    turn) and 5.7 m/s (180 deg turn) around t = 0.75 s -- the plan's own speed
+    is nowhere near it, the cubic's shape is. Handing that to the MPC as a
+    velocity AND position reference is what flew the 2026-09-16 Isaac trials at
+    5.6-6.0 m/s on labels capped at 3.0.
+
+    So: cap the reference speed at max_vel, remove the along-track reference
+    acceleration while the cap binds (clamp_command's rule), and pull the
+    position reference back by the distance the cap removed, so the
+    position and velocity references keep agreeing -- the same consistency the
+    z clip below maintains. max_vel=None leaves the raw cubic (the legacy
+    behaviour, and what the reference-equivalence test asserts).
 
     `t_offset` is the plan's age [s]: between net updates the manoeuvre is
     consumed rather than dragged along with the vehicle.
@@ -261,16 +282,40 @@ def build_reference_cubic(cubic, yaw_des, t_offset=0.0, prev_q0=None,
     yref_term = np.zeros(NY_E)
     prev_q = prev_q0
     q0 = None
+    c = np.asarray(cubic, dtype=np.float64)
+    nodes = [eval_cubic(c, float(t_offset) + i * DT) for i in range(N + 1)]
+    pos = [np.asarray(n[0], np.float64).copy() for n in nodes]
+    vel = [np.asarray(n[1], np.float64).copy() for n in nodes]
+    acc = [np.asarray(n[2], np.float64).copy() for n in nodes]
+    if max_vel is not None and max_vel > 0.0:
+        # Cap the speed, drop the along-track acceleration while the cap binds
+        # (sim_episode.clamp_command), and pull every later node's position back
+        # by the distance the cap removed -- trapezoidal, so the position and
+        # velocity references keep agreeing to the integration error of the
+        # cubic itself (< 1 cm per node).
+        rate = []
+        for i in range(N + 1):
+            sp = float(np.linalg.norm(vel[i]))
+            if sp > max_vel:
+                vh = vel[i] / sp
+                along = float(acc[i] @ vh)
+                if along > 0.0:
+                    acc[i] = acc[i] - along * vh
+                v_cap = vel[i] * (max_vel / sp)
+                rate.append(vel[i] - v_cap)
+                vel[i] = v_cap
+            else:
+                rate.append(np.zeros(3))
+        excess = np.zeros(3)
+        for i in range(1, N + 1):
+            excess = excess + 0.5 * (rate[i - 1] + rate[i]) * DT
+            pos[i] = pos[i] - excess
     for i in range(N + 1):
-        ti = float(t_offset) + i * DT
-        p, v, a = eval_cubic(np.asarray(cubic, dtype=np.float64), ti)
-        a = np.asarray(a, dtype=np.float64).copy()
+        p, v, a = pos[i], vel[i], acc[i]
         a_xy = float(np.hypot(a[0], a[1]))
         if a_xy > MAX_REF_ACCEL_XY:
             a[:2] *= MAX_REF_ACCEL_XY / a_xy
         a[2] = float(np.clip(a[2], -MAX_REF_ACCEL_XY, MAX_REF_ACCEL_XY))
-        p = np.asarray(p, dtype=np.float64).copy()
-        v = np.asarray(v, dtype=np.float64).copy()
         # Clip z, and zero vz at the boundary: leaving vz unclipped makes the
         # position and velocity references disagree exactly where the clip
         # bites, and the MPC then chases a climb/descent the position reference
@@ -443,7 +488,7 @@ class MPC:
             # build_reference_cubic); world_pts is then only a diagnostic.
             yref_stages, yref_term, q0 = build_reference_cubic(
                 cubic, yaw_des, t_offset=t_offset, prev_q0=q_anchor,
-                min_alt=min_alt, max_alt=max_alt)
+                min_alt=min_alt, max_alt=max_alt, max_vel=max_vel)
         else:
             yref_stages, yref_term, q0 = build_reference(
                 world_pts, x0[:3], cruise_alt, yaw_des, dt_wp, max_vel,

@@ -14,6 +14,7 @@ and the reference module on the path):
         -m pytest tests/test_agile_student.py -q
 """
 from pathlib import Path
+import math
 import sys
 
 import numpy as np
@@ -375,6 +376,76 @@ def test_mpc_reference_equals_reference_cubic(from_rest):
     # the property that motivated the fix: from rest the reference commands zero
     if from_rest:
         np.testing.assert_allclose(yref[0][7:10], 0.0, atol=1e-12)
+
+
+def _turn_cubic(turn_deg, v0=3.0, cruise=3.0, dt_wp=0.5):
+    """A plan whose waypoints are a uniform `cruise` m/s straight line at
+    `turn_deg` off the vehicle's heading, pinned to a vehicle doing v0 m/s
+    along +x -- the geometry of every mid-flight avoidance decision."""
+    from superfly.policies.agile.mpc import fit_cubic_state
+    th = math.radians(turn_deg)
+    d = np.array([math.cos(th), math.sin(th), 0.0])
+    p = np.array([0.0, 0.0, 2.0])
+    wps = np.array([p + cruise * dt_wp * (j + 1) * d for j in range(3)])
+    return p, fit_cubic_state(p, np.array([v0, 0.0, 0.0]), wps, dt_wp)
+
+
+@pytest.mark.parametrize("turn_deg", [0, 45, 90, 135, 180])
+def test_reference_speed_is_capped_at_v_cap(turn_deg):
+    """The 2026-09-16 overspeed: a cubic pinned to (p, v) and forced through
+    waypoints 1-3 bulges in the MIDDLE of the MPC's 1.0 s horizon, well above
+    the 3.0 m/s its own waypoints are spaced at. sim_episode never sees that
+    (it reads the cubic only within one 1/15 s decision) and clamps the command
+    at V_CAP anyway; this port reads it across the whole horizon, so the cap
+    has to be on the reference."""
+    from superfly.policies.agile.mpc import build_reference_cubic, N, DT
+
+    _, c = _turn_cubic(turn_deg)
+    raw, raw_t, _ = build_reference_cubic(c, 0.0)
+    cap, cap_t, _ = build_reference_cubic(c, 0.0, max_vel=3.5)
+    raw_sp = [float(np.linalg.norm((raw[i] if i < N else raw_t)[7:10]))
+              for i in range(N + 1)]
+    cap_sp = [float(np.linalg.norm((cap[i] if i < N else cap_t)[7:10]))
+              for i in range(N + 1)]
+    assert max(cap_sp) <= 3.5 + 1e-9, f"capped reference still at {max(cap_sp):.2f} m/s"
+    if turn_deg >= 90:
+        # the regression itself: uncapped, this reference demands >= 4.5 m/s
+        assert max(raw_sp) > 4.4, max(raw_sp)
+    # a straight plan the vehicle is already flying is left alone
+    if turn_deg == 0:
+        np.testing.assert_allclose(cap_sp, raw_sp, atol=1e-9)
+    # position and velocity references still agree: no node advances further
+    # than the capped speed allows (the slack is the trapezoidal integration
+    # error of the cubic's own velocity over one 0.1 s node, < 1 cm)
+    for i in range(N):
+        step = np.linalg.norm((cap[i + 1] if i + 1 < N else cap_t)[:3] - cap[i][:3])
+        assert step <= 3.5 * DT + 0.01, f"node {i} advances {step / DT:.2f} m/s"
+
+
+def test_reference_cap_drops_along_track_acceleration():
+    """clamp_command's rule: while the cap binds the reference must not ask for
+    any more speed along its own direction of travel. The reference
+    acceleration is recovered from the flatness pair it is encoded as,
+    a = T * z_body - g."""
+    from scipy.spatial.transform import Rotation
+    from superfly.policies.agile.mpc import (build_reference_cubic, eval_cubic,
+                                             G, N, DT)
+
+    _, c = _turn_cubic(180)
+    cap, _, _ = build_reference_cubic(c, 0.0, max_vel=3.5)
+    capped_any = False
+    for i in range(N):
+        _, v_raw, _ = eval_cubic(c, i * DT)
+        sp = float(np.linalg.norm(v_raw))
+        if sp <= 3.5:
+            continue
+        capped_any = True
+        q = cap[i][3:7]
+        z_b = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()[:, 2]
+        a = float(cap[i][10]) * z_b - np.array([0.0, 0.0, G])
+        assert float(a @ (v_raw / sp)) <= 1e-6, \
+            f"node {i}: reference still accelerates along track at {sp:.2f} m/s"
+    assert capped_any, "this fixture must actually exercise the cap"
 
 
 def test_plan_age_offsets_the_reference():
