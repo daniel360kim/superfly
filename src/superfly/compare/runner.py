@@ -660,10 +660,28 @@ def run_trial(method, cfg, args, scenario):
     Path(POLICY_PHASE_FILE).unlink(missing_ok=True)
     sim = subprocess.Popen(sim_cmd, cwd=str(_SCRIPTS))
     off = None
+    off_log = None
     try:
         print(f"  [warmup] giving Isaac {args.warmup:.0f}s to boot before offboard ...")
         _sleep_or_die(sim, args.warmup, "sim exited during warmup")
-        off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS))
+        # The offboard's per-tick POLICY lines (tilt cmd/meas, thrust, alt sp,
+        # net Hz, depth probe) are the only record of what the policy actually
+        # commanded -- they are what a speed/altitude post-mortem needs, and
+        # inheriting this process's stdout scatters them through the campaign
+        # console. Give each trial its own offboard.log next to its traj.npz,
+        # the way PX4 already gets px4_sitl.log. SUPERFLY_OFFBOARD_CONSOLE=1
+        # restores the inherited-stdout behaviour (live watching).
+        if os.environ.get("SUPERFLY_OFFBOARD_CONSOLE", "0") == "1":
+            off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS))
+        else:
+            off_log = open(trial_dir / "offboard.log", "w")
+            print(f"  offboard log: {trial_dir / 'offboard.log'}")
+            # PYTHONUNBUFFERED: a redirected stdout is block-buffered, and the
+            # phase timeouts kill the offboard -- the last (most interesting)
+            # 8 KB would die in the buffer. Not every offboard print flushes.
+            off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS), stdout=off_log,
+                                   stderr=subprocess.STDOUT,
+                                   env=dict(os.environ, PYTHONUNBUFFERED="1"))
         wait_offboard_phased(off, args, scenario)
         # Ensure the sim's --auto-stop trips even if offboard was killed (its
         # own on-exit sentinel write only runs on a clean/Ctrl-C exit).
@@ -679,6 +697,8 @@ def run_trial(method, cfg, args, scenario):
         for p in (sim, off):
             if p is not None and p.poll() is None:
                 p.kill()
+        if off_log is not None:
+            off_log.close()
 
     if not npz_path.exists():
         print(f"  [warn] no trajectory logged at {npz_path}; trial failed to run.")
