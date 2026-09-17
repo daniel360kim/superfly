@@ -33,8 +33,8 @@ from superfly.policies.agile.model import (
     OnnxStudentBackend, is_onnx_checkpoint,
 )
 from superfly.policies.agile.mpc import (
-    MPC, state_x0, clamp_attitude_tilt, clamp_speed_command, flatness_attitude,
-    G, fit_cubic_state,
+    MPC, state_x0, clamp_attitude_tilt, clamp_speed_command, scale_tilt_to_thrust,
+    flatness_attitude, G, fit_cubic_state,
     eval_cubic,
 )
 
@@ -98,6 +98,20 @@ STUDENT_ACCEPT = 0.9
 # see AGILE_STUDENT_CLIMB_ALT in compare/registry.py, which defaults the method
 # to a 2.0 m handover.
 STUDENT_Z_REF = (0.5, 4.0)
+#: How far the altitude setpoint may lead the vehicle [m]. The student's
+#: vertical plan is RELATIVE (body-frame z), so integrating its slope into an
+#: absolute setpoint ratchets for as long as the vehicle has not caught up
+#: (measured 2026-09-17: 1.6 -> 4.0 m in 3 s, integrator at its limit, the
+#: vehicle then climbing at 2.30 m/s against a setpoint moving 0.60 m/s).
+#: Larger than the 0.43 m/s sink 16d6251 cured, so that fix is untouched.
+STUDENT_ALT_LEAD = 0.75
+#: Attitude-loop response time used by the command speed clamp to decide how
+#: much along-track acceleration can still be stopped before V_CAP. Measured
+#: only indirectly (commanded vs measured tilt in the offboard logs track
+#: within a few degrees at 1 Hz sampling); the bound degrades gracefully --
+#: too small and the clamp reverts to a plain delete, too large and the
+#: approach to the cap is gentler than it needs to be.
+STUDENT_CMD_LAG_S = 0.15
 #: Headroom kept above the handover altitude when it is outside STUDENT_Z_REF.
 STUDENT_Z_HEADROOM = 2.0
 
@@ -396,6 +410,7 @@ class AgilePolicy:
         # clamp saturates at r = 1.20, and the trial's own airframe is already
         # at 1.18. +-4 covers r = 1.41.
         self.alt_i_limit = 4.0 if self.is_student else 2.0
+        self.alt_lead = STUDENT_ALT_LEAD if self.is_student else 0.0
         # PD fallback tracker gains (only used when an MPC solve fails)
         self.kp_pos, self.kd_vel = 6.0, 4.0
         # PD-fallback lookahead index: 0.5 s ahead in both plans (legacy index
@@ -802,13 +817,28 @@ class AgilePolicy:
             return (float(minfo["p_ref1"][2]) - self._alt_sp) / max(self.control_dt, 1e-6)
         return 0.0
 
-    def _advance_alt_setpoint(self, minfo, lo: float, hi: float) -> float:
+    def _advance_alt_setpoint(self, minfo, lo: float, hi: float,
+                              z_now: float | None = None) -> float:
         if self._alt_sp is None:
             # Start where the policy took over, not at the plan's first node:
             # the handover altitude is the only absolute the vehicle agrees on.
             self._alt_sp = float(np.clip(self._cruise_alt, lo, hi))
         vz_ref = self._reference_vz(minfo)
-        self._alt_sp = float(np.clip(self._alt_sp + vz_ref * self.control_dt, lo, hi))
+        sp = self._alt_sp + vz_ref * self.control_dt
+        if z_now is not None and self.alt_lead > 0.0:
+            # The plan's vertical intent is RELATIVE ("be 0.6 m higher in 0.5
+            # s"), and the net keeps asking for it as long as the vehicle has
+            # not got there -- so integrating its slope into an absolute
+            # setpoint is a ratchet: measured 1.6 -> 4.0 m in three seconds,
+            # against a vehicle that had not moved anything like that far. Cap
+            # how far the setpoint may run ahead of the vehicle. This does NOT
+            # reintroduce 16d6251's disease (a target pinned to the vehicle, so
+            # alt_err == 0 by construction and a throttle-model error can only
+            # appear as a permanent sink): every error smaller than the lead is
+            # untouched, and the sink it cured was 0.43 m/s against a lead of
+            # 0.75 m.
+            sp = float(np.clip(sp, z_now - self.alt_lead, z_now + self.alt_lead))
+        self._alt_sp = float(np.clip(sp, lo, hi))
         return self._alt_sp
 
     def _update_hover_estimate(self, thrust: float, cos_tilt: float,
@@ -942,6 +972,9 @@ class AgilePolicy:
                 # reached the paths that matter (both were silently inert once).
                 print(f"[agile] student speed cap {self.max_vel:.2f} m/s: "
                       f"MPC reference velocity + along-track command clamp "
+                      f"(3-D, lag {STUDENT_CMD_LAG_S:.2f} s); tilt rescaled to "
+                      f"the MPC's own thrust; altitude setpoint leads by at "
+                      f"most {self.alt_lead:.2f} m "
                       f"(sim_episode.V_CAP = 3.50).", flush=True)
 
         goal_dir = self._goal_dir(pos, goal)
@@ -972,6 +1005,7 @@ class AgilePolicy:
         # --- MPC tracking (every tick) ---
         attitude_q = None
         tracker = "pd"
+        t_mpc = None            # the MPC's own collective thrust [m/s^2]
         alt_target = self._cruise_alt
         keepout = self._keepout_list() if self.use_keepout else None
         x0 = state_x0(pos, R_enu, vel)
@@ -997,6 +1031,10 @@ class AgilePolicy:
                         clamp_attitude_tilt(attitude_q, self.max_tilt_deg, yaw_des),
                         dtype=np.float64)
                 tracker = "mpc"
+                # .get: a stub/older MPC may not report it; the rescale is
+                # then simply not applied, never an exception on the hot path.
+                u0 = minfo.get("u0") if isinstance(minfo, dict) else None
+                t_mpc = None if u0 is None else float(np.asarray(u0, np.float64)[0])
                 if self.alt_follow:
                     # Follow the plan's vertical profile WITHOUT losing the
                     # absolute reference. p_ref1[2] is node 1 of a cubic pinned
@@ -1009,7 +1047,8 @@ class AgilePolicy:
                     # still tracked; a sag is now a real error kp/ki can remove.
                     lo, hi = (self.z_band() if self.is_student
                               else (1.0, self._cruise_alt + 3.0))
-                    alt_target = self._advance_alt_setpoint(minfo, lo, hi)
+                    alt_target = self._advance_alt_setpoint(minfo, lo, hi,
+                                                            z_now=float(pos[2]))
         except Exception as exc:
             if self._tick < 3 or self._tick % 300 == 0:
                 print(f"[agile] MPC solve raised ({exc}); PD fallback this tick.",
@@ -1034,41 +1073,75 @@ class AgilePolicy:
                     clamp_attitude_tilt(attitude_q, self.max_tilt_deg, yaw_des),
                     dtype=np.float64)
 
-        # sim_episode.clamp_command, at the only place this port has a command
-        # to clamp. Above V_CAP the tracker may turn and brake but may not add
-        # more speed along its own direction of travel -- the rule that bounds
-        # the labelled student's speed, and the one thing neither the capped
-        # reference (the MPC trades velocity error against a position reference
-        # a whole horizon ahead, 100 vs 10) nor the MPC's input bounds enforce.
-        # Student only: the legacy `agile` net is scored against upstream's own
-        # tracker, which has no such rule.
-        if self.is_student:
-            attitude_q = np.asarray(
-                clamp_speed_command(attitude_q, vel, self.max_vel, yaw_des),
-                dtype=np.float64)
-
         # Optional low-pass on the attitude sent to PX4 (disabled when att_lp>=1).
         if self.att_lp < 1.0 and self._prev_q is not None:
             if float(np.dot(attitude_q, self._prev_q)) < 0.0:
                 attitude_q = -attitude_q
             attitude_q = (1.0 - self.att_lp) * self._prev_q + self.att_lp * attitude_q
             attitude_q /= np.linalg.norm(attitude_q) + 1e-12
-        self._prev_q = attitude_q.copy()
 
-        # Thrust: altitude PD+I on alt_target, tilt-compensated, normalized by
-        # the hover throttle. alt_target is the cruise altitude without
-        # --alt-follow, and the absolute _alt_sp (advanced by the plan's own vz)
-        # with it -- never a target re-pinned to the vehicle, which would make
-        # the error identically zero and leave a throttle-model error to be
-        # balanced by a permanent sink.
-        R_cmd = Rotation.from_quat(
-            [attitude_q[1], attitude_q[2], attitude_q[3], attitude_q[0]]).as_matrix()
+        # --- altitude loop. Computed BEFORE the horizontal corrections below,
+        # because az does not depend on the attitude and they need the specific
+        # force it implies. alt_target is the cruise altitude without
+        # --alt-follow, and the absolute _alt_sp (advanced by the plan's own vz,
+        # and kept within STUDENT_ALT_LEAD of the vehicle) with it -- never a
+        # target re-pinned to the vehicle, which would make the error
+        # identically zero and leave a throttle-model error to be balanced by a
+        # permanent sink.
         alt_err = alt_target - float(pos[2])
-        self._alt_i = float(np.clip(self._alt_i + self.ki_alt * alt_err * self.control_dt,
-                                    -self.alt_i_limit, self.alt_i_limit))
+        # Conditional integration: the integrator exists to remove a STEADY
+        # error at equilibrium (the hover-throttle mismatch of 16d6251). While
+        # the setpoint is ramping away faster than the vehicle can follow, the
+        # error is not an equilibrium error, and integrating it is how a 2026-
+        # 09-17 climb reached the +4 m/s^2 integrator limit and then overshot
+        # its own setpoint 4x (setpoint +0.60 m/s, vehicle +2.30 m/s). Inside
+        # the lead band nothing changes.
+        if (not self.is_student) or abs(alt_err) < self.alt_lead:
+            self._alt_i = float(np.clip(
+                self._alt_i + self.ki_alt * alt_err * self.control_dt,
+                -self.alt_i_limit, self.alt_i_limit))
         az = float(np.clip(
             self.kp_alt * alt_err - self.kd_alt * float(vel[2]) + self._alt_i,
             -4.0, 8.0))
+
+        if self.is_student:
+            # The specific force the vehicle is about to be given [m/s^2], from
+            # the attitude as it stands. One pass: both corrections below only
+            # ever REDUCE tilt, so the final cos(tilt) is larger and the real
+            # force slightly smaller -- this estimate is conservative in the
+            # direction that matters.
+            R0 = Rotation.from_quat([attitude_q[1], attitude_q[2], attitude_q[3],
+                                     attitude_q[0]]).as_matrix()
+            f_cmd = (az + G) / max(0.5, float(R0[2, 2]))
+            # (1) the MPC solved its tilt against its OWN collective thrust; we
+            # stream the altitude loop's. Rescale so the horizontal
+            # acceleration is the one it planned.
+            if t_mpc is not None:
+                attitude_q = np.asarray(
+                    scale_tilt_to_thrust(attitude_q, t_mpc, f_cmd, yaw_des),
+                    dtype=np.float64)
+            # (2) sim_episode.clamp_command, lag-compensated: above V_CAP the
+            # tracker may turn and brake but may not add speed along its own
+            # direction of travel. Neither the capped reference (the MPC trades
+            # velocity error against a position reference a whole horizon
+            # ahead, 100 vs 10) nor the MPC's input bounds enforce this.
+            attitude_q = np.asarray(
+                clamp_speed_command(attitude_q, vel, self.max_vel, yaw_des,
+                                    thrust_cmd=f_cmd, lag_s=STUDENT_CMD_LAG_S),
+                dtype=np.float64)
+            # The clamp BRAKES above the cap, and a large excess asks for a
+            # large deceleration -- which is still an attitude PX4 has to fly.
+            # Re-apply the same tilt limit the tracker's own command got.
+            if self.max_tilt_deg < 89.0:
+                attitude_q = np.asarray(
+                    clamp_attitude_tilt(attitude_q, self.max_tilt_deg, yaw_des),
+                    dtype=np.float64)
+        self._prev_q = attitude_q.copy()
+
+        # Thrust: the altitude loop's az, tilt-compensated through the FINAL
+        # attitude and normalized by the hover throttle.
+        R_cmd = Rotation.from_quat(
+            [attitude_q[1], attitude_q[2], attitude_q[3], attitude_q[0]]).as_matrix()
         cos_tilt = max(0.5, float(R_cmd[2, 2]))
         thrust = float(np.clip((az + G) / cos_tilt / G * self.hover_thrust, 0.05, 0.9))
         self._update_hover_estimate(thrust, cos_tilt, float(vel[2]), alt_err)

@@ -467,62 +467,144 @@ def _tilt_dir(q):
     return math.degrees(math.atan2(h, z[2])), d
 
 
-def test_command_clamp_is_inert_below_the_cap():
-    from superfly.policies.agile.mpc import clamp_speed_command
+def test_command_clamp_is_inert_at_cruise():
+    """It must not touch a student flying its labelled 3 m/s cruise: at 3.0 m/s
+    against a 3.5 cap it still allows (3.5-3.0)/0.15 = 3.3 m/s^2 along track,
+    more than these plans ask for."""
+    from superfly.policies.agile.mpc import clamp_speed_command, G
+    q = _q_from_tilt(15.0, 0.0)                  # ~2.6 m/s^2 of forward push
+    for v in ([0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 2.0, 0.0],
+              [0.0, 0.0, -5.0], [2.0, 0.0, -1.0]):
+        out = clamp_speed_command(q, np.array(v), 3.5, 0.0, thrust_cmd=G)
+        np.testing.assert_allclose(out, q, atol=1e-12), v
+
+
+def test_command_clamp_counts_vertical_speed_too():
+    """V_CAP is a 3-D cap upstream, and these runs climb at up to 2.3 m/s: a
+    horizontal-only trigger would let that ride for free."""
+    from superfly.policies.agile.mpc import clamp_speed_command, G
     q = _q_from_tilt(25.0, 0.0)
-    for v in ([0.0, 0.0, 0.0], [3.4, 0.0, 0.0], [2.0, 2.0, 0.0], [0.0, 0.0, -5.0]):
-        # the last one: a fast DESCENT must not freeze the horizontal tracker
-        out = clamp_speed_command(q, np.array(v), 3.5, 0.0)
-        np.testing.assert_allclose(out, q, atol=1e-12)
+    flat = clamp_speed_command(q, np.array([3.2, 0.0, 0.0]), 3.5, 0.0, thrust_cmd=G)
+    climb = clamp_speed_command(q, np.array([3.2, 0.0, 2.0]), 3.5, 0.0, thrust_cmd=G)
+    t_flat, _ = _tilt_dir(flat)
+    t_climb, _ = _tilt_dir(climb)
+    assert t_climb < t_flat, "the climb must eat into the same budget"
 
 
 def test_command_clamp_removes_only_the_along_track_push():
-    """Above the cap: no forward acceleration, but turning and braking survive."""
-    from superfly.policies.agile.mpc import clamp_speed_command
-    v = np.array([5.0, 0.0, 0.0])                       # flying +x, over the cap
-
-    # a forward tilt is flattened along track
-    tilt, d = _tilt_dir(clamp_speed_command(_q_from_tilt(25.0, 0.0), v, 3.5, 0.0))
-    assert tilt < 1e-6, f"forward push survived at {tilt:.2f} deg"
-
-    # a pure left turn is untouched
-    q = _q_from_tilt(25.0, 90.0)
-    out = clamp_speed_command(q, v, 3.5, math.pi / 2)
-    t_in, _ = _tilt_dir(q)
-    t_out, d_out = _tilt_dir(out)
-    assert t_out == pytest.approx(t_in, abs=1e-6)
-    assert abs(float(d_out @ np.array([1.0, 0.0]))) < 1e-6
-
-    # braking is untouched
-    q = _q_from_tilt(25.0, 180.0)
-    out = clamp_speed_command(q, v, 3.5, math.pi)
-    np.testing.assert_allclose(out, q, atol=1e-12)
-
-    # a 45 deg push keeps its cross-track half, loses its along-track half
-    t_out, d_out = _tilt_dir(clamp_speed_command(_q_from_tilt(30.0, 45.0), v, 3.5,
-                                                 math.pi / 4))
-    assert float(d_out @ np.array([1.0, 0.0])) < 1e-6
-    assert t_out > 5.0, "the cross-track (turning) component must survive"
-
-
-def test_command_clamp_bounds_the_vehicle_on_the_worst_case_plant():
-    """The whole point: a tracker that tilts to its 30 deg limit for ever, with
-    the altitude loop's thrust 1.30x hover (the measured 2026-09-17 climb), must
-    still not exceed V_CAP. Point-mass plant, a = (T/T_hover)*G*z_b - g."""
+    """Above the cap: no forward acceleration (it brakes), but turning and
+    braking commands survive untouched."""
     from superfly.policies.agile.mpc import clamp_speed_command, G
+    v = np.array([5.0, 0.0, 0.0])                       # over the cap
+
+    # a forward tilt is turned into a braking tilt, never left pushing
+    t, d = _tilt_dir(clamp_speed_command(_q_from_tilt(25.0, 0.0), v, 3.5, 0.0,
+                                         thrust_cmd=G))
+    assert float(d @ np.array([1.0, 0.0])) < 0.0, "must brake above the cap"
+
+    # a pure left turn keeps its cross-track component (and gains a brake)
+    q = _q_from_tilt(25.0, 90.0)
+    t_out, d_out = _tilt_dir(clamp_speed_command(q, v, 3.5, math.pi / 2,
+                                                 thrust_cmd=G))
+    assert float(d_out @ np.array([0.0, 1.0])) > 0.2, "the turn must survive"
+    assert float(d_out @ np.array([1.0, 0.0])) < 0.0, "and it brakes too"
+
+    # a braking command is never weakened
+    q = _q_from_tilt(25.0, 180.0)
+    t_in, _ = _tilt_dir(q)
+    t_out, d_out = _tilt_dir(clamp_speed_command(q, v, 3.5, math.pi, thrust_cmd=G))
+    assert t_out >= t_in - 1e-9
+    assert float(d_out @ np.array([1.0, 0.0])) < 0.0
+
+
+def test_command_clamp_brake_is_still_tilt_limited():
+    """The brake is an attitude PX4 has to fly: a big excess must not command a
+    90 deg flip. agile_core re-applies the tracker's own tilt limit after it."""
+    from superfly.policies.agile.mpc import clamp_speed_command, clamp_attitude_tilt, G
+    q = clamp_speed_command(_q_from_tilt(25.0, 0.0), np.array([9.0, 0.0, 0.0]),
+                            3.5, 0.0, thrust_cmd=G)
+    assert _tilt_dir(q)[0] > 30.0, "this fixture must exercise the limiter"
+    q = clamp_attitude_tilt(q, 30.0, 0.0)
+    assert _tilt_dir(q)[0] == pytest.approx(30.0, abs=1e-6)
+    assert float(_tilt_dir(q)[1] @ np.array([1.0, 0.0])) < 0.0, "still braking"
+
+
+def test_tilt_is_rescaled_to_the_mpc_thrust():
+    """The measured climb: thrust 0.748 against a 0.577 hover is 1.30x, so the
+    same tilt buys 1.30x the horizontal acceleration the MPC solved for."""
+    from superfly.policies.agile.mpc import scale_tilt_to_thrust, G
+    from scipy.spatial.transform import Rotation
+    q = _q_from_tilt(30.0, 0.0)
+    f_cmd = 1.30 * G
+    out = scale_tilt_to_thrust(q, G, f_cmd, 0.0)
+    z_in = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()[:, 2]
+    z_out = Rotation.from_quat([out[1], out[2], out[3], out[0]]).as_matrix()[:, 2]
+    # the PRODUCT thrust * sin(tilt) is what the MPC planned, to 1 %
+    assert f_cmd * float(np.hypot(z_out[0], z_out[1])) == pytest.approx(
+        G * float(np.hypot(z_in[0], z_in[1])), rel=0.01)
+    # never amplifies: an UNDER-thrusting loop is left alone
+    np.testing.assert_allclose(scale_tilt_to_thrust(q, G, 0.8 * G, 0.0), q,
+                               atol=1e-12)
+
+
+@pytest.mark.parametrize("lag_s,thrust_ratio", [(0.05, 1.0), (0.15, 1.0),
+                                               (0.30, 1.0), (0.30, 1.30)])
+def test_command_clamp_bounds_the_vehicle_through_the_attitude_lag(lag_s, thrust_ratio):
+    """The 2026-09-17 failure mode, reproduced and fixed. A tracker that always
+    wants full 30 deg of forward tilt, a plant that follows the attitude
+    setpoint with a first-order lag, and (in the last case) the measured 1.30x
+    climb thrust. A clamp that merely DELETES the along-track push at the cap
+    settles above it -- 3.78 / 4.46 / 5.34 m/s at these lags -- because the
+    attitude the vehicle holds still carries the push it was given a moment
+    ago. Limiting the along-track acceleration to (cap - |v|)/lag brakes
+    instead, and bounds it."""
+    from scipy.spatial.transform import Rotation
+    from superfly.policies.agile.mpc import (clamp_speed_command,
+                                             scale_tilt_to_thrust, G)
     dt, v = 0.01, np.zeros(3)
-    speeds = []
-    for _ in range(1500):                                # 15 s
-        q = _q_from_tilt(30.0, 0.0)                      # full forward tilt, always
-        q = clamp_speed_command(q, v, 3.5, 0.0)
-        from scipy.spatial.transform import Rotation
-        z_b = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()[:, 2]
-        a = 1.30 * G * z_b - np.array([0.0, 0.0, G])
-        a[2] = 0.0                                       # altitude loop's job
+    z_act = np.array([0.0, 0.0, 1.0])
+    peak = 0.0
+    for _ in range(2500):                                    # 25 s
+        f = thrust_ratio * G
+        q = scale_tilt_to_thrust(_q_from_tilt(30.0, 0.0), G, f, 0.0)
+        q = clamp_speed_command(q, v, 3.5, 0.0, thrust_cmd=f, lag_s=0.15)
+        z_cmd = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()[:, 2]
+        z_act = z_act + (z_cmd - z_act) * (dt / lag_s)       # PX4 tracking lag
+        z_act = z_act / np.linalg.norm(z_act)
+        a = f * z_act - np.array([0.0, 0.0, G])
+        a[2] = 0.0                                           # altitude loop's job
         v = v + a * dt
-        speeds.append(float(np.linalg.norm(v)))
-    assert max(speeds) <= 3.5 + 0.05, f"peaked at {max(speeds):.2f} m/s"
-    assert speeds[-1] == pytest.approx(3.5, abs=0.05), "and it should reach the cap"
+        peak = max(peak, float(np.linalg.norm(v)))
+    assert peak <= 4.0, f"peaked at {peak:.2f} m/s"
+    assert float(np.linalg.norm(v)) == pytest.approx(3.5, abs=0.05)
+
+
+def test_alt_setpoint_cannot_ratchet_away_from_the_vehicle(monkeypatch):
+    """(b) The measured ratchet: the plan's vertical intent is RELATIVE, so a
+    net that keeps asking to be 0.6 m higher raises an integrated setpoint for
+    ever. Setpoint 1.6 -> 4.0 m in three seconds against a vehicle that had not
+    moved. The lead cap bounds it; the integrator no longer winds up on it."""
+    pytest.importorskip("onnxruntime")
+    import superfly.policies.agile.core as core
+    from superfly.policies.agile.core import STUDENT_ALT_LEAD
+    monkeypatch.setattr(core, "MPC", _RefMPC)
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=100.0, net_every=1,
+                         alt_follow=True, mode_select="cost",
+                         hover_thrust=HOVER_ASSUMED)
+    policy.net = _LevelNet(2, 10, sink=+0.6)     # "be 0.6 m higher every plan"
+    policy.config = policy.net.config
+    depth = np.full((224, 224), 20.0, np.float32)
+    p = np.array([0.0, 0.0, 1.70])               # a vehicle that never climbs
+    v = np.array([3.0, 0.0, 0.0])
+    for _ in range(300):                         # 3 s, the measured window
+        cmd = policy.compute(core.AgileObs(p, v, np.eye(3), np.zeros(3),
+                                           np.array([0.0, 60.0, 1.96]), depth))
+    assert policy._alt_sp <= 1.70 + STUDENT_ALT_LEAD + 1e-6, (
+        f"setpoint ratcheted to {policy._alt_sp:.2f} m above a vehicle at 1.70")
+    assert policy._alt_sp > 1.70, "but it must still ask for the climb"
+    assert abs(policy._alt_i) < policy.alt_i_limit - 1e-6, \
+        "the integrator must not wind up on a ramp the vehicle cannot follow"
 
 
 def test_plan_age_offsets_the_reference():

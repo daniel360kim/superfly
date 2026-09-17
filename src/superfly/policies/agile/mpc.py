@@ -213,49 +213,101 @@ def clamp_attitude_tilt(q_pred_wxyz, max_tilt_deg, yaw_des):
     return q_clamped
 
 
-def clamp_speed_command(q_cmd_wxyz, vel_enu, max_vel, yaw_des):
-    """sim_episode.clamp_command's V_CAP rule, applied to the ATTITUDE command
-    this port actually streams.
+def scale_tilt_to_thrust(q_cmd_wxyz, thrust_mpc, thrust_cmd, yaw_des):
+    """Make the HORIZONTAL acceleration the one the MPC actually solved for.
 
-    The evaluation harness commands an acceleration and, whenever the VEHICLE is
-    above V_CAP, deletes the positive along-track component of it: above the cap
-    the tracker may still turn and still brake, but it may not add any more
-    speed along its own direction of travel. That is what bounds the labelled
-    student's speed -- not its plan, not its reference.
+    The MPC solves a (tilt, collective thrust) pair; this port streams the tilt
+    but replaces the thrust with the altitude loop's, so the horizontal
+    acceleration the vehicle gets is thrust_cmd * sin(tilt) where the MPC
+    planned thrust_mpc * sin(tilt). In the 2026-09-17 climbs thrust_cmd reached
+    0.748 against a 0.577 hover -- 1.30x -- and every speed excursion in those
+    runs is inside a climb. Scale the horizontal part of the commanded body-z by
+    thrust_mpc / thrust_cmd and the product is exact again.
 
-    This port commands an attitude (plus a thrust from the altitude loop), so
-    the same rule has to act there. The commanded body-z IS the direction of the
-    commanded specific force, so removing the along-track part of its HORIZONTAL
-    component removes exactly the along-track acceleration. The vertical share is
-    left to the altitude loop, which recomputes thrust from this attitude's own
-    cos(tilt) immediately afterwards -- hence horizontal-only, where upstream
-    uses the full 3-D velocity: a fast descent must not be allowed to freeze the
-    horizontal tracker.
+    Reduce only (k clamped to <= 1). The symmetric case -- the altitude loop
+    UNDER-thrusting in a descent, where the MPC's horizontal intent would need
+    MORE tilt -- is deliberately not applied: adding tilt in a descent is the
+    one direction that can make an overspeed worse, and the descents in these
+    runs are exactly where the vehicle is already fast. Both thrusts are
+    mass-normalised specific forces [m/s^2].
 
-    Why the reference cap is not enough (measured, 2026-09-17 Isaac re-runs):
-    the MPC weights position 100 against velocity 10, and its position reference
-    runs a whole horizon (1.0 s, up to 3.5 m) ahead of the vehicle, so a lagging
-    vehicle is told to close that gap and overshoots the capped speed to do it.
-    On top of that the streamed thrust is the altitude PD's, not the MPC's: in a
-    climb it reached 0.748 against a 0.577 hover, so the horizontal acceleration
-    at a given tilt was 1.30x what the MPC solved for. Both are bounded by this
-    clamp regardless of their cause.
-
-    Returns a wxyz quaternion (unchanged below the cap)."""
-    v = np.asarray(vel_enu, dtype=np.float64).reshape(3)[:2]
-    sp = float(np.linalg.norm(v))
+    Returns a wxyz quaternion (unchanged when the loop is not over-thrusting)."""
     q = np.asarray(q_cmd_wxyz, dtype=np.float64)
-    if max_vel is None or max_vel <= 0.0 or sp <= max_vel or sp < 1e-9:
+    if thrust_mpc is None or thrust_cmd is None or thrust_cmd <= 1e-6:
         return q
+    k = float(thrust_mpc) / float(thrust_cmd)
+    if not np.isfinite(k) or k >= 1.0 - 1e-9:
+        return q
+    k = max(k, 0.0)
     R = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
     z = R[:, 2].copy()
-    vh = v / sp
-    along = float(z[:2] @ vh)
-    if along <= 0.0:                     # already braking or purely turning
-        return q
-    z[0] -= along * vh[0]
-    z[1] -= along * vh[1]
+    z[0] *= k
+    z[1] *= k
     z[2] = float(np.sqrt(max(1e-6, 1.0 - float(z[0] ** 2 + z[1] ** 2))))
+    z /= np.linalg.norm(z)
+    q_scaled, _ = flatness_attitude(z, yaw_des)
+    return q_scaled
+
+
+def clamp_speed_command(q_cmd_wxyz, vel_enu, max_vel, yaw_des, thrust_cmd=G,
+                        lag_s=0.15):
+    """sim_episode.clamp_command's V_CAP rule, applied to the ATTITUDE command
+    this port actually streams, with the plant's attitude lag compensated.
+
+    The evaluation harness commands an acceleration and, whenever the vehicle is
+    above V_CAP, deletes the positive along-track part of it. Its plant applies
+    that command through a 0.1 s lag, so "delete" is enough there. Here the
+    command is an attitude that PX4 tracks with its own dynamics, and deleting
+    the along-track push only at the cap is NOT enough: the attitude the vehicle
+    is actually holding still carries the push it was given a moment ago, so the
+    loop chatters around an equilibrium ABOVE the cap. Simulated on a point mass
+    with a first-order attitude lag and a tracker that always wants full tilt,
+    a pure delete settles at 3.78 / 4.46 / 5.34 m/s for a 0.05 / 0.15 / 0.30 s
+    lag -- which is the shape of the 2026-09-17 re-runs (median 3.1, excursions
+    to 4.1-6.2, all in climbs, where the thrust excess raises the equilibrium
+    further).
+
+    So limit the along-track acceleration to what can still be stopped:
+
+        a_along <= (max_vel - |v|) / lag_s
+
+    One constant with a physical meaning (the attitude loop's response time).
+    Far below the cap it is inert -- at 3.0 m/s against a 3.5 cap it still
+    allows 3.3 m/s^2, more than these plans ever ask for. At the cap it is
+    zero. Above it, it is negative: the clamp brakes, rather than merely
+    declining to push, which is what recovers from the overshoot the lag
+    creates. Same simulation, lag 0.30 s and a 1.30x thrust excess: 5.34 ->
+    4.10 m/s peak and an exact 3.50 m/s settle.
+
+    |v| is the FULL 3-D speed (sim_episode.V_CAP caps the 3-D speed, and these
+    runs climb at up to 2.3 m/s -- a horizontal-only trigger lets that ride for
+    free), but only the HORIZONTAL command is touched: the vertical axis belongs
+    to the altitude loop, which recomputes thrust from this attitude's own
+    cos(tilt) immediately afterwards.
+
+    `thrust_cmd` is the specific force the vehicle will be given [m/s^2], i.e.
+    what converts body-z tilt into acceleration. Returns a wxyz quaternion."""
+    v = np.asarray(vel_enu, dtype=np.float64).reshape(3)
+    q = np.asarray(q_cmd_wxyz, dtype=np.float64)
+    if max_vel is None or max_vel <= 0.0 or lag_s <= 0.0:
+        return q
+    n_xy = float(np.hypot(v[0], v[1]))
+    if n_xy < 1e-9:
+        return q
+    f = float(thrust_cmd)
+    if not np.isfinite(f) or f <= 1e-6:
+        return q
+    vh = np.array([v[0], v[1]]) / n_xy
+    R = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    z = R[:, 2].copy()
+    along = float(z[0] * vh[0] + z[1] * vh[1]) * f          # m/s^2 along track
+    a_max = (float(max_vel) - float(np.linalg.norm(v))) / float(lag_s)
+    if along <= a_max:
+        return q
+    z[0] += (a_max - along) / f * vh[0]
+    z[1] += (a_max - along) / f * vh[1]
+    h2 = float(z[0] ** 2 + z[1] ** 2)
+    z[2] = float(np.sqrt(max(1e-6, 1.0 - h2))) if h2 < 1.0 else 0.0
     z /= np.linalg.norm(z)
     q_clamped, _ = flatness_attitude(z, yaw_des)
     return q_clamped
