@@ -14,6 +14,7 @@ that was literally identical across offboards lives here.
 """
 
 import math
+import os
 import threading
 import time
 
@@ -22,6 +23,7 @@ from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
 
 from superfly.common.frames import ROT_ENU_TO_NED, ROT_FLU_TO_FRD
+from superfly.common.state_log import StateLog  # noqa: F401  (re-export)
 
 # --- vehicle constants shared by every offboard (PX4 sees the same drone) ---
 MASS_KG = 1.5

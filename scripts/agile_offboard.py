@@ -54,6 +54,7 @@ from superfly.common.px4_offboard import (
     send_land_command, send_heartbeat, set_param_float, receive_loop,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
+from superfly.common.state_log import StateLog
 from superfly.policies.agile.core import AgilePolicy, AgileObs
 from superfly.common.agile_debug_transport import AgileDebugPublisher
 
@@ -342,6 +343,13 @@ def main():
 
     phase = "CLIMB"
     landing_sent = False
+    # Per-tick control-state CSV next to this trial's traj.npz (runner sets the
+    # env var). Absolute timestamps, so it aligns with the ground-truth
+    # trajectory exactly.
+    state_log = StateLog.from_env()
+    if state_log is not None:
+        print(f"State log -> {os.environ['SUPERFLY_STATE_LOG']} "
+              f"({len(StateLog.COLUMNS)} columns @ {control_hz:.0f} Hz)")
     print(f"CLIMB: position-holding to {args.climb_alt:.1f} m ...")
 
     try:
@@ -402,6 +410,12 @@ def main():
                     )
                     cmd = policy.compute(obs)
                     send_attitude_target(mav, cmd.attitude_ned_frd_wxyz, cmd.thrust_norm)
+                    if state_log is not None:
+                        state_log.write(
+                            now, elapsed, phase, cmd.tracker, pos, vel,
+                            cmd.tilt_cmd_deg,
+                            math.degrees(math.acos(float(np.clip(R_enu[2, 2], -1, 1)))),
+                            cmd.thrust_norm, cmd.alt_sp, cmd.net_hz, cmd.mode_idx)
                     if debug_pub is not None:
                         dbg = policy.debug_frame(pos, R_enu, cmd.tracker)
                         if dbg is not None:
@@ -450,6 +464,9 @@ def main():
                             f"offboard={state.offboard}\n---"
                         )
                 elif phase == "LANDING":
+                    if state_log is not None:
+                        state_log.close()
+                        state_log = None
                     if not landing_sent:
                         send_land_command(mav)
                         landing_sent = True
@@ -469,6 +486,8 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        if state_log is not None:   # a killed trial keeps the rows it wrote
+            state_log.close()
         policy.shutdown()      # join the inference worker before the interpreter
         stop_event.set()
         mav.mav.command_long_send(

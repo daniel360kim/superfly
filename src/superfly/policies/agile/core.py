@@ -112,6 +112,21 @@ STUDENT_ALT_LEAD = 0.75
 #: too small and the clamp reverts to a plain delete, too large and the
 #: approach to the cap is gentler than it needs to be.
 STUDENT_CMD_LAG_S = 0.15
+#: Headroom [m/s] the COMMAND clamp keeps below V_CAP, because it can only
+#: bound the speed it is shown. Measured 2026-09-18 on the diffaero field: the
+#: offboard's own speed (PX4 LOCAL_POSITION_NED) agrees with the ground-truth
+#: trajectory at the median (within 0.25 m/s) and under-reads the EXCURSIONS --
+#: p90 3.45 vs 3.95, 3.38 vs 3.70, 3.40 vs 3.86 across three students, and the
+#: instantaneous samples inside an excursion differ by 0.7-0.9 m/s. On the
+#: diffphys field the same comparison agrees at every quantile (p90 3.22 vs
+#: 3.17), which is why that field has always passed. Clamping the reported
+#: speed at exactly V_CAP therefore lands the true speed at ~3.9-4.4, which is
+#: the 2026-09-18 result. The margin is inert at the labelled 3.0 m/s cruise
+#: (at 2.8 m/s reported it still allows (3.3-2.8)/0.15 = 3.3 m/s^2 along
+#: track). It bounds only what we can see: it is not a substitute for
+#: understanding the state signal -- see the state.csv instrumentation.
+#: AGILE_STUDENT_CAP_MARGIN overrides; 0 restores the old behaviour.
+STUDENT_CMD_CAP_MARGIN = 0.2
 #: Headroom kept above the handover altitude when it is outside STUDENT_Z_REF.
 STUDENT_Z_HEADROOM = 2.0
 
@@ -411,6 +426,13 @@ class AgilePolicy:
         # at 1.18. +-4 covers r = 1.41.
         self.alt_i_limit = 4.0 if self.is_student else 2.0
         self.alt_lead = STUDENT_ALT_LEAD if self.is_student else 0.0
+        #: What the COMMAND clamp aims at. The REFERENCE is still capped at the
+        #: full max_vel: the margin must not shrink the plan the student flies,
+        #: only the speed the tracker is allowed to reach on a signal that
+        #: under-reads its own excursions.
+        self.cmd_cap = max(0.0, self.max_vel - float(os.environ.get(
+            "AGILE_STUDENT_CAP_MARGIN", STUDENT_CMD_CAP_MARGIN))) \
+            if self.is_student else self.max_vel
         # PD fallback tracker gains (only used when an MPC solve fails)
         self.kp_pos, self.kd_vel = 6.0, 4.0
         # PD-fallback lookahead index: 0.5 s ahead in both plans (legacy index
@@ -971,7 +993,8 @@ class AgilePolicy:
                 # Named at launch so a log says, without inference, that the cap
                 # reached the paths that matter (both were silently inert once).
                 print(f"[agile] student speed cap {self.max_vel:.2f} m/s: "
-                      f"MPC reference velocity + along-track command clamp "
+                      f"MPC reference velocity + along-track command clamp at "
+                      f"{self.cmd_cap:.2f} m/s "
                       f"(3-D, lag {STUDENT_CMD_LAG_S:.2f} s); tilt rescaled to "
                       f"the MPC's own thrust; altitude setpoint leads by at "
                       f"most {self.alt_lead:.2f} m "
@@ -1126,7 +1149,7 @@ class AgilePolicy:
             # velocity error against a position reference a whole horizon
             # ahead, 100 vs 10) nor the MPC's input bounds enforce this.
             attitude_q = np.asarray(
-                clamp_speed_command(attitude_q, vel, self.max_vel, yaw_des,
+                clamp_speed_command(attitude_q, vel, self.cmd_cap, yaw_des,
                                     thrust_cmd=f_cmd, lag_s=STUDENT_CMD_LAG_S),
                 dtype=np.float64)
             # The clamp BRAKES above the cap, and a large excess asks for a

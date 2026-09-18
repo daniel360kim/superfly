@@ -671,8 +671,13 @@ def run_trial(method, cfg, args, scenario):
         # console. Give each trial its own offboard.log next to its traj.npz,
         # the way PX4 already gets px4_sitl.log. SUPERFLY_OFFBOARD_CONSOLE=1
         # restores the inherited-stdout behaviour (live watching).
+        # Per-tick control-state CSV next to this trial's traj.npz. Honoured by
+        # the offboards that support it (superfly.common.px4_offboard.StateLog);
+        # harmless to the ones that do not. It is what lets a post-mortem put
+        # what the controller SAW against the ground truth it was flying in.
+        off_env = dict(os.environ, SUPERFLY_STATE_LOG=str(trial_dir / "state.csv"))
         if os.environ.get("SUPERFLY_OFFBOARD_CONSOLE", "0") == "1":
-            off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS))
+            off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS), env=off_env)
         else:
             off_log = open(trial_dir / "offboard.log", "w")
             print(f"  offboard log: {trial_dir / 'offboard.log'}")
@@ -681,7 +686,7 @@ def run_trial(method, cfg, args, scenario):
             # 8 KB would die in the buffer. Not every offboard print flushes.
             off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS), stdout=off_log,
                                    stderr=subprocess.STDOUT,
-                                   env=dict(os.environ, PYTHONUNBUFFERED="1"))
+                                   env=dict(off_env, PYTHONUNBUFFERED="1"))
         wait_offboard_phased(off, args, scenario)
         # Ensure the sim's --auto-stop trips even if offboard was killed (its
         # own on-exit sentinel write only runs on a clean/Ctrl-C exit).

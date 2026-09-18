@@ -607,6 +607,75 @@ def test_alt_setpoint_cannot_ratchet_away_from_the_vehicle(monkeypatch):
         "the integrator must not wind up on a ramp the vehicle cannot follow"
 
 
+def test_command_clamp_keeps_headroom_for_the_state_signal(stub_mpc):
+    """The clamp can only bound the speed it is shown, and the offboard's own
+    speed under-reads its excursions on the diffaero field. The COMMAND cap
+    therefore sits below V_CAP -- while the REFERENCE cap does not, so the plan
+    the student flies is unchanged."""
+    pytest.importorskip("onnxruntime")
+    from superfly.policies.agile.core import STUDENT_CMD_CAP_MARGIN
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=100.0, net_every=1,
+                         mode_select="cost")
+    assert policy.max_vel == 3.5, "the reference cap is V_CAP"
+    assert policy.cmd_cap == pytest.approx(3.5 - STUDENT_CMD_CAP_MARGIN)
+    assert 0.0 < STUDENT_CMD_CAP_MARGIN <= 0.5, "headroom, not a speed limit"
+
+
+def test_cap_margin_is_overridable(monkeypatch, stub_mpc):
+    pytest.importorskip("onnxruntime")
+    monkeypatch.setenv("AGILE_STUDENT_CAP_MARGIN", "0")
+    policy = AgilePolicy(str(CHECKPOINTS / "t5fix_s_r1" / "student.onnx"),
+                         max_vel=3.5, control_hz=100.0, net_every=1,
+                         mode_select="cost")
+    assert policy.cmd_cap == pytest.approx(3.5)
+
+
+def test_state_log_row_is_parseable_and_aligned(tmp_path):
+    """The instrumentation that this audit needed and did not have: a per-tick
+    row with an ABSOLUTE timestamp, so the control state lines up with
+    traj.npz's t_unix0 without guessing an anchor from 1 Hz stdout."""
+    from superfly.common.state_log import StateLog
+    path = tmp_path / "state.csv"
+    log = StateLog(path)
+    log.write(1789674458.69, 10.07, "POLICY", "mpc", [1.0, 2.0, 3.0],
+              [3.0, 0.0, 0.5], 12.3, 11.0, 0.577, 1.8, 14.2, 0)
+    log.write(1789674458.70, 10.08, "POLICY", "pd", [1.0, 2.0, 3.0],
+              [0.0, 0.0, 0.0], None, 1.0, 0.5, None, 0.0, None)
+    log.close()
+    lines = path.read_text().strip().split("\n")
+    assert lines[0].split(",") == list(StateLog.COLUMNS)
+    assert all(len(r.split(",")) == len(StateLog.COLUMNS) for r in lines[1:])
+    cols = {k: i for i, k in enumerate(StateLog.COLUMNS)}
+    first = lines[1].split(",")
+    assert float(first[cols["t_unix"]]) == pytest.approx(1789674458.69, abs=1e-3)
+    assert float(first[cols["speed"]]) == pytest.approx(np.hypot(3.0, 0.5), abs=1e-3)
+    # missing values stay empty rather than becoming a lying 0.0
+    assert lines[2].split(",")[cols["tilt_cmd_deg"]] == ""
+    assert lines[2].split(",")[cols["alt_sp"]] == ""
+
+
+def test_state_log_is_off_without_the_env_var(monkeypatch, tmp_path):
+    from superfly.common.state_log import StateLog
+    monkeypatch.delenv("SUPERFLY_STATE_LOG", raising=False)
+    assert StateLog.from_env() is None
+    monkeypatch.setenv("SUPERFLY_STATE_LOG", str(tmp_path / "s.csv"))
+    log = StateLog.from_env()
+    assert log is not None
+    log.close()
+    # an unwritable path must not kill the flight
+    monkeypatch.setenv("SUPERFLY_STATE_LOG", str(tmp_path / "nope" / "s.csv"))
+    assert StateLog.from_env() is None
+
+
+def test_runner_points_the_state_log_at_the_trial_dir():
+    import inspect
+    from superfly.compare import runner
+    src = inspect.getsource(runner.run_trial)
+    assert 'SUPERFLY_STATE_LOG=str(trial_dir / "state.csv")' in src
+    assert "env=off_env" in src and "env=dict(off_env" in src
+
+
 def test_plan_age_offsets_the_reference():
     from superfly.policies.agile.mpc import build_reference_cubic, DT
     c = np.array([[0.0, 0.0, 2.0], [3.0, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.0]])
