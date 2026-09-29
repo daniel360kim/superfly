@@ -209,7 +209,7 @@ what makes `checkpoint_ready` gate it. Three things differ from `agile`:
 |---|---|---|
 | state | 21-dim, **de-yawed** R, goal as a **unit direction** to a point `future_time * max_vel` ahead on the mission line | 22-dim, **raw** R, goal as the **metric** body-frame vector clamped to 10 m, plus `v_goal` (arrival speed, `--goal-speed`) |
 | plan | 10 waypoints at 0.1 s, rescaled by `max_vel / 7` | M x N waypoints (both read off the graph) in **absolute metres** at 0.5 s — **never** rescaled |
-| mode | always the lowest `\|alpha\|` | depth veto + argmin cost (`--mode-select`) |
+| mode | always the lowest `\|alpha\|` | depth veto + argmin cost (`--mode-select`); what "cost" means comes from the ONNX sidecar (`selection`) |
 | altitude | PD hold on the climb altitude | **follows the plan's z** (`--alt-follow`, forced), clipped to the reference's `Z_REF` = 0.5-4.0 m |
 | omega | body rate | `R^T` x body rate — what test-5 fed (see below) |
 | reference | unconstrained cubic, position integrated from it | `sim_episode.fit_cubic`: pinned to `p(0)=p`, `p'(0)=v`, evaluated at `tau = t - t_decision` |
@@ -359,6 +359,63 @@ python scripts/run_comparison.py configs/scenarios/probes/diffaero_field.json \
 # a non-zero arrival speed:  AGILE_STUDENT_GOAL_SPEED=2.0
 # upstream mode rule:        AGILE_STUDENT_MODE_SELECT=cost
 ```
+
+**Head selection.** The ONNX sidecar's `selection` decides what alpha means:
+`cost` = |alpha| (lower better, upstream); `selector` = a logit (higher better,
+the t6 selection arms), ranked by 1/softmax; `clearance` = 1/alpha. Before
+2026-09-29 every head was ranked as a cost, which flies a selector head's
+WORST mode. `AGILE_STUDENT_MODE_SELECT=cost` = "plain selection" (the head's
+own ranking, no depth veto).
+
+## Starling 2 Max, the sim clock, and the other student methods (2026-09-29)
+
+**`--vehicle starling2max`** (the harness default is still `iris`). Without
+`SUPERFLY_VEHICLE_USD` it is the sys-ID body built on the local Pegasus Iris
+frame (`sim.vehicles.apply_vehicle_overrides`: mass 0.557 kg, inertia/CoM
+from `configs/vehicles/starling2max.yaml`, rotors at +-0.085/+-0.0625 m, prop
+colliders off), the measured rotor constants with the 55/85 ms motor lag, and
+a Pegasus motor map `omega = 730 u + 100` so PX4's u = 1 is the rotor's 830
+rad/s saturation. The lab USD is on Nucleus, whose login has expired on
+airstation03 -- headless, the vehicle then never spawns. PX4 stays on
+`none_iris` (Iris gains): the hover probe shows them stable on this body.
+For `agile_student` the registry takes the hover throttle from the spec
+(`isaac_px4.hover_throttle` 0.666, measured; the Iris's is 0.577-0.581),
+`--t-max 19.62` (T/W 2.0 x g) and `--thrust-max 1.0`. Iris argv unchanged.
+
+**`--clock px4`** (offboards). PX4 SITL is lockstepped to Isaac, but the
+offboards paced everything on the wall clock; at a realtime factor of 1 these
+agree. On a busy airstation03 Isaac runs at 0.13-0.16 x real time (vs 0.65-0.75
+normally), and a wall-clocked student's reference then runs ~7x ahead of the
+vehicle. `--clock px4` puts the offboard on PX4's `time_boot_ms` (= sim time):
+control ticks, plan ages, the 15 Hz rate gate and the integrators all live in
+sim time, so the flight no longer depends on how busy the box is.
+`--policy-timeout S` is the matching SIM-time policy budget (the harness's own
+`--timeout` is wall time). Every trial's `metrics.json` records
+`realtime_factor`. Pass both to the student via
+`AGILE_STUDENT_EXTRA_ARGS="--clock px4 --policy-timeout 120"`.
+
+**One campaign at a time.** Each trial kills every `run_px4_sim.py` /
+`*_offboard.py` of the user first, so `run_comparison.py` holds
+`/tmp/superfly_isaac_campaign_<uid>.lock` for its whole run.
+
+**`agile_student_chunk`** -- a velocity-chunk student (sidecar
+`arch: chunk_v1`): same inputs and camera as `agile_student`; the executor is
+a byte-parity port of `sim_episode.OnnxChunkPolicy` (`superfly.policies.chunk`:
+gate argmax with 0.15 hysteresis, same-head temporal ensemble of 4 chunks,
+0.5^age, a lead into each chunk, `AGILE_CHUNK_LEAD`, default 0.5 s), deciding
+at 15 Hz of sim time and streaming PX4 velocity + yaw-rate setpoints at 60 Hz
+(`scripts/chunk_offboard.py`; `MPC_XY/Z_VEL_P_ACC` = 3 = the python sim's
+velocity gain, setpoints capped at 3.5 m/s, the z band as
+`sim_episode.velocity_setpoint`). Its per-decision log is
+`chunk_decisions.csv` in the trial dir.
+
+**`hover_probe`** -- not a policy: position-held hover (reads PX4's own
+collective thrust back from ATTITUDE_TARGET) + a 2 m/s velocity step, result
+in `hover_probe.json`. Run once per airframe change.
+
+The overnight student evaluation that uses all of this (both
+`*_student_v1` suites, seeds 0-4, Starling, one trial at a time, a queue) is
+`anyanything/scratch_t6/isaac_eval/` (`isaac_eval.sh`, `queue_runner.sh`).
 
 ## Key options
 
