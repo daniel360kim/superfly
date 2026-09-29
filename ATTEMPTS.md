@@ -43,6 +43,9 @@ tilt 41 deg vs 20-30 commanded, v ~ 0 for 3-13 s), slides off and still
 arrives; clearance -0.05..-0.13 m (one -0.39) at the 0.2 m radius.
 Cruise ~2 m/s (peak 2.1-3.3), z 0.5-4.0 m (no sag: hover estimate 0.648-0.651
 against PX4's 0.666), decisions 13.6-13.8 Hz of sim time.
+setGfix2_sel_s1 (selector head, now ranked correctly) **7/10**: diffphys
+5/5 clean, diffaero 2/5 (3 collide, s4 never arrives: struck the ground,
+z 0.07-0.10 for 70 s); faster (peak 2.6-3.7 m/s, 25-27 s to goal).
 agile_student_chunk t6_chunkv8_s1 (python sim arrive 9 %) diffaero s0:
 reached, clean (0.37 m), 1.07 m/s mean, head switch on 56 % of decisions.
 
