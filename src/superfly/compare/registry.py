@@ -79,6 +79,50 @@ STUDENT_Z_REF_NOTE = ("agile_student hands over at 2.0 m: its labels only cover 
                       "AGILE_STUDENT_CLIMB_ALT=scenario to use the scenario value.")
 
 
+# --- per-vehicle constants the offboards must not assume --------------------
+# The agile/agile_student offboard defaults were measured on (or tuned for) the
+# Pegasus Iris. With --vehicle starling2max they come from the vehicle spec
+# instead (configs/vehicles/starling2max.yaml, the single source of truth):
+#   hover throttle -- measured in Isaac+PX4 by the hover_probe method (the
+#                     `isaac_px4` block of the yaml). The 0.577 in agile_student
+#                     is the IRIS's; on the Starling it is a different number,
+#                     and a wrong one becomes a steady sink under --alt-follow.
+#   MPC thrust max -- the spec's thrust-to-weight x g (19.62 m/s^2 at the
+#                     assumed T/W 2.0), not the port default 20.
+#   thrust ceiling -- the normalized collective the offboard may stream; 0.9
+#                     leaves the Iris (hover 0.58) ~2 g but the Starling only
+#                     ~1.4 g of its 2.0, so it is lifted to 1.0 there.
+VEHICLE_SPEC = _REPO / "configs" / "vehicles" / "starling2max.yaml"
+
+
+def vehicle_spec(vehicle: str) -> dict:
+    """The yaml spec for --vehicle (empty for the stock Iris)."""
+    if vehicle != "starling2max":
+        return {}
+    try:
+        import yaml
+        return yaml.safe_load(VEHICLE_SPEC.read_text()) or {}
+    except Exception as exc:          # pragma: no cover - a broken spec is loud
+        raise SystemExit(f"cannot read {VEHICLE_SPEC}: {exc}")
+
+
+def vehicle_hover_thrust(vehicle: str, default: float) -> float:
+    """Measured PX4 hover throttle for the vehicle, else `default`."""
+    spec = vehicle_spec(vehicle)
+    v = (spec.get("isaac_px4") or {}).get("hover_throttle")
+    return float(v) if v is not None else float(default)
+
+
+def vehicle_agile_args(vehicle: str) -> list:
+    """MPC/offboard bounds that differ from the Iris defaults (none for iris,
+    so every iris trial's argv stays byte-identical)."""
+    spec = vehicle_spec(vehicle)
+    if not spec:
+        return []
+    return ["--t-max", f"{float(spec['assumed']['max_thrust_accel_mps2']):.2f}",
+            "--thrust-max", "1.0"]
+
+
 def student_goal_speed() -> float:
     return float(os.environ.get("AGILE_STUDENT_GOAL_SPEED", DEFAULT_STUDENT_GOAL_SPEED))
 
@@ -269,7 +313,11 @@ def method_registry():
                 # cannot appear as an altitude offset -- it becomes a steady
                 # -0.43 m/s sink. agile_core also estimates it online and
                 # adopts the measurement; this is the starting point.
-                "--hover-thrust", os.environ.get("AGILE_HOVER_THRUST", "0.577"),
+                # (Iris number; the Starling's comes from its spec, see
+                # vehicle_hover_thrust.)
+                "--hover-thrust", os.environ.get(
+                    "AGILE_HOVER_THRUST",
+                    f"{vehicle_hover_thrust(getattr(a, 'vehicle', 'iris'), 0.577):.3f}"),
                 # NOT optional. Without --alt-follow the MPC discards the
                 # student's vertical plan (vz=0, z=cruise_alt) while the depth
                 # veto still clears modes on their vertical geometry -- it can
@@ -281,7 +329,54 @@ def method_registry():
                 # harness's 15. The worker is latest-only and rate-gated to 15 Hz
                 # in agile_core.
                 "--net-thread",
-            ] + shlex.split(os.environ.get("AGILE_STUDENT_EXTRA_ARGS", "")),
+            ] + vehicle_agile_args(getattr(a, "vehicle", "iris"))
+              + shlex.split(os.environ.get("AGILE_STUDENT_EXTRA_ARGS", "")),
+        ),
+        # Airframe probe, not a policy: climbs, holds a hover under PX4's own
+        # position controller, reads back PX4's collective thrust (the hover
+        # throttle the other methods assume), then a 2 m/s velocity step for
+        # the rate/attitude loops' stability. Writes hover_probe.json in the
+        # trial dir. Use it once per airframe:
+        #   run_comparison.py configs/scenarios/probes/diffaero_field.json \
+        #       --methods hover_probe --vehicle starling2max ...
+        "hover_probe": dict(
+            policy="agile",
+            offboard="hover_probe.py",
+            control_hz=50.0,
+            goal_argc=2,
+            python=SCRIPTS_DIR / "agile_python.sh",
+            checkpoint=SCRIPTS_DIR / "hover_probe.py",     # nothing to load
+            ckpt_kind="file",
+            climb_alt=2.0,
+            speed_args=lambda a: [
+                "--hover-guess", f"{vehicle_hover_thrust(getattr(a, 'vehicle', 'iris'), 0.5):.3f}"],
+        ),
+        # Velocity-chunk student (ONNX sidecar arch chunk_v1; agile_student/
+        # INPUTS.md "Velocity chunk"). Same inputs and sim camera as
+        # agile_student; the output is a 1.5 s heading-frame velocity + yaw-rate
+        # chunk per head plus a gate, executed like superfly_expert_sampler
+        # sim_episode.OnnxChunkPolicy (gate argmax with hysteresis 0.15,
+        # temporal ensemble of the last 4 SAME-HEAD chunks, 0.5^age weights,
+        # a lead into each chunk) and sent to PX4's velocity loop as velocity
+        # setpoints + yaw rate, the way depthnav_vel sends velocity.
+        # AGILE_CHUNK_LEAD sets the lead [s] (default 0.5);
+        # AGILE_CHUNK_EXTRA_ARGS appends offboard args.
+        "agile_student_chunk": dict(
+            policy="agile",                  # same 224x224 depth camera as the student
+            offboard="chunk_offboard.py",
+            control_hz=50.0,
+            goal_argc=2,
+            python=SCRIPTS_DIR / "agile_python.sh",
+            checkpoint=CHECKPOINTS_DIR / "Student" / "chunk" / "student.onnx",
+            ckpt_kind="onnx",
+            climb_alt=student_climb_alt(),
+            speed_args=lambda a: [
+                "--v-cap", str(STUDENT_MAX_VEL),
+                "--goal-speed", str(student_goal_speed()),
+                "--lead", os.environ.get("AGILE_CHUNK_LEAD", "0.5"),
+                "--hover-thrust",
+                f"{vehicle_hover_thrust(getattr(a, 'vehicle', 'iris'), 0.577):.3f}",
+            ] + shlex.split(os.environ.get("AGILE_CHUNK_EXTRA_ARGS", "")),
         ),
     }
 

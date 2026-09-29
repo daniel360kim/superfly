@@ -343,7 +343,8 @@ def restart_px4(px4_dir: Path, model: str, boot_timeout: float, log_path: Path):
 # 'OSError: [Errno 98] Address already in use'.
 STALE_PATTERNS = ("run_px4_sim.py", "depthnav_offboard.py",
                   "depthnav_vel_offboard.py", "diffaero_offboard.py",
-                  "diffaero_vel_offboard.py", "agile_offboard.py")
+                  "diffaero_vel_offboard.py", "agile_offboard.py",
+                  "chunk_offboard.py", "hover_probe.py")
 
 
 def stop_stale_sims():

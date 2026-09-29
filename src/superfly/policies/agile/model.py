@@ -425,7 +425,38 @@ def is_onnx_checkpoint(path) -> bool:
     return str(path).lower().endswith(".onnx")
 
 
-def decode_student_output(out) -> Tuple[np.ndarray, np.ndarray]:
+def student_selection(path) -> str:
+    """What the student's alpha column means, from the ONNX sidecar
+    ``<model>.onnx.json`` (``selection``: cost | selector | clearance), else
+    ``cost`` (every student before the t6 selection arms). Read it, never guess: the t6 ``selector`` heads emit a
+    LOGIT where higher is better, and ranking that by |alpha| ascending (the
+    cost rule) flies the WORST mode, silently, with plausible logs."""
+    import json
+    side = Path(str(path) + ".json")
+    if side.is_file():
+        try:
+            return str(json.loads(side.read_text()).get("selection") or "cost")
+        except (OSError, ValueError):
+            pass
+    return "cost"
+
+
+def costs_from_alpha(alpha, selection: str = "cost") -> np.ndarray:
+    """Per-mode cost (lower = better) from the head's raw alpha column --
+    superfly_expert_sampler sim_episode.OnnxPolicy.costs_from_alpha:
+    cost -> |alpha|; selector -> 1 / softmax(alpha) (so upstream's 0.9 accept
+    ratio reads "probability within 10 % of the best"); clearance -> 1 / alpha."""
+    a = np.asarray(alpha, dtype=np.float64)
+    if selection == "selector":
+        z = a - np.max(a)
+        p = np.exp(z) / np.sum(np.exp(z))
+        return 1.0 / np.maximum(p, 1e-9)
+    if selection == "clearance":
+        return 1.0 / np.maximum(a, 1e-3)
+    return np.abs(a)
+
+
+def decode_student_output(out, selection: str = "cost") -> Tuple[np.ndarray, np.ndarray]:
     """(1, M, 1+3N) -> (alphas (M,), trajectories (M, 3N)), modes sorted
     ascending by |alpha| so index 0 is the net's lowest-cost prediction --
     the same ordering TensorFlowLoquercioBackend.infer returns, and the same
@@ -439,12 +470,13 @@ def decode_student_output(out) -> Tuple[np.ndarray, np.ndarray]:
         m = np.asarray(out[0], dtype=np.float64)[0]
         modes = m.shape[0]
         wps = m.reshape(modes, m.size // (3 * modes), 3)          # (M, N, 3)
-        alpha = np.abs(np.asarray(out[1], dtype=np.float64)[0].reshape(modes))
+        alpha = costs_from_alpha(np.asarray(out[1], dtype=np.float64)[0].reshape(modes),
+                                 selection)
         flat = np.transpose(wps, (0, 2, 1)).reshape(modes, -1)    # -> [x..|y..|z..]
     else:
         o = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float64)
         o = o.reshape(-1, o.shape[-1])
-        alpha = np.abs(o[:, 0])
+        alpha = costs_from_alpha(o[:, 0], selection)
         flat = o[:, 1:]
     order = np.argsort(alpha, kind="stable")
     return (alpha[order].astype(np.float32), flat[order].astype(np.float32))
@@ -485,6 +517,9 @@ class OnnxStudentBackend:
         if not path.exists():
             raise FileNotFoundError(f"ONNX student not found: {path}")
         self.checkpoint_prefix = str(path)
+        self.selection = student_selection(path)
+        print(f"[agile] student head selection: {self.selection} "
+              f"(sidecar {path.name}.json)", flush=True)
         # CPU on purpose: the offboard shares the box with Isaac + PX4 SITL.
         if intra_op_threads is None:
             intra_op_threads = int(os.environ.get("AGILE_ONNX_THREADS",
@@ -554,4 +589,5 @@ class OnnxStudentBackend:
         """(alphas (M,), trajectories (M, 3*out_seq_len)) sorted by |alpha|."""
         feed = {self._depth_input: np.ascontiguousarray(depth, dtype=np.float32),
                 self._state_input: np.ascontiguousarray(imu, dtype=np.float32)}
-        return decode_student_output(self.session.run(None, feed))
+        return decode_student_output(self.session.run(None, feed),
+                                     getattr(self, "selection", "cost"))

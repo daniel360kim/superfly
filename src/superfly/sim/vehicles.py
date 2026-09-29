@@ -72,6 +72,31 @@ def load_starling_spec() -> dict:
     return yaml.safe_load(STARLING_SPEC.read_text())
 
 
+#: Pegasus maps each PX4 motor output u in [0, 1] to a rotor-speed reference
+#: omega = (u + offset) * scaling + zero_position_armed (PX4MavlinkBackend
+#: ThrusterControl), stock scaling 1000 / zero 100 rad/s. That was sized for
+#: the Iris (max_rotor_velocity 1100 = full scale at u = 1). The Starling's
+#: rotor saturates at 830 rad/s, so with the stock scaling it clips at u =
+#: 0.73 and PX4's allocator -- which believes it has headroom to 1.0 -- loses
+#: differential authority silently above that. Scaling (830 - 100) makes u = 1
+#: the real saturation, i.e. the same normalized throttle curve shape the Iris
+#: has. SUPERFLY_STARLING_INPUT_SCALING overrides (1000 = the stock mapping).
+PEGASUS_ZERO_POSITION_ARMED = 100.0
+
+
+def vehicle_backend_overrides(name: str) -> dict:
+    """Extra PX4MavlinkBackendConfig keys for --vehicle <name> ({} = stock)."""
+    import os
+    if name != "starling2max":
+        return {}
+    w_max = float(load_starling_spec()["assumed"]["max_rotor_velocity_rad_s"])
+    scaling = float(os.environ.get("SUPERFLY_STARLING_INPUT_SCALING",
+                                   w_max - PEGASUS_ZERO_POSITION_ARMED))
+    return {"input_offset": [0.0] * 4,
+            "input_scaling": [scaling] * 4,
+            "zero_position_armed": [PEGASUS_ZERO_POSITION_ARMED] * 4}
+
+
 def vehicle_usd_and_curve(name: str):
     """(usd_file, thrust_curve, label) for --vehicle <name>."""
     import os

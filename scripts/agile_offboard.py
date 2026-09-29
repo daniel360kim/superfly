@@ -209,6 +209,11 @@ def main():
                              "also estimates it online from level flight and "
                              "adopts the measurement. AGILE_HOVER_THRUST "
                              "overrides.")
+    parser.add_argument("--thrust-max", type=float, default=0.9,
+                        help="Ceiling on the normalized collective thrust streamed "
+                             "to PX4 (default 0.9, set for the Iris). The Starling "
+                             "(hover ~0.6-0.7 of full scale, T/W 2.0) gets 1.0 from "
+                             "the registry so its envelope is not cut to ~1.4 g.")
     parser.add_argument("--veto-look-m", type=float, default=3.5,
                         help="Depth-veto path length walked from the body [m].")
     parser.add_argument("--veto-margin-m", type=float, default=0.15,
@@ -292,6 +297,7 @@ def main():
         veto_look_m=args.veto_look_m,
         veto_margin_m=args.veto_margin_m,
         veto_radius_m=args.veto_radius_m,
+        thrust_max=args.thrust_max,
     )
     debug_pub = None if args.no_debug_viz else AgileDebugPublisher()
     if debug_pub is not None:

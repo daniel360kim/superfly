@@ -776,9 +776,44 @@ def test_registry_pins_the_student_handover_altitude():
     cfg = method_registry()["agile_student"]
     assert cfg["climb_alt"] == DEFAULT_STUDENT_CLIMB_ALT == 2.0
     assert STUDENT_Z_REF_NOTE            # the choice is documented in the module
+    # the baselines keep the scenario's; only the students (trained in the
+    # 0.5-4 m band) and the airframe probe pin their own
+    pinned = {"agile_student", "agile_student_chunk", "hover_probe"}
     for m, c in method_registry().items():
-        if m != "agile_student":
+        if m not in pinned:
             assert c.get("climb_alt") is None, f"{m} must keep the scenario's"
+    assert method_registry()["agile_student_chunk"]["climb_alt"] == 2.0
+
+
+def test_selector_head_flies_the_highest_logit(tmp_path):
+    """A t6 `selector` head emits logits (higher = better). Ranking them by
+    |alpha| ascending, the cost rule, would put the WORST mode first."""
+    import json as _json
+    from superfly.policies.agile.model import student_selection
+    wp = np.arange(15, dtype=np.float32)
+    out = np.stack([np.concatenate([[a], wp + 10 * k]) for k, a in
+                    enumerate([-2.0, 3.0, 0.5])])[None]            # mode 1 is best
+    alphas, flat = decode_student_output(out, "selector")
+    assert flat[0][0] == 10.0 and alphas[0] < alphas[1] < alphas[2]
+    alphas_c, flat_c = decode_student_output(out)                  # cost rule
+    assert flat_c[0][0] == 20.0                                    # |0.5| smallest
+    f = tmp_path / "m.onnx"
+    assert student_selection(f) == "cost"
+    (tmp_path / "m.onnx.json").write_text(_json.dumps({"selection": "selector"}))
+    assert student_selection(f) == "selector"
+
+
+def test_registry_starling_args_come_from_the_spec():
+    import argparse
+    from superfly.compare.registry import method_registry, vehicle_hover_thrust
+    reg = method_registry()
+    iris = reg["agile_student"]["speed_args"](argparse.Namespace(max_speed=3.0, vehicle="iris"))
+    assert "--t-max" not in iris and iris[iris.index("--hover-thrust") + 1] == "0.577"
+    st = reg["agile_student"]["speed_args"](argparse.Namespace(max_speed=3.0,
+                                                               vehicle="starling2max"))
+    assert st[st.index("--t-max") + 1] == "19.62"
+    assert st[st.index("--thrust-max") + 1] == "1.0"
+    assert float(st[st.index("--hover-thrust") + 1]) == vehicle_hover_thrust("starling2max", 0.577)
 
 
 def test_plan_clock_starts_at_the_snapshot_not_at_adoption(stub_mpc):

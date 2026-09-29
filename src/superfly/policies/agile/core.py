@@ -327,7 +327,8 @@ class AgilePolicy:
                  veto_look_m: float = STUDENT_VETO_LOOK_M,
                  veto_step_m: float = STUDENT_VETO_STEP_M,
                  veto_margin_m: float = STUDENT_VETO_MARGIN_M,
-                 veto_radius_m: float = STUDENT_VETO_RADIUS_M):
+                 veto_radius_m: float = STUDENT_VETO_RADIUS_M,
+                 thrust_max: float = 0.9):
         # Which net: a .onnx artifact is an anyanything student (22-dim state,
         # metric 0.5 s waypoints, any mode/waypoint count); anything else is
         # the legacy TF2 PlaNet checkpoint prefix (21-dim state, 0.1 s plan).
@@ -353,6 +354,10 @@ class AgilePolicy:
         print("[agile] MPC ready.", flush=True)
 
         self.max_vel = float(max_vel)
+        # Ceiling on the streamed normalized collective. 0.9 was set for the
+        # Iris (hover 0.58: ~2 g left); a vehicle hovering higher on its curve
+        # (the Starling, T/W 2.0) passes 1.0 so it keeps its whole envelope.
+        self.thrust_max = float(np.clip(thrust_max, 0.5, 1.0))
         # hover_thrust None -> the student's measured value, else the legacy
         # G/MAX_ACCEL assumption. AGILE_HOVER_THRUST overrides both.
         if hover_thrust is None:
@@ -1166,7 +1171,8 @@ class AgilePolicy:
         R_cmd = Rotation.from_quat(
             [attitude_q[1], attitude_q[2], attitude_q[3], attitude_q[0]]).as_matrix()
         cos_tilt = max(0.5, float(R_cmd[2, 2]))
-        thrust = float(np.clip((az + G) / cos_tilt / G * self.hover_thrust, 0.05, 0.9))
+        thrust = float(np.clip((az + G) / cos_tilt / G * self.hover_thrust, 0.05,
+                               self.thrust_max))
         self._update_hover_estimate(thrust, cos_tilt, float(vel[2]), alt_err)
         tilt_cmd = math.degrees(math.acos(float(np.clip(R_cmd[2, 2], -1.0, 1.0))))
 

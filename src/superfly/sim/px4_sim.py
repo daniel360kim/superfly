@@ -70,7 +70,7 @@ from pegasus.simulator.logic.graphical_sensors.monocular_camera import Monocular
 from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
-from superfly.sim.vehicles import vehicle_usd_and_curve
+from superfly.sim.vehicles import vehicle_usd_and_curve, vehicle_backend_overrides
 from superfly.sim import scene_setup
 
 import sys
@@ -432,9 +432,17 @@ class PegasusApp:
         self._spawn_pos = spawn_pos  # kept for the trajectory npz 'start' field
 
         config_multirotor = MultirotorConfig()
+        # Per-vehicle motor-output mapping (stock for the Iris; the Starling
+        # needs u = 1 at its own rotor saturation -- see vehicles.py).
+        _backend_extra = vehicle_backend_overrides(vehicle)
+        if _backend_extra:
+            print(f"[vehicle] PX4 motor mapping: omega = u * "
+                  f"{_backend_extra['input_scaling'][0]:g} + "
+                  f"{_backend_extra['zero_position_armed'][0]:g} rad/s")
         mavlink_config = PX4MavlinkBackendConfig({
             "vehicle_id": 0,
             "px4_autolaunch": False,
+            **_backend_extra,
         })
         config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
