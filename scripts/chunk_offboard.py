@@ -25,6 +25,18 @@ PX4 gets that plant's velocity AND acceleration (feedforward) at 60 Hz, the
 yaw-rate command low-passed and rate-limited. Position stays masked (a
 position setpoint would fight the z band / altitude logic).
 
+--shield (off by default; without it nothing changes): a short-lived
+egocentric obstacle memory (each decision's depth frame subsampled and
+back-projected to local points with the odometry pose, ~1.2 s kept, capped)
+and a clearance shield on the commanded velocity at 60 Hz: the component
+toward any remembered point that the next --shield-horizon seconds of motion
+would bring within --shield-margin is removed (reversed inside the margin),
+with a repulsive gain; the shield never adds speed
+(superfly.policies.chunk.ObstacleMemory / ClearanceShield). With --smooth it
+filters the plant's target AND its output (written back into the plant).
+--yaw-to-vel K (off by default) adds K * (heading(velocity) - yaw) to the yaw
+rate so the camera turns with the velocity during swerves.
+
 Phases as agile_offboard: CLIMB (position hold) -> YAW (face goal) -> POLICY
 -> LANDING when within --goal-radius horizontally.
 """
@@ -51,7 +63,8 @@ from superfly.common.px4_offboard import (
     send_land_command, send_heartbeat, set_param_float, receive_loop, make_clock,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
-from superfly.policies.chunk import ChunkPolicy, SmoothRef
+from superfly.policies.chunk import (ChunkPolicy, SmoothRef, ObstacleMemory, ClearanceShield,
+                                     yaw_toward)
 
 CONTROL_HZ = 60.0          # a multiple of DECISION_HZ: exactly every 4th tick decides
 DECISION_HZ = 15.0          # sim_episode.DECISION_HZ
@@ -140,6 +153,35 @@ def main():
     ap.add_argument("--smooth-ff", action="store_true",
                     help="--smooth: add the chunk's own slope to the plant's accel target "
                          "(sim --chunk-feedforward; off as there).")
+    ap.add_argument("--shield", action="store_true",
+                    help="Clearance shield (off = unchanged): remember ~--mem-horizon s of "
+                         "back-projected depth points and remove/reverse the commanded velocity "
+                         "component toward any point the next --shield-horizon s of motion brings "
+                         "within --shield-margin. Never adds speed. Isaac 2026-09-29: 16 of 20 "
+                         "passes under 0.25 m were side passes whose obstacle had left the 91 deg "
+                         "view 0.06-0.8 s earlier.")
+    ap.add_argument("--shield-margin", type=float, default=0.5,
+                    help="--shield: centre-to-surface margin [m] (clearance ~ margin - 0.2 m).")
+    ap.add_argument("--shield-horizon", type=float, default=0.5,
+                    help="--shield: predicted motion checked against the memory [s].")
+    ap.add_argument("--shield-gain", type=float, default=2.0,
+                    help="--shield: allowed approach speed = gain * (distance - margin) [1/s].")
+    ap.add_argument("--shield-vrep", type=float, default=0.5,
+                    help="--shield: max retreat speed inside the margin [m/s].")
+    ap.add_argument("--mem-horizon", type=float, default=1.2,
+                    help="--shield: obstacle memory length [s].")
+    ap.add_argument("--mem-stride", type=int, default=8,
+                    help="--shield: depth subsample stride [px] (224/8 = 28x28 rays per frame).")
+    ap.add_argument("--mem-range", type=float, default=5.0,
+                    help="--shield: farthest depth point remembered [m].")
+    ap.add_argument("--mem-cap", type=int, default=3000,
+                    help="--shield: max points (the nearest are kept).")
+    ap.add_argument("--mem-cam-pitch", type=float, default=0.0,
+                    help="--shield: effective camera pitch [deg, + = down] for the back-"
+                         "projection (Isaac with SUPERFLY_CAM_PITCH_DEG=-13: level = 0).")
+    ap.add_argument("--yaw-to-vel", type=float, default=0.0,
+                    help="Add K * (heading(velocity) - yaw) to the yaw rate [1/s] above 0.5 m/s "
+                         "(0 = off): turns the camera with the velocity during swerves.")
     ap.add_argument("--kv", type=float, default=3.0,
                     help="PX4 velocity P gain (MPC_XY/Z_VEL_P_ACC) = sim KV_VEL.")
     ap.add_argument("--clock", choices=["wall", "px4"], default="px4",
@@ -181,6 +223,34 @@ def main():
               f"m/s^2, yaw tau {args.smooth_yaw_tau:g} s, yaw acc {args.smooth_yaw_acc:g} rad/s^2, "
               f"chunk slope ff {'on' if args.smooth_ff else 'off'}; PX4 gets velocity + accel", flush=True)
 
+    memory = shield = None
+    if args.shield:
+        memory = ObstacleMemory(horizon=args.mem_horizon, stride=args.mem_stride,
+                                r_max=args.mem_range, cap=args.mem_cap,
+                                cam_pitch_deg=args.mem_cam_pitch)
+        shield = ClearanceShield(margin=args.shield_margin, horizon=args.shield_horizon,
+                                 gain=args.shield_gain, v_rep=args.shield_vrep)
+        print(f"[chunk] SHIELD: margin {args.shield_margin:g} m, horizon {args.shield_horizon:g} s, "
+              f"gain {args.shield_gain:g}/s, v_rep {args.shield_vrep:g} m/s; memory "
+              f"{args.mem_horizon:g} s, stride {args.mem_stride}, range {args.mem_range:g} m, cap "
+              f"{args.mem_cap}, cam pitch {args.mem_cam_pitch:g} deg", flush=True)
+        if not args.depth:
+            print("[chunk] WARNING: --shield without --depth: the memory stays empty", flush=True)
+    if args.yaw_to_vel > 0:
+        print(f"[chunk] YAW-TO-VEL: + {args.yaw_to_vel:g} * (heading(v) - yaw) rad/s", flush=True)
+    sh_stat = dict(ticks=0, dv=0.0, dmin=float("inf"), n=0)   # since the last csv row
+    sh_tot = dict(ticks=0, pol_ticks=0, dv=0.0, dmin=float("inf"))
+
+    def shield_v(v_in, pos, vel, now):
+        v_out, info = shield.apply(v_in, pos, memory.points(now, pos), vel)
+        sh_stat["dmin"] = min(sh_stat["dmin"], info["dmin"])
+        sh_tot["dmin"] = min(sh_tot["dmin"], info["dmin"])
+        if info["dv"] > 1e-3:
+            sh_stat["dv"] = max(sh_stat["dv"], info["dv"])
+            sh_stat["n"] = max(sh_stat["n"], info["n"])
+            sh_tot["dv"] = max(sh_tot["dv"], info["dv"])
+        return v_out, info["dv"]
+
     for name, val in (("MPC_XY_VEL_P_ACC", args.kv), ("MPC_Z_VEL_P_ACC", args.kv),
                       ("MPC_XY_VEL_MAX", max(4.0, args.v_cap + 0.5)),
                       ("MPC_Z_VEL_MAX_UP", 3.0), ("MPC_Z_VEL_MAX_DN", 3.0)):
@@ -209,6 +279,8 @@ def main():
         dec_log.write("t,x,y,z,vx,vy,vz,yaw,head,reason,p0,p1,p2,p3,p4,"
                       "cmd_vx,cmd_vy,cmd_vz,cmd_yr,n_ens"
                       + (",tgt_vx,tgt_vy,tgt_vz,tgt_yr,cmd_ax,cmd_ay,cmd_az" if smooth else "")
+                      + (",mem_n,sh_ticks,sh_dv,sh_n,sh_dmin" if shield else "")
+                      + (",yaw_vel_yr" if args.yaw_to_vel > 0 else "")
                       + "\n")
 
     dt = 1.0 / CONTROL_HZ
@@ -256,6 +328,8 @@ def main():
                     next_dec = now
                     mark_policy_phase("start")
                     policy.reset()
+                    if memory is not None:
+                        memory.reset()
                     if smooth is not None:
                         smooth.reset(vel)
                     t_prev = now
@@ -269,6 +343,8 @@ def main():
                     next_dec = max(next_dec + 1.0 / DECISION_HZ, now)
                     depth = depth_sub.latest() if depth_sub else None
                     rec = policy.decide(now, pos, R, vel, om, goal, depth)
+                    if memory is not None:
+                        memory.add(now, depth, pos, R)
                     last_dec = now
                     n_dec += 1
                 v, yr, n_used = policy.command(now)
@@ -279,6 +355,14 @@ def main():
                 vz_lo = (lo - pos[2]) / Z_SOFT_T
                 vz_hi = (hi - pos[2]) / Z_SOFT_T
                 v[2] = min(max(v[2], min(vz_lo, 0.0)), max(vz_hi, 0.0))
+                sh_dv = 0.0
+                if shield is not None:
+                    v, sh_dv = shield_v(v, pos, vel, now)
+                    v[2] = min(max(v[2], min(vz_lo, 0.0)), max(vz_hi, 0.0))
+                yv_yr = 0.0
+                if args.yaw_to_vel > 0:
+                    yv_yr = yaw_toward(yaw, vel, args.yaw_to_vel)
+                    yr = yr + yv_yr
                 yr = float(np.clip(yr, -YAW_RATE_MAX, YAW_RATE_MAX))
                 if smooth is None:
                     # ENU (x E, y N, z U) -> NED; ENU yaw rate (CCW about up) -> NED -yr
@@ -287,6 +371,20 @@ def main():
                     v_tgt, yr_tgt = v.copy(), yr
                     a_ff = policy.command_acc(now) if args.smooth_ff else None
                     v, a, yr = smooth.step(v_tgt, yr_tgt, min(max(now - t_prev, 0.0), 0.1), a_ff)
+                    if shield is not None:
+                        # the plant lags its (already shielded) target: filter
+                        # its output too, write it back, and drop any accel
+                        # still pointing against the correction
+                        v_s, dv2 = shield_v(v, pos, vel, now)
+                        if dv2 > 1e-3:
+                            u = (v_s - v) / dv2
+                            au = float(a @ u)
+                            if au < 0:
+                                a = a - au * u
+                                smooth.a = a.copy()
+                            v = v_s
+                            smooth.v = v.copy()
+                            sh_dv = max(sh_dv, dv2)
                     # the z band again on the smoothed setpoint; no vertical
                     # feedforward pushing further out of it
                     vz = min(max(v[2], min(vz_lo, 0.0)), max(vz_hi, 0.0))
@@ -300,6 +398,11 @@ def main():
                     send_velocity_accel_yawrate_ned(mav, (v[1], v[0], -v[2]),
                                                     (a[1], a[0], -a[2]), -yr)
                 t_prev = now
+                if shield is not None:
+                    sh_tot["pol_ticks"] += 1
+                    if sh_dv > 1e-3:
+                        sh_stat["ticks"] += 1
+                        sh_tot["ticks"] += 1
                 if dec_log is not None and last_dec == now:
                     p = policy.last["probs"]
                     dec_log.write(",".join(f"{x:.4f}" for x in (
@@ -307,13 +410,19 @@ def main():
                         f"{policy.last['reason']}," + ",".join(f"{x:.3f}" for x in p)
                         + "," + ",".join(f"{x:.3f}" for x in (*v, yr)) + f",{n_used}"
                         + ("," + ",".join(f"{x:.3f}" for x in (*v_tgt, yr_tgt, *a))
-                           if smooth is not None else "") + "\n")
+                           if smooth is not None else "")
+                        + (f",{len(memory.pts)},{sh_stat['ticks']},{sh_stat['dv']:.3f},"
+                           f"{sh_stat['n']},{min(sh_stat['dmin'], 99.0):.3f}" if shield is not None else "")
+                        + (f",{yv_yr:.3f}" if args.yaw_to_vel > 0 else "") + "\n")
+                    sh_stat.update(ticks=0, dv=0.0, dmin=float("inf"), n=0)
                 dist = float(np.linalg.norm((goal - pos)[:2]))
                 if verbose:
                     print(f"[POLICY t={now - t0:.1f}] pos={pos.round(2)} |v|={np.linalg.norm(vel):.2f} "
                           f"cmd={np.round(v, 2)} yr={yr:+.2f} head={policy.heads[policy.head]} "
                           f"p={np.round(policy.last['probs'], 2)} n_ens={n_used} "
-                          f"switches={policy.switches} dist={dist:.1f} decisions={n_dec}",
+                          f"switches={policy.switches} dist={dist:.1f} decisions={n_dec}"
+                          + (f" mem={len(memory.pts)} shield_ticks={sh_tot['ticks']}"
+                             if shield is not None else ""),
                           flush=True)
                 if dist < args.goal_radius:
                     phase = "LANDING"
@@ -333,6 +442,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if shield is not None:
+            print(f"[chunk] SHIELD summary: active {sh_tot['ticks']}/{sh_tot['pol_ticks']} policy ticks "
+                  f"({sh_tot['ticks'] / CONTROL_HZ:.1f} s), max |dv| {sh_tot['dv']:.2f} m/s, nearest "
+                  f"remembered point {sh_tot['dmin']:.2f} m", flush=True)
         if dec_log is not None:
             dec_log.close()
         stop.set()

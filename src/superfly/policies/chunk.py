@@ -32,6 +32,11 @@ Executor (per decision, 15 Hz):
     default): the command is integrated through the sim's plant with jerk /
     accel limits and sent as velocity + acceleration feedforward, yaw rate
     low-passed.
+  * optional clearance shield (ObstacleMemory + ClearanceShield,
+    chunk_offboard --shield, off by default): a ~1.2 s egocentric memory of
+    back-projected depth points, and a velocity filter that removes (or
+    reverses) the commanded component toward any remembered point the next
+    ~0.5 s of motion would bring inside a margin. Never adds speed.
 Dependency-light: numpy + onnxruntime.
 """
 
@@ -163,6 +168,242 @@ class SmoothRef:
         lim = self.yaw_acc * dt if self.yaw_acc > 0 else abs(dyr)
         self.yr = self.yr + max(-lim, min(lim, dyr))
         return self.v.copy(), self.a.copy(), self.yr
+
+
+class ObstacleMemory:
+    """Short-lived egocentric obstacle memory (chunk_offboard --shield).
+
+    Why: the chunk student is purely reactive, and 16 of the 20 Isaac close
+    passes under 0.25 m (2026-09-29, chunkv8L_s2 vc15/sm runs) were SIDE
+    passes -- bearing ~90 deg from the velocity -- whose closest obstacle patch
+    had left the 91 deg depth view 0.06-0.8 s before closest approach. So each
+    depth frame is subsampled and back-projected to local-ENU points with the
+    odometry pose at the decision, points older than ``horizon`` are dropped,
+    and the set is thinned on a voxel grid (newest wins) and capped to the
+    ``cap`` points nearest the vehicle. numpy only, O(1e3) points: cheap
+    enough for the Starling's CPU.
+
+    Camera (superfly.sim.px4_sim POLICY_CAMERAS['agile'] + render_depth.Camera,
+    the training renderer): 640x480 render, 91 deg hfov, square pixels,
+    bilinear to the shipped frame (224x224, so fy != fx there), planar z-depth,
+    row 0 = up, col 0 = left, mounted ``cam_pos`` in the FLU body frame. The
+    effective mount is level (``cam_pitch_deg`` 0, positive = nose-down):
+    Isaac's SUPERFLY_CAM_PITCH_DEG=-13 cancels the 13 deg the raw mount looks
+    down, which is what makes its frame match the training renderer.
+
+    Silhouettes: resizing 640x480 -> 224 (cv2 bilinear in px4_sim) blends
+    foreground and background into one-pixel-wide phantom depths in free
+    space. Those pixels are detected (``_mixed``: strictly between two
+    opposite neighbours, a big jump to each) and dropped, and each sampled
+    pixel then takes the MIN depth of its (2 edge_px + 1)^2 neighbourhood
+    (3x3), so thin bars and silhouettes are still caught, on the foreground
+    surface, inflated by <= edge_px pixels (~1.4 cm at 1.5 m)."""
+
+    def __init__(self, horizon: float = 1.2, stride: int = 8, r_min: float = 0.35,
+                 r_max: float = 5.0, cap: int = 3000, voxel: float = 0.08,
+                 z_floor: float = 0.2, cam_pos=(0.10, 0.0, 0.0), cam_pitch_deg: float = 0.0,
+                 hfov_deg: float = 91.0, render_wh=(640, 480), edge_px: int = 1,
+                 mix_rel: float = 0.05, mix_abs: float = 0.05):
+        self.horizon, self.stride = float(horizon), max(1, int(stride))
+        self.edge_px = max(0, int(edge_px))
+        self.mix_rel, self.mix_abs = float(mix_rel), float(mix_abs)
+        self.r_min, self.r_max = float(r_min), float(r_max)
+        self.cap, self.voxel, self.z_floor = int(cap), float(voxel), float(z_floor)
+        self.cam_pos = np.asarray(cam_pos, float).reshape(3)
+        th = math.radians(cam_pitch_deg)
+        # camera (x right, y down, z forward) -> FLU body, then pitched
+        # nose-down by th about body +y
+        R_bc = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+        Ry = np.array([[math.cos(th), 0.0, math.sin(th)], [0.0, 1.0, 0.0],
+                       [-math.sin(th), 0.0, math.cos(th)]])
+        self.R_bc = Ry @ R_bc
+        self.hfov = math.radians(hfov_deg)
+        self.render_wh = (int(render_wh[0]), int(render_wh[1]))
+        self._grid_key = None
+        self.reset()
+
+    def reset(self):
+        self.frames: list[tuple[float, np.ndarray]] = []   # (t, (K,3) local ENU)
+        self.pts = np.zeros((0, 3))
+        self._last_depth = None
+
+    def _grid(self, h: int, w: int):
+        """Sampled pixel indices and their camera-frame rays (z_c = 1)."""
+        if self._grid_key != (h, w):
+            s = self.stride
+            rows = np.arange(s // 2, h, s)
+            cols = np.arange(s // 2, w, s)
+            W0, H0 = self.render_wh
+            fx_r = 0.5 * W0 / math.tan(0.5 * self.hfov)
+            fx, fy = fx_r * w / W0, fx_r * h / H0
+            cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+            C, Rr = np.meshgrid(cols, rows)
+            self._rows, self._cols = Rr.ravel(), C.ravel()
+            self._rays = np.stack([(self._cols - cx) / fx, (self._rows - cy) / fy,
+                                   np.ones(self._rows.size)], 1)
+            self._grid_key = (h, w)
+        return self._rows, self._cols, self._rays
+
+    @staticmethod
+    def _mixed(d, rel: float, tol: float) -> np.ndarray:
+        """Pixels strictly between two opposite neighbours (horizontal,
+        vertical or either diagonal) with a jump of more than rel * depth + tol
+        to EACH: a resampler's blend of foreground and background, i.e. a
+        phantom depth in free space. A continuous surface -- even a wall seen at
+        grazing incidence, ~1 cm per pixel -- does not trip it; a steep limb
+        may, which only drops real points."""
+        m = np.zeros(d.shape, bool)
+        c = d[1:-1, 1:-1]
+        tau = rel * c + tol
+        for a, b in ((d[1:-1, :-2], d[1:-1, 2:]), (d[:-2, 1:-1], d[2:, 1:-1]),
+                     (d[:-2, :-2], d[2:, 2:]), (d[:-2, 2:], d[2:, :-2])):
+            lo, hi = np.minimum(a, b), np.maximum(a, b)
+            m[1:-1, 1:-1] |= ((c - lo) > tau) & ((hi - c) > tau)
+        return m
+
+    def add(self, t: float, depth, pos, R) -> int:
+        """Add one depth frame seen from (pos, R: local ENU <- FLU body).
+        A frame object already added (the subscriber's last-seen frame, no new
+        one arrived) is skipped. Returns the number of points added."""
+        if depth is None or depth is self._last_depth:
+            return 0
+        self._last_depth = depth
+        d = np.nan_to_num(np.asarray(depth, np.float32), nan=np.inf, posinf=np.inf,
+                          neginf=0.0)
+        h, w = d.shape
+        rows, cols, rays = self._grid(h, w)
+        d = np.where(self._mixed(d, self.mix_rel, self.mix_abs), np.inf, d)
+        z = d[rows, cols]
+        e = self.edge_px
+        for dr in range(-e, e + 1):
+            rr = np.clip(rows + dr, 0, h - 1)
+            for dc in range(-e, e + 1):
+                z = np.minimum(z, d[rr, np.clip(cols + dc, 0, w - 1)])
+        z = np.nan_to_num(z.astype(float), nan=np.inf, posinf=np.inf, neginf=0.0)
+        rng = z * np.sqrt((rays ** 2).sum(1))
+        ok = (rng > self.r_min) & (rng < self.r_max)
+        if not ok.any():
+            self._push(t, np.zeros((0, 3)))
+            return 0
+        p_c = rays[ok] * z[ok, None]
+        p_b = p_c @ self.R_bc.T + self.cam_pos
+        p_w = p_b @ np.asarray(R, float).T + np.asarray(pos, float).reshape(3)
+        p_w = p_w[p_w[:, 2] > self.z_floor]          # the ground is not an obstacle here
+        self._push(t, p_w)
+        return len(p_w)
+
+    def _push(self, t: float, p_w: np.ndarray):
+        self.frames.insert(0, (float(t), p_w))
+        self._rebuild(t)
+
+    def _rebuild(self, t: float):
+        self.frames = [f for f in self.frames if t - f[0] <= self.horizon + 1e-9]
+        pts = np.concatenate([f[1] for f in self.frames], 0) if self.frames else np.zeros((0, 3))
+        if len(pts) and self.voxel > 0:                # newest first -> unique keeps the newest
+            k = np.floor(pts / self.voxel).astype(np.int64) + (1 << 20)
+            key = (k[:, 0] << 42) | (k[:, 1] << 21) | k[:, 2]
+            _, idx = np.unique(key, return_index=True)
+            pts = pts[np.sort(idx)]
+        self.pts = pts
+
+    def points(self, t: float, pos=None) -> np.ndarray:
+        """The remembered points at time t (frames older than horizon
+        dropped); if more than ``cap``, the cap nearest ``pos``."""
+        if self.frames and t - self.frames[-1][0] > self.horizon + 1e-9:
+            self._rebuild(t)
+        pts = self.pts
+        if len(pts) > self.cap and pos is not None:
+            d2 = ((pts - np.asarray(pos, float).reshape(3)) ** 2).sum(1)
+            pts = pts[np.argpartition(d2, self.cap)[:self.cap]]
+        return pts
+
+
+class ClearanceShield:
+    """Velocity filter over ObstacleMemory points (chunk_offboard --shield).
+
+    For every remembered point p (vehicle centre x, c = |p - x|, n = (p - x)/c)
+    the commanded velocity must satisfy the discrete barrier condition
+
+        v . n  <=  gain * (c - margin)        (clipped below at -v_rep)
+
+    i.e. the approach speed toward p shrinks linearly to zero at ``margin`` and
+    turns into a retreat of up to ``v_rep`` inside it. A point is only
+    constrained when the predicted next ``horizon`` seconds of straight-line
+    motion (along the command and along the current velocity) pass within
+    ``margin`` of it -- with a weight ramping 0 -> 1 as that predicted miss
+    distance goes from margin to margin - ``soft`` (always 1 once c < margin)
+    so a point entering the gate does not step the command. The worst
+    violation is removed by projection, ``iters`` times; finally the result is
+    rescaled to at most the input speed: the shield NEVER ADDS SPEED.
+    ``margin`` is a centre-to-surface distance: clearance to the airframe is
+    ~margin - 0.2 m (drone_radius)."""
+
+    def __init__(self, margin: float = 0.5, horizon: float = 0.5, gain: float = 2.0,
+                 v_rep: float = 0.5, soft: float = 0.2, iters: int = 3):
+        self.margin, self.horizon, self.gain = float(margin), float(horizon), float(gain)
+        self.v_rep, self.soft, self.iters = float(v_rep), float(soft), int(iters)
+
+    @staticmethod
+    def _seg_dist(d, u):
+        """Distance from points d (relative to the segment start) to the segment 0 -> u."""
+        uu = float(u @ u)
+        if uu < 1e-12:
+            return np.sqrt((d ** 2).sum(1))
+        s = np.clip(d @ u / uu, 0.0, 1.0)
+        return np.sqrt(((d - s[:, None] * u) ** 2).sum(1))
+
+    def apply(self, v, pos, pts, vel=None):
+        """Filter v (local ENU, (3,)). Returns (v_out, info) with info
+        {n: points constrained, dmin: nearest remembered point [m], dv: |v_out - v|}."""
+        v = np.asarray(v, float).reshape(3).copy()
+        info = {"n": 0, "dmin": float("inf"), "dv": 0.0}
+        if pts is None or len(pts) == 0:
+            return v, info
+        x = np.asarray(pos, float).reshape(3)
+        d = pts - x
+        c = np.sqrt((d ** 2).sum(1))
+        info["dmin"] = float(c.min())
+        sp = float(np.linalg.norm(v))
+        vv = np.zeros(3) if vel is None else np.asarray(vel, float).reshape(3)
+        reach = self.margin + self.horizon * max(sp, float(np.linalg.norm(vv))) + 1e-6
+        near = c < reach
+        if not near.any():
+            return v, info
+        d, c = d[near], c[near]
+        dseg = np.minimum(self._seg_dist(d, v * self.horizon),
+                          self._seg_dist(d, vv * self.horizon))
+        w = np.clip((self.margin - dseg) / max(self.soft, 1e-6), 0.0, 1.0)
+        w[c < self.margin] = 1.0
+        act = w > 0
+        if not act.any():
+            return v, info
+        n = d[act] / np.maximum(c[act], 1e-6)[:, None]
+        allow = np.maximum(self.gain * (c[act] - self.margin), -self.v_rep)
+        w = w[act]
+        info["n"] = int(act.sum())
+        v0 = v.copy()
+        for _ in range(max(self.iters, 1)):
+            viol = w * (n @ v - allow)
+            k = int(np.argmax(viol))
+            if viol[k] <= 1e-6:
+                break
+            v = v - viol[k] * n[k]
+        s1 = float(np.linalg.norm(v))
+        if s1 > sp:
+            v = v * (sp / s1) if s1 > 1e-9 else v
+        info["dv"] = float(np.linalg.norm(v - v0))
+        return v, info
+
+
+def yaw_toward(yaw: float, vel, gain: float, v_min: float = 0.5) -> float:
+    """Extra yaw rate turning the camera toward the horizontal velocity
+    (chunk_offboard --yaw-to-vel): gain * wrap(heading(vel) - yaw), 0 below
+    v_min m/s. Swerves put up to 24 deg between yaw and velocity in Isaac."""
+    vx, vy = float(vel[0]), float(vel[1])
+    if gain <= 0 or math.hypot(vx, vy) < v_min:
+        return 0.0
+    e = math.atan2(vy, vx) - float(yaw)
+    return float(gain) * math.atan2(math.sin(e), math.cos(e))
 
 
 class ChunkPolicy:

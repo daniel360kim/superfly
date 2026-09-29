@@ -368,6 +368,97 @@ def test_chunk_head_dwell():
     assert p.select_head(q, 1.2) == (1, "switch")
 
 
+
+# --------------------------------------------------------------------------- #
+# 6b. chunk executor clearance shield (chunk_offboard --shield)
+# --------------------------------------------------------------------------- #
+def _rot(roll, pitch, yaw):
+    cr, sr, cp, sp, cy, sy = (math.cos(roll), math.sin(roll), math.cos(pitch),
+                              math.sin(pitch), math.cos(yaw), math.sin(yaw))
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    return Rz @ Ry @ Rx
+
+
+def _cv2_linear(img, out):
+    """cv2.resize(..., INTER_LINEAR) -- what px4_sim ships to the offboard --
+    in numpy: no antialiasing, 2x2 taps at src = (dst + 0.5) * scale - 0.5.
+    (render_depth.resize_bilinear is PIL's antialiased filter, which smears a
+    silhouette over ~3 output pixels; Isaac's frame mixes ~1.)"""
+    h, w = img.shape
+
+    def taps(n_in, n_out):
+        x = np.clip((np.arange(n_out) + 0.5) * n_in / n_out - 0.5, 0, n_in - 1)
+        i0 = np.floor(x).astype(int)
+        return i0, np.minimum(i0 + 1, n_in - 1), x - i0
+    r0, r1, fr = taps(h, out)
+    c0, c1, fc = taps(w, out)
+    a = img[r0][:, c0] * (1 - fc) + img[r0][:, c1] * fc
+    b = img[r1][:, c0] * (1 - fc) + img[r1][:, c1] * fc
+    return (a * (1 - fr)[:, None] + b * fr[:, None]).astype(np.float32)
+
+
+@pytest.mark.parametrize("yaw,pitch", [(0.0, 0.0), (0.7, 0.0), (-2.0, 0.15)])
+def test_obstacle_memory_backprojects_onto_the_surface(yaw, pitch):
+    """A sphere rendered by the TRAINING renderer (640x480, 91 deg) and resized
+    to 224 the way Isaac ships it, at an arbitrary pose, back-projects onto
+    that sphere (mixed silhouette pixels are dropped, the 3x3 min puts the
+    rest on it); the ground plane is dropped by the z floor."""
+    _, render_depth = _reference()
+    from superfly.policies import chunk
+    c, r = np.array([2.5, 0.8, 1.6]), 0.9
+    pos, R = np.array([0.0, 0.0, 1.8]), _rot(0.0, pitch, yaw)
+    c_w = pos + _rot(0, 0, yaw) @ (c - pos)
+    prims = [dict(kind="sphere", c=list(c_w), r=r)]
+    frame = _cv2_linear(render_depth.render(prims, pos, R, ground=True), 224)
+    mem = chunk.ObstacleMemory(cam_pos=(0.0, 0.0, 0.0), r_max=6.0, voxel=0.0)
+    assert mem.add(1.0, frame, pos, R) > 20
+    assert mem.add(1.05, frame, pos, R) == 0            # same frame object: skipped
+    pts = mem.points(1.05, pos)
+    err = np.abs(np.linalg.norm(pts - c_w, axis=1) - r)
+    assert np.percentile(err, 95) < 0.03 and err.max() < 0.06, (np.percentile(err, 95), err.max())
+    assert (pts[:, 2] > mem.z_floor).all()
+    assert len(mem.points(1.0 + mem.horizon + 0.2, pos)) == 0   # forgotten
+
+
+def test_clearance_shield_side_pass():
+    """Tangential pass along a wall of points 0.45 m to the left, drifting in:
+    the inward component is reversed, forward motion kept, speed never grows;
+    moving away or far from it is untouched."""
+    from superfly.policies import chunk
+    sh = chunk.ClearanceShield(margin=0.5, horizon=0.5, gain=2.0, v_rep=0.5)
+    xs = np.linspace(-1.0, 1.0, 41)
+    pts = np.stack([xs, np.full_like(xs, 0.45), np.zeros_like(xs)], 1)
+    v = np.array([1.5, 0.3, 0.0])
+    out, info = sh.apply(v, np.zeros(3), pts, vel=v)
+    assert info["n"] > 0 and info["dv"] > 0.3
+    assert out[1] < 0 and out[0] > 0.5
+    assert np.linalg.norm(out) <= np.linalg.norm(v) + 1e-9
+    away = np.array([1.5, -0.3, 0.0])
+    out2, info2 = sh.apply(away, np.array([0.0, -0.2, 0.0]), pts - [0, 0, 0], vel=away)
+    assert info2["dv"] == 0.0 and np.allclose(out2, away)
+    out3, info3 = sh.apply(v, np.array([0.0, -3.0, 0.0]), pts, vel=v)
+    assert info3["dv"] == 0.0
+    out4, _ = sh.apply(np.zeros(3), np.zeros(3), pts, vel=np.zeros(3))
+    assert np.allclose(out4, 0.0)                       # never adds speed, even inside
+
+
+def test_clearance_shield_head_on_slows_to_the_barrier():
+    """Head-on at 1 m: the approach speed is capped at gain * (c - margin)."""
+    from superfly.policies import chunk
+    sh = chunk.ClearanceShield(margin=0.5, horizon=0.5, gain=2.0)
+    out, info = sh.apply(np.array([1.5, 0, 0]), np.zeros(3), np.array([[1.0, 0, 0]]))
+    assert out[0] == pytest.approx(1.0)
+
+
+def test_yaw_toward_velocity():
+    from superfly.policies import chunk
+    assert chunk.yaw_toward(0.0, [1.0, 1.0, 0.0], 2.0) == pytest.approx(2.0 * math.pi / 4)
+    assert chunk.yaw_toward(0.0, [0.1, 0.1, 0.0], 2.0) == 0.0
+    assert chunk.yaw_toward(3.0, [-1.0, -0.1, 0.0], 1.0) == pytest.approx(
+        math.atan2(math.sin(math.atan2(-0.1, -1.0) - 3.0), math.cos(math.atan2(-0.1, -1.0) - 3.0)))
+
 # --------------------------------------------------------------------------- #
 # 7. the MPC reference IS sim_episode's fit_cubic / eval_cubic
 # --------------------------------------------------------------------------- #
