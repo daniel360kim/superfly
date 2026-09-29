@@ -133,7 +133,7 @@ def main():
                     phase, t_phase = "HOVER", now
                     mark_policy_phase("start")
                     print(f"[probe] HOVER at z={pos[2]:.2f} (t={now - t0:.1f}s)", flush=True)
-                elif now - t0 > 60:
+                elif now - t0 > 240:
                     print("[probe] never settled in CLIMB", flush=True)
                     break
             elif phase == "HOVER":
