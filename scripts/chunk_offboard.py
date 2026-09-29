@@ -94,6 +94,13 @@ def main():
     ap.add_argument("--mix-heads", action="store_true",
                     help="Ensemble chunks across head switches (sim default off=same-head here).")
     ap.add_argument("--v-cap", type=float, default=3.5)
+    ap.add_argument("--z-min", type=float, default=Z_REF[0],
+                    help="Floor of the executor's z band [m] (python sim --chunk-z-min; default "
+                         "0.5 = sim_episode.Z_REF[0]). The vertical setpoint is limited so the "
+                         "vehicle takes >= 0.5 s to reach it. Isaac 2026-09-29: the recipe-v3 chunk "
+                         "students sink from the 1.9 m handoff to the 0.5 m floor within 2-4 s "
+                         "(python-sim flights: 1.3-2.3 m); all six of their diffphys contacts were "
+                         "at 0.4-0.7 m (bars, box tops/undersides, low spheres). Off = 0.5.")
     ap.add_argument("--kv", type=float, default=3.0,
                     help="PX4 velocity P gain (MPC_XY/Z_VEL_P_ACC) = sim KV_VEL.")
     ap.add_argument("--clock", choices=["wall", "px4"], default="px4",
@@ -126,7 +133,7 @@ def main():
           f"{policy.steps} x {policy.cdt:g} s, lead {policy.lead:g} s, "
           f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "
           f"({'same-head' if policy.same_head else 'mixed'}), v_cap {args.v_cap:g}, "
-          f"forward {policy.forward_ms:.1f} ms", flush=True)
+          f"z floor {args.z_min:g}, forward {policy.forward_ms:.1f} ms", flush=True)
 
     for name, val in (("MPC_XY_VEL_P_ACC", args.kv), ("MPC_Z_VEL_P_ACC", args.kv),
                       ("MPC_XY_VEL_MAX", max(4.0, args.v_cap + 0.5)),
@@ -166,7 +173,7 @@ def main():
     next_dec = -1e9
     policy_t0 = None
     landing_sent = False
-    lo, hi = Z_REF
+    lo, hi = float(args.z_min), Z_REF[1]
     n_dec = 0
     try:
         while True:
