@@ -68,6 +68,78 @@ class FirstOrderQuadraticThrustCurve(QuadraticThrustCurve):
         return out
 
 
+#: Rotor positions of the Starling 2 Max [m], body FLU, |x| / |y| -- ModalAI's
+#: D0012 PX4 params (CA_ROTOR*_PX/PY 0.085 / 0.0625; PX4's FRD y is flipped),
+#: as installed in airstation03's PX4 airframe 10099_starling.
+STARLING_ARM_X = 0.085
+STARLING_ARM_Y = 0.0625
+#: Each Iris rotor is its own rigid body with no authored mass; give it a small
+#: explicit one so the total is the spec's mass, not a PhysX default.
+STARLING_ROTOR_MASS = 0.005
+
+
+def apply_vehicle_overrides(stage, root: str, name: str) -> str | None:
+    """Turn the spawned Iris at `root` into the Starling 2 Max: sys-ID mass,
+    inertia and CoM on the body, the Starling's rotor positions (same Pegasus
+    rotor order and spin directions as the Iris: 0 front-right, 1 back-left,
+    2 front-left, 3 back-right, rot_dir [-1,-1,1,1] -- which is also PX4's
+    quad-x order), rotor rigid bodies at a small explicit mass. Call after the
+    Multirotor is created and before world.reset(). No-op (None) unless the
+    Starling is being built on the Iris frame. Returns a one-line summary."""
+    import os
+    from pxr import Gf, UsdGeom, UsdPhysics
+    if name != "starling2max" or os.environ.get("SUPERFLY_VEHICLE_USD"):
+        return None
+    spec = load_starling_spec()
+    n_rot = 4
+    body = stage.GetPrimAtPath(f"{root}/body")
+    if not body.IsValid():
+        raise RuntimeError(f"{root}/body not found -- not the Pegasus Iris layout")
+    m = UsdPhysics.MassAPI.Apply(body)
+    m.CreateMassAttr().Set(float(spec["mass_kg"]) - n_rot * STARLING_ROTOR_MASS)
+    I = spec["inertia_flu"]
+    m.CreateDiagonalInertiaAttr().Set(Gf.Vec3f(float(I["ixx_roll"]), float(I["iyy_pitch"]),
+                                               float(I["izz_yaw"])))
+    m.CreateCenterOfMassAttr().Set(Gf.Vec3f(*[float(v) for v in spec["com_offset_flu_m"]]))
+    m.CreatePrincipalAxesAttr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    # Iris order: 0 front-right, 1 back-left, 2 front-left, 3 back-right
+    signs = [(1, -1), (-1, 1), (1, 1), (-1, -1)]
+    moved = []
+    for i, (sx, sy) in enumerate(signs):
+        rotor = stage.GetPrimAtPath(f"{root}/rotor{i}")
+        joint = stage.GetPrimAtPath(f"{root}/rotor{i}/joint{i}")
+        if not rotor.IsValid() or not joint.IsValid():
+            raise RuntimeError(f"{root}/rotor{i} or its joint not found")
+        x, y = sx * STARLING_ARM_X, sy * STARLING_ARM_Y
+        xf = UsdGeom.Xformable(rotor)
+        ops = [op for op in xf.GetOrderedXformOps()
+               if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+        z = 0.023
+        if ops:
+            old = ops[0].Get()
+            z = float(old[2]) if old is not None else z
+            ops[0].Set(type(old)(x, y, z) if old is not None else Gf.Vec3d(x, y, z))
+        else:
+            xf.AddTranslateOp().Set(Gf.Vec3d(x, y, z))
+        # The joint's body0 frame is the Iris body mesh, rotated -90 deg about
+        # z against the body (localPos0 = (y, -x, z), read off the stock USD).
+        j = UsdPhysics.Joint(joint)
+        j.GetLocalPos0Attr().Set(Gf.Vec3f(y, -x, z))
+        # The Iris props (~0.12 m radius) overlap at the Starling's 0.125 m
+        # rotor spacing; as colliders they would push each other apart.
+        from pxr import Usd
+        for c in Usd.PrimRange(rotor):
+            if c.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI(c).CreateCollisionEnabledAttr().Set(False)
+        rm = UsdPhysics.MassAPI.Apply(rotor)
+        rm.CreateMassAttr().Set(STARLING_ROTOR_MASS)
+        rm.CreateDiagonalInertiaAttr().Set(Gf.Vec3f(1e-6, 1e-6, 2e-6))
+        moved.append(f"r{i}({x:+.3f},{y:+.4f})")
+    return (f"Starling overrides on {root}: body m={spec['mass_kg'] - n_rot * STARLING_ROTOR_MASS:.3f} "
+            f"+ 4 x {STARLING_ROTOR_MASS} kg rotors, I={tuple(I.values())}, "
+            f"rotors {' '.join(moved)}")
+
+
 def load_starling_spec() -> dict:
     return yaml.safe_load(STARLING_SPEC.read_text())
 
@@ -120,8 +192,22 @@ def vehicle_usd_and_curve(name: str):
             tau_up=float(spec["rotor"]["time_constant_up_s"]),
             tau_down=float(spec["rotor"]["time_constant_down_s"]),
         )
-        usd = os.environ.get("SUPERFLY_VEHICLE_USD", STARLING_USD)
-        label = (f"Starling 2 Max (m=0.557 kg, kT={k_t:g}, "
+        usd = os.environ.get("SUPERFLY_VEHICLE_USD", "")
+        if usd:
+            label = (f"Starling 2 Max from {usd} (kT={k_t:g}, "
+                     f"w_max={w_max:g} rad/s, tau 55/85 ms)")
+            return usd, curve, label
+        # Default: the sys-ID body on the Pegasus Iris frame (see
+        # apply_vehicle_overrides). The lab USD lives on Nucleus, whose login
+        # on airstation03 has expired (ATTEMPTS 2026-08) and which OSMO cannot
+        # reach at all -- a headless Kit then blocks on a browser login and the
+        # vehicle never spawns (observed 2026-09-29: PX4 waits for a heartbeat
+        # forever). SUPERFLY_VEHICLE_USD=<STARLING_USD> restores the lab USD
+        # once auth works.
+        spec = load_starling_spec()
+        label = (f"Starling 2 Max sys-ID on the Iris frame (m={spec['mass_kg']} kg, "
+                 f"I={[round(v, 5) for v in spec['inertia_flu'].values()]}, arms "
+                 f"+-{STARLING_ARM_X}/+-{STARLING_ARM_Y} m, kT={k_t:g}, "
                  f"w_max={w_max:g} rad/s, tau 55/85 ms)")
-        return usd, curve, label
+        return ROBOTS["Iris"], curve, label
     raise ValueError(f"unknown vehicle {name!r}")

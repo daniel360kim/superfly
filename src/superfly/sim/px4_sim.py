@@ -70,7 +70,8 @@ from pegasus.simulator.logic.graphical_sensors.monocular_camera import Monocular
 from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
-from superfly.sim.vehicles import vehicle_usd_and_curve, vehicle_backend_overrides
+from superfly.sim.vehicles import (vehicle_usd_and_curve, vehicle_backend_overrides,
+                                   apply_vehicle_overrides)
 from superfly.sim import scene_setup
 
 import sys
@@ -494,6 +495,11 @@ class PegasusApp:
             Rotation.from_euler("XYZ", [0.0, 0.0, self.SPAWN_YAW_DEG], degrees=True).as_quat(),
             config=config_multirotor,
         )
+        # --vehicle starling2max without the (Nucleus) lab USD: the sys-ID body
+        # is applied to the spawned Iris here, before physics starts.
+        _ovr = apply_vehicle_overrides(self.world.stage, "/World/quadrotor", vehicle)
+        if _ovr:
+            print(f"[vehicle] {_ovr}", flush=True)
 
         self.world.reset()
         self._depth_pub = DepthPublisher()
