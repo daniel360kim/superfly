@@ -88,6 +88,8 @@ def main():
                 state.update_from_local_position(msg)
             elif ty == "HEARTBEAT" and msg.get_srcSystem() != 255:
                 state.update_from_heartbeat(msg)
+            elif ty == "STATUSTEXT" and msg.severity <= 4:
+                print(f"[px4 statustext sev={msg.severity}] {msg.text}", flush=True)
             elif ty == "ATTITUDE_TARGET":
                 with lock:
                     thr["t"], thr["thrust"] = time.time(), float(msg.thrust)

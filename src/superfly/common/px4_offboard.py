@@ -313,3 +313,8 @@ def receive_loop(mav, state: DroneState, stop_event: threading.Event):
             state.update_from_local_position(msg)
         elif msg_type == "HEARTBEAT" and msg.get_srcSystem() != 255:
             state.update_from_heartbeat(msg)
+        elif msg_type == "STATUSTEXT" and msg.severity <= 4:
+            # PX4 says WHY it refuses to arm / fails over only here (the SITL
+            # log just shows "notify negative"): observed 2026-09-29 on a
+            # loaded airstation03, offboard=True armed=False for 2 minutes.
+            print(f"[px4 statustext sev={msg.severity}] {msg.text}", flush=True)
