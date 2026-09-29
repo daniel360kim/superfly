@@ -907,7 +907,7 @@ def run_trial(method, cfg, args, scenario):
             off = subprocess.Popen(off_cmd, cwd=str(_SCRIPTS), stdout=off_log,
                                    stderr=subprocess.STDOUT,
                                    env=dict(off_env, PYTHONUNBUFFERED="1"))
-        wait_offboard_phased(off, args, scenario)
+        wait_offboard_phased(off, args, scenario, sim)
         # Ensure the sim's --auto-stop trips even if offboard was killed (its
         # own on-exit sentinel write only runs on a clean/Ctrl-C exit).
         Path(done_file).write_text(str(time.time()))
@@ -1020,7 +1020,7 @@ def _kill_offboard(off, reason):
         off.kill()
 
 
-def wait_offboard_phased(off, args, scenario):
+def wait_offboard_phased(off, args, scenario, sim=None):
     """Wait for the offboard process to exit, budgeting each flight phase
     separately via POLICY_PHASE_FILE: pre_policy_timeout covers heartbeat/
     arm/climb/yaw (before "start"), timeout covers ONLY the policy flight
@@ -1033,6 +1033,14 @@ def wait_offboard_phased(off, args, scenario):
     landing = scenario["landing_timeout"] or args.landing_timeout
     launched = time.time()
     while off.poll() is None:
+        if sim is not None and sim.poll() is not None:
+            # the sim only ever exits on its own after the done-file; dying
+            # first (Kit abort, OOM kill) freezes PX4's lockstep clock and
+            # would leave the offboard waiting out a 2400 s phase budget
+            # (2026-09-29: two Kits aborted when Isaac's caches were deleted
+            # under them mid-flight)
+            _kill_offboard(off, f"sim exited (code {sim.returncode}) before the offboard")
+            return
         t_start, t_end = _read_policy_phase()
         now = time.time()
         if t_start is None:
