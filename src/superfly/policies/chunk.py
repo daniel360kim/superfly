@@ -7,7 +7,7 @@ velocity loop (chunk_offboard.py).
 
 Contract (agile_student/INPUTS.md, "Velocity chunk"):
   in   depth (1,1,224,224,3) mm/80 clipped at 20 m, tiled   -- as the student
-       imu   (1,1,22) [pos, R row-major, v_body, R^T omega_body, goal_body
+       imu   (1,1,22) [pos, R row-major, v_body, omega_body, goal_body
              (clamped 10 m), v_goal]                          -- as the student
        prev_chunk (1,60) the chunk executed from at the previous decision,
              re-expressed in the CURRENT heading frame, zeros if none
@@ -89,7 +89,7 @@ def encode_depth(depth_m) -> np.ndarray:
 
 def encode_state(pos, R, vel, omega_body, goal, goal_speed) -> np.ndarray:
     """The student's 22-dim state, byte-for-byte AgilePolicy.
-    _student_state_to_model_input (see there for why omega gets R^T)."""
+    _student_state_to_model_input: omega_body goes in unrotated, like training."""
     R = np.asarray(R, np.float64)
     g = R.T @ (np.asarray(goal, np.float64) - np.asarray(pos, np.float64))
     n = float(np.linalg.norm(g))
@@ -97,7 +97,7 @@ def encode_state(pos, R, vel, omega_body, goal, goal_speed) -> np.ndarray:
         g = g * (min(n, GOAL_CLAMP_M) / n)
     v = np.concatenate([np.asarray(pos, np.float64).reshape(3), R.reshape(-1),
                         R.T @ np.asarray(vel, np.float64).reshape(3),
-                        R.T @ np.asarray(omega_body, np.float64).reshape(3),
+                        np.asarray(omega_body, np.float64).reshape(3),
                         g, [float(goal_speed)]])
     return v.astype(np.float32)[None, None]
 

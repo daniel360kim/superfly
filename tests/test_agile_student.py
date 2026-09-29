@@ -84,13 +84,14 @@ def test_student_state_encoder_matches_reference(seed):
 
     # omega_body is what BOTH sides are handed: MAVLink gives a body rate, and
     # sim_episode.run_episode's Obs.omega is already a body rate (integrated
-    # from dR = R.T @ R_new). The reference then applies R.T to it anyway, so
-    # the same body rate goes in unrotated on both sides of this comparison --
-    # no rotation is applied to the test input to make them agree.
+    # from dR = R.T @ R_new). Training feeds it unrotated, so slots 15:18 must
+    # be omega_body itself; the reference checkout may predate the 2026-09-29
+    # fix of its R.T double rotation, so those slots are pinned explicitly.
     omega_body = omega_world
     obs = sim_episode.Obs(t=0.0, p=pos, v=vel, R=R, omega=omega_body,
                           goal_p=goal, goal_speed=goal_speed, depth=None)
-    expected = sim_episode.OnnxPolicy.encode_state(obs)     # (1, 1, 22)
+    expected = sim_episode.OnnxPolicy.encode_state(obs).copy()     # (1, 1, 22)
+    expected[0, 0, 15:18] = omega_body
 
     got = _NoNet(goal_speed)._student_state_to_model_input(
         pos, R, vel, omega_body, goal)
@@ -331,18 +332,22 @@ def test_student_plan_is_not_velocity_rescaled(stub_mpc):
         np.testing.assert_array_equal(policy._scale_body_plan(plan), plan)
 
 
-def test_omega_channel_is_rotated_like_the_reference():
-    """Guard against silently reverting to feeding omega_body raw: the two
-    conventions differ (the whole point of finding 4), so the test must fail if
-    the R.T is dropped."""
+def test_omega_channel_is_the_body_rate_unrotated():
+    """Training (agile_student data_loader) reads odometry.csv's body rate
+    unrotated, so the harness must feed the FLU body rate as is. Guards against
+    reintroducing the R.T double rotation (fixed 2026-09-29), in both the
+    agile student encoder and the chunk encoder."""
     from scipy.spatial.transform import Rotation
+    from superfly.policies import chunk
     R = Rotation.from_euler("xyz", [0.3, -0.25, -2.0]).as_matrix()
     omega_body = np.array([0.4, -0.2, 0.7])
+    assert not np.allclose(R.T @ omega_body, omega_body, atol=1e-3), \
+        "R.T must actually change this vector, or the test proves nothing"
     v = _NoNet(0.0)._student_state_to_model_input(
         np.zeros(3), R, np.zeros(3), omega_body, np.array([5.0, 0.0, 0.0]))[0, 0]
-    np.testing.assert_allclose(v[15:18], R.T @ omega_body, atol=1e-6)
-    assert not np.allclose(v[15:18], omega_body, atol=1e-3), \
-        "R.T must actually change this vector, or the test proves nothing"
+    np.testing.assert_allclose(v[15:18], omega_body, atol=1e-6)
+    c = chunk.encode_state(np.zeros(3), R, np.zeros(3), omega_body, np.array([5.0, 0.0, 0.0]), 0.0)[0, 0]
+    np.testing.assert_allclose(c, v, atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #

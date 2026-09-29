@@ -566,17 +566,13 @@ class AgilePolicy:
             np.asarray(pos_enu, np.float64).reshape(3),
             R_enu.reshape(-1),
             R_enu.T @ np.asarray(vel_enu, np.float64).reshape(3),
-            # R^T omega, NOT omega. The evaluation harness's Obs.omega is
-            # ALREADY a body rate (sim_episode.run_episode integrates it from
-            # dR = R^T R_new) and encode_state then applies R^T again, so what
-            # the student was scored with is R^T omega_body. Physically odd, but
-            # it is also harmless: the TRAINING data's omega column is drawn
-            # noise, not a measured rate (draw_states.synthesize_attitude:
-            # omega = rng.normal(0, 0.3, 3), independent of R) and the loader
-            # passes it through unrotated (data_loader rotates velocity only),
-            # so the net learned nothing frame-dependent from this channel.
-            # Matching test-5 is therefore the only tie-break, and this is it.
-            R_enu.T @ np.asarray(angular_body, np.float64).reshape(3),
+            # omega_body (FLU) UNROTATED, as training sees it: the writer puts
+            # the state's body rate in odometry.csv and agile_student's
+            # data_loader passes it through (it rotates velocity only).
+            # angular_body is already FLU body (Px4State: FRD -> (x, -y, -z)).
+            # Until 2026-09-29 this fed R^T omega_body to mirror a double
+            # rotation in sim_episode.OnnxPolicy.encode_state; both are fixed.
+            np.asarray(angular_body, np.float64).reshape(3),
             g,
             [self.goal_speed],
         ]).astype(np.float32)
