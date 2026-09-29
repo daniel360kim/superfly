@@ -819,6 +819,29 @@ def run_trial(method, cfg, args, scenario):
     inst = getattr(args, "instance", None)
     stop_stale_sims(inst)
 
+    # Parallel campaigns boot ONE Kit at a time: concurrent boots contend for
+    # the RTX pipeline (RtPso) compile -- measured 2026-09-29, 3 simultaneous
+    # boots: one sat 135 s in "Waiting for RtPso async group async
+    # compilation" while a flying sibling fell to 0.28 x real time. Held from
+    # the PX4 restart until the sim has stepped (or --warmup ran out).
+    boot_f = None
+    if inst is not None:
+        import fcntl
+        boot_f = open(f"/tmp/superfly_isaac_boot_{os.getuid()}.lock", "w")
+        try:
+            fcntl.flock(boot_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("  [boot] another slot's Isaac is booting; waiting for it ...", flush=True)
+            t_b = time.time()
+            fcntl.flock(boot_f, fcntl.LOCK_EX)
+            print(f"  [boot] waited {time.time() - t_b:.0f}s", flush=True)
+
+    def _boot_done():
+        nonlocal boot_f
+        if boot_f is not None:
+            boot_f.close()          # releases the flock
+            boot_f = None
+
     if not args.no_px4_manage:
         restart_px4(Path(args.px4_dir), PX4_MODEL, PX4_BOOT_TIMEOUT,
                    results / "px4_sitl.log", inst)
@@ -831,6 +854,7 @@ def run_trial(method, cfg, args, scenario):
     Path(sentinels.policy_phase_file()).unlink(missing_ok=True)
     Path(ready_file).unlink(missing_ok=True)
     sim = subprocess.Popen(sim_cmd, cwd=str(_SCRIPTS))
+    t_launch = time.time()
     off = None
     off_log = None
     try:
@@ -843,11 +867,20 @@ def run_trial(method, cfg, args, scenario):
                   f"steps (at most {args.warmup:.0f}s) ...")
             t_ready = _wait_file_or_die(sim, ready_file, args.warmup,
                                         "sim exited during warmup")
+            _boot_done()
             if t_ready is None:
                 print(f"  [warmup] no ready file after {args.warmup:.0f}s; launching anyway")
             else:
                 print(f"  [warmup] sim stepping after {t_ready:.1f}s")
                 _sleep_or_die(sim, args.ready_settle, "sim exited during warmup")
+        elif inst is not None:
+            # parallel without --fast-start: the fixed warmup, but the boot
+            # lock only until the sim steps
+            _wait_file_or_die(sim, ready_file, args.warmup, "sim exited during warmup")
+            _boot_done()
+            print(f"  [warmup] giving Isaac {args.warmup:.0f}s to boot before offboard ...")
+            _sleep_or_die(sim, max(0.0, args.warmup - (time.time() - t_launch)),
+                          "sim exited during warmup")
         else:
             print(f"  [warmup] giving Isaac {args.warmup:.0f}s to boot before offboard ...")
             _sleep_or_die(sim, args.warmup, "sim exited during warmup")
@@ -884,6 +917,7 @@ def run_trial(method, cfg, args, scenario):
             print("  [cleanup] sim still running after grace; terminating.")
             sim.terminate()
     finally:
+        _boot_done()
         # Reap BOTH children -- a leaked offboard keeps its MAVLink UDP port
         # bound and poisons the next trial with 'Errno 98 Address in use'.
         for p in (sim, off):
@@ -1324,6 +1358,9 @@ def main():
             # children (sim, offboard) inherit the instance: sentinels, UDP
             # ports and the acados build dirs follow it
             os.environ["SUPERFLY_INSTANCE"] = str(args.instance)
+            # Kit starts isaacsim.ros2.bridge: keep concurrent instances' DDS
+            # discovery apart (nothing here publishes on ROS)
+            os.environ.setdefault("ROS_DOMAIN_ID", str(60 + args.instance))
             for var, default in (("AGILE_MPC_CODE_EXPORT_DIR", "/tmp/acados_agile_c_generated_code"),
                                  ("AGILE_MPC_JSON", "/tmp/acados_quad_agile_upstream.json")):
                 base = os.environ.get(var, default)
