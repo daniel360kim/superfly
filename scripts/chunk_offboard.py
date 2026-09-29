@@ -18,6 +18,13 @@ setpoint is limited so the vehicle takes >= 0.5 s to reach either bound of
 the student's z band (sim_episode.velocity_setpoint); yaw rate clipped to
 +-2 rad/s (YAW_RATE_MAX).
 
+--smooth (off by default; without it the above is unchanged): the command is
+not streamed as a bare velocity step but drives SmoothRef -- the sim's own
+plant (a' = (kv (v_cmd - v) - a) / 0.1) with a jerk and an accel limit -- and
+PX4 gets that plant's velocity AND acceleration (feedforward) at 60 Hz, the
+yaw-rate command low-passed and rate-limited. Position stays masked (a
+position setpoint would fight the z band / altitude logic).
+
 Phases as agile_offboard: CLIMB (position hold) -> YAW (face goal) -> POLICY
 -> LANDING when within --goal-radius horizontally.
 """
@@ -44,7 +51,7 @@ from superfly.common.px4_offboard import (
     send_land_command, send_heartbeat, set_param_float, receive_loop, make_clock,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
-from superfly.policies.chunk import ChunkPolicy
+from superfly.policies.chunk import ChunkPolicy, SmoothRef
 
 CONTROL_HZ = 60.0          # a multiple of DECISION_HZ: exactly every 4th tick decides
 DECISION_HZ = 15.0          # sim_episode.DECISION_HZ
@@ -67,6 +74,23 @@ def send_velocity_yawrate_ned(mav, vx_n, vy_e, vz_d, yaw_rate_ned):
         0.0, 0.0, 0.0,
         float(vx_n), float(vy_e), float(vz_d),
         0.0, 0.0, 0.0,
+        0.0, float(yaw_rate_ned))
+
+
+def send_velocity_accel_yawrate_ned(mav, v_ned, a_ned, yaw_rate_ned):
+    """Velocity + acceleration feedforward + yaw-RATE setpoint (--smooth):
+    position and yaw masked. PX4's velocity controller adds the acceleration
+    to its own P/I output (PositionControl: acc_sp = ff + vel loop)."""
+    IGNORE_POS = 1 | 2 | 4
+    IGNORE_YAW = 1024
+    mav.mav.set_position_target_local_ned_send(
+        int(time.time() * 1000) & 0xFFFFFFFF,
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        IGNORE_POS | IGNORE_YAW,
+        0.0, 0.0, 0.0,
+        float(v_ned[0]), float(v_ned[1]), float(v_ned[2]),
+        float(a_ned[0]), float(a_ned[1]), float(a_ned[2]),
         0.0, float(yaw_rate_ned))
 
 
@@ -101,6 +125,21 @@ def main():
                          "students sink from the 1.9 m handoff to the 0.5 m floor within 2-4 s "
                          "(python-sim flights: 1.3-2.3 m); all six of their diffphys contacts were "
                          "at 0.4-0.7 m (bars, box tops/undersides, low spheres). Off = 0.5.")
+    ap.add_argument("--smooth", action="store_true",
+                    help="Smooth executor (off = the velocity-step path, unchanged): the ensembled "
+                         "command drives the python sim's plant (a' = (kv (v_cmd - v) - a) / 0.1) "
+                         "with a jerk and an accel limit, and PX4 gets that plant's velocity AND "
+                         "acceleration (feedforward); the yaw-rate command is low-passed and "
+                         "rate-limited (superfly.policies.chunk.SmoothRef; sim --chunk-smooth).")
+    ap.add_argument("--smooth-jerk", type=float, default=8.0, help="--smooth jerk limit [m/s^3].")
+    ap.add_argument("--smooth-acc", type=float, default=4.0, help="--smooth accel limit [m/s^2].")
+    ap.add_argument("--smooth-yaw-tau", type=float, default=0.25,
+                    help="--smooth yaw-rate low-pass time constant [s].")
+    ap.add_argument("--smooth-yaw-acc", type=float, default=4.0,
+                    help="--smooth yaw acceleration limit [rad/s^2].")
+    ap.add_argument("--smooth-ff", action="store_true",
+                    help="--smooth: add the chunk's own slope to the plant's accel target "
+                         "(sim --chunk-feedforward; off as there).")
     ap.add_argument("--kv", type=float, default=3.0,
                     help="PX4 velocity P gain (MPC_XY/Z_VEL_P_ACC) = sim KV_VEL.")
     ap.add_argument("--clock", choices=["wall", "px4"], default="px4",
@@ -134,6 +173,13 @@ def main():
           f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "
           f"({'same-head' if policy.same_head else 'mixed'}), v_cap {args.v_cap:g}, "
           f"z floor {args.z_min:g}, forward {policy.forward_ms:.1f} ms", flush=True)
+    smooth = None
+    if args.smooth:
+        smooth = SmoothRef(kv=args.kv, jerk=args.smooth_jerk, acc_max=args.smooth_acc,
+                           yaw_tau=args.smooth_yaw_tau, yaw_acc=args.smooth_yaw_acc)
+        print(f"[chunk] SMOOTH executor: jerk {args.smooth_jerk:g} m/s^3, acc {args.smooth_acc:g} "
+              f"m/s^2, yaw tau {args.smooth_yaw_tau:g} s, yaw acc {args.smooth_yaw_acc:g} rad/s^2, "
+              f"chunk slope ff {'on' if args.smooth_ff else 'off'}; PX4 gets velocity + accel", flush=True)
 
     for name, val in (("MPC_XY_VEL_P_ACC", args.kv), ("MPC_Z_VEL_P_ACC", args.kv),
                       ("MPC_XY_VEL_MAX", max(4.0, args.v_cap + 0.5)),
@@ -161,7 +207,9 @@ def main():
     if sl:
         dec_log = open(Path(sl).with_name("chunk_decisions.csv"), "w")
         dec_log.write("t,x,y,z,vx,vy,vz,yaw,head,reason,p0,p1,p2,p3,p4,"
-                      "cmd_vx,cmd_vy,cmd_vz,cmd_yr,n_ens\n")
+                      "cmd_vx,cmd_vy,cmd_vz,cmd_yr,n_ens"
+                      + (",tgt_vx,tgt_vy,tgt_vz,tgt_yr,cmd_ax,cmd_ay,cmd_az" if smooth else "")
+                      + "\n")
 
     dt = 1.0 / CONTROL_HZ
     phase = "CLIMB"
@@ -175,6 +223,7 @@ def main():
     landing_sent = False
     lo, hi = float(args.z_min), Z_REF[1]
     n_dec = 0
+    t_prev = None
     try:
         while True:
             now = clock()
@@ -207,6 +256,9 @@ def main():
                     next_dec = now
                     mark_policy_phase("start")
                     policy.reset()
+                    if smooth is not None:
+                        smooth.reset(vel)
+                    t_prev = now
                     hi = max(Z_REF[1], float(pos[2]) + Z_HEADROOM)
                     print(f">>> HANDOFF to the chunk policy at z={pos[2]:.2f} "
                           f"(z band {lo:.1f}-{hi:.1f} m)", flush=True)
@@ -228,14 +280,34 @@ def main():
                 vz_hi = (hi - pos[2]) / Z_SOFT_T
                 v[2] = min(max(v[2], min(vz_lo, 0.0)), max(vz_hi, 0.0))
                 yr = float(np.clip(yr, -YAW_RATE_MAX, YAW_RATE_MAX))
-                # ENU (x E, y N, z U) -> NED; ENU yaw rate (CCW about up) -> NED -yr
-                send_velocity_yawrate_ned(mav, v[1], v[0], -v[2], -yr)
+                if smooth is None:
+                    # ENU (x E, y N, z U) -> NED; ENU yaw rate (CCW about up) -> NED -yr
+                    send_velocity_yawrate_ned(mav, v[1], v[0], -v[2], -yr)
+                else:
+                    v_tgt, yr_tgt = v.copy(), yr
+                    a_ff = policy.command_acc(now) if args.smooth_ff else None
+                    v, a, yr = smooth.step(v_tgt, yr_tgt, min(max(now - t_prev, 0.0), 0.1), a_ff)
+                    # the z band again on the smoothed setpoint; no vertical
+                    # feedforward pushing further out of it
+                    vz = min(max(v[2], min(vz_lo, 0.0)), max(vz_hi, 0.0))
+                    if vz != v[2]:
+                        floor_bit = v[2] < vz
+                        v[2] = vz
+                        smooth.v[2] = vz
+                        if (a[2] < 0) if floor_bit else (a[2] > 0):
+                            a[2] = 0.0
+                            smooth.a[2] = 0.0
+                    send_velocity_accel_yawrate_ned(mav, (v[1], v[0], -v[2]),
+                                                    (a[1], a[0], -a[2]), -yr)
+                t_prev = now
                 if dec_log is not None and last_dec == now:
                     p = policy.last["probs"]
                     dec_log.write(",".join(f"{x:.4f}" for x in (
                         now - t0, *pos, *vel, yaw)) + f",{policy.last['head']},"
                         f"{policy.last['reason']}," + ",".join(f"{x:.3f}" for x in p)
-                        + "," + ",".join(f"{x:.3f}" for x in (*v, yr)) + f",{n_used}\n")
+                        + "," + ",".join(f"{x:.3f}" for x in (*v, yr)) + f",{n_used}"
+                        + ("," + ",".join(f"{x:.3f}" for x in (*v_tgt, yr_tgt, *a))
+                           if smooth is not None else "") + "\n")
                 dist = float(np.linalg.norm((goal - pos)[:2]))
                 if verbose:
                     print(f"[POLICY t={now - t0:.1f}] pos={pos.round(2)} |v|={np.linalg.norm(vel):.2f} "

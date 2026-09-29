@@ -28,6 +28,10 @@ Executor (per decision, 15 Hz):
   * command(t) = 0.5^age-weighted mean over ring chunks whose horizon still
     covers t of each chunk's velocity at tau + lead (linear between steps;
     tau = t - issue time) and its yaw rate on the step containing tau.
+  * optional smooth execution (SmoothRef, chunk_offboard --smooth, off by
+    default): the command is integrated through the sim's plant with jerk /
+    accel limits and sent as velocity + acceleration feedforward, yaw rate
+    low-passed.
 Dependency-light: numpy + onnxruntime.
 """
 
@@ -102,6 +106,63 @@ def encode_state(pos, R, vel, omega_body, goal, goal_speed) -> np.ndarray:
                         np.asarray(omega_body, np.float64).reshape(3),
                         g, [float(goal_speed)]])
     return v.astype(np.float32)[None, None]
+
+
+class SmoothRef:
+    """Smooth executor (chunk_offboard --smooth; python sim --chunk-smooth): the
+    ensembled chunk command is not sent to PX4 as a bare velocity step every
+    1/15 s but integrated through the python sim's own velocity-setpoint plant
+
+        a' = (KV (v_cmd - v_ref) - a) / LAG     (sim_episode KV_VEL 3, LAG 0.1)
+        v_ref' = a
+
+    with a jerk limit on a' (|a'| <= jerk) and an acceleration limit
+    (|a| <= acc_max); PX4 then gets v_ref AND a as velocity setpoint + accel
+    feedforward, so it follows the trajectory the sim's point mass would fly
+    instead of reacting to each decision's step. ``a_ff`` (optional) adds the
+    chunk's own slope to the plant's acceleration target (the sim's
+    --chunk-feedforward; off by default there too). The yaw-rate command goes
+    through a first-order low-pass (``yaw_tau``) and a yaw-acceleration limit
+    (``yaw_acc``): the network's yaw rate scatters 0.2-0.4 rad/s between
+    decisions (Isaac 2026-09-29), which is what shakes the onboard video."""
+
+    def __init__(self, kv: float = 3.0, lag: float = 0.1, jerk: float = 8.0,
+                 acc_max: float = 4.0, yaw_tau: float = 0.25, yaw_acc: float = 4.0):
+        self.kv, self.lag = float(kv), float(lag)
+        self.jerk, self.acc_max = float(jerk), float(acc_max)
+        self.yaw_tau, self.yaw_acc = float(yaw_tau), float(yaw_acc)
+        self.reset(np.zeros(3))
+
+    def reset(self, v0, a0=None, yr0: float = 0.0):
+        self.v = np.asarray(v0, float).reshape(3).copy()
+        self.a = np.zeros(3) if a0 is None else np.asarray(a0, float).reshape(3).copy()
+        self.yr = float(yr0)
+
+    @staticmethod
+    def _clip_norm(x, m):
+        n = float(np.linalg.norm(x))
+        return x * (m / n) if (m > 0 and n > m) else x
+
+    def step(self, v_cmd, yr_cmd: float, dt: float, a_ff=None):
+        """Advance by dt toward (v_cmd, yr_cmd). Returns (v_ref, a_ref, yr_ref)."""
+        dt = float(dt)
+        if dt <= 0:
+            return self.v.copy(), self.a.copy(), self.yr
+        a_tgt = self.kv * (np.asarray(v_cmd, float) - self.v)
+        if a_ff is not None:
+            a_tgt = a_tgt + np.asarray(a_ff, float)
+        a_tgt = self._clip_norm(a_tgt, self.acc_max)
+        da = (a_tgt - self.a) * min(dt / self.lag, 1.0) if self.lag > 0 else a_tgt - self.a
+        da = self._clip_norm(da, self.jerk * dt)
+        self.a = self._clip_norm(self.a + da, self.acc_max)
+        self.v = self.v + self.a * dt
+        # yaw rate: low-pass, then a yaw-acceleration limit
+        tgt = self.yr + (float(yr_cmd) - self.yr) * (1.0 - math.exp(-dt / self.yaw_tau)
+                                                     if self.yaw_tau > 0 else 1.0)
+        dyr = tgt - self.yr
+        lim = self.yaw_acc * dt if self.yaw_acc > 0 else abs(dyr)
+        self.yr = self.yr + max(-lim, min(lim, dyr))
+        return self.v.copy(), self.a.copy(), self.yr
 
 
 class ChunkPolicy:
@@ -256,3 +317,22 @@ class ChunkPolicy:
             return np.zeros(3), 0.0, 0
         w = np.asarray(ws) / np.sum(ws)
         return (w[:, None] * np.asarray(vs)).sum(0), float(w @ np.asarray(ys)), len(ws)
+
+    def command_acc(self, t):
+        """d/dt of command()'s velocity at t (sim OnnxChunkPolicy.command_acc):
+        same weights, each chunk's slope on the step it is interpolated on."""
+        acc, ws = [], []
+        T = self.cdt * self.steps
+        for age, e in enumerate(self.ring):
+            s = t - e["t"] + self.lead
+            if s > T + 1e-9:
+                continue
+            x = np.clip(s / self.cdt, 1.0, float(self.steps)) - 1.0
+            i0 = int(math.floor(x))
+            i1 = min(i0 + 1, self.steps - 1)
+            acc.append((e["v"][i1] - e["v"][i0]) / self.cdt if i1 > i0 else np.zeros(3))
+            ws.append(self.decay ** age)
+        if not ws:
+            return np.zeros(3)
+        w = np.asarray(ws) / np.sum(ws)
+        return (w[:, None] * np.asarray(acc)).sum(0)
