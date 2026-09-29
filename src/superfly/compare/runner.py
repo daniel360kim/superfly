@@ -1052,6 +1052,25 @@ def main():
         raise SystemExit(f"--px4-dir {args.px4_dir} not found -- pass --px4-dir or "
                          f"set $PX4_DIR, or use --no-px4-manage to manage PX4 yourself.")
 
+    # One Isaac campaign per account at a time. Every trial starts with
+    # stop_stale_sims(), which kills ALL of this user's run_px4_sim.py /
+    # *_offboard.py processes -- including another campaign's live trial
+    # (2026-09-29: a t6_iter isaac stage started mid-trial and silently killed
+    # a Starling eval's sim + offboard; no traj.npz, no error). Serialize on a
+    # per-user lock instead; flock is released when the process dies.
+    lock_f = None
+    if not args.dry_run:
+        import fcntl
+        lock_path = f"/tmp/superfly_isaac_campaign_{os.getuid()}.lock"
+        lock_f = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"[lock] another Isaac campaign holds {lock_path}; waiting for it ...",
+                  flush=True)
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            print("[lock] acquired", flush=True)
+
     registry = method_registry()
     ran_any = False
 
