@@ -531,6 +531,21 @@ class PegasusApp:
         if _ovr not in (None, ""):
             print(f"[camera] pitch_deg {cam['pitch_deg']} -> {float(_ovr)} (SUPERFLY_CAM_PITCH_DEG)")
             cam["pitch_deg"] = float(_ovr)
+        # SUPERFLY_CAM_NEAR (metres) sets the depth camera's NEAR clipping plane
+        # (far kept, Pegasus default 100 m). Found 2026-09-29: with the default
+        # 0.05 m the vehicle's own rotor blades (the iris-derived airframe; the
+        # camera sits 0.10 m ahead of the body origin, behind the rotor disc
+        # front) show as two rotating blade silhouettes at <= 0.3 m in the upper
+        # half of the agile frame (in flight: median 5 %, p90 10 % of the whole
+        # frame; chunk students duck from it -- 'under' picks and 3-9 head
+        # switches/s vs 0.5 in the python sim). The training renderer has no airframe and the
+        # student clips inverse depth at 0.3 m, so 0.3 hides exactly what it
+        # could never have seen. Unset = unchanged.
+        _near = os.environ.get("SUPERFLY_CAM_NEAR")
+        if _near not in (None, ""):
+            far_clip = cam["clipping"][1] if cam["clipping"] is not None else 100.0
+            print(f"[camera] clipping {cam['clipping']} -> ({float(_near)}, {far_clip}) (SUPERFLY_CAM_NEAR)")
+            cam["clipping"] = (float(_near), float(far_clip))
         w, h = cam["resolution"]
         config = {
             "depth": True,
