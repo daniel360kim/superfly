@@ -51,6 +51,10 @@ from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 
 
 def main():
+    import signal
+    # the harness stops an offboard with SIGTERM; turn it into an exception so
+    # the finally block still writes hover_probe.json and the done sentinel
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", default=None)       # ignored (harness contract)
     ap.add_argument("--connect", default="udp:localhost:14550")
