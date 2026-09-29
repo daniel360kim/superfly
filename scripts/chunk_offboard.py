@@ -46,7 +46,7 @@ from superfly.common.px4_offboard import (
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 from superfly.policies.chunk import ChunkPolicy
 
-CONTROL_HZ = 50.0
+CONTROL_HZ = 60.0          # a multiple of DECISION_HZ: exactly every 4th tick decides
 DECISION_HZ = 15.0          # sim_episode.DECISION_HZ
 YAW_RATE_MAX = 2.0          # sim_episode.YAW_RATE_MAX
 Z_REF = (0.5, 4.0)          # sim_episode.Z_REF
@@ -158,6 +158,7 @@ def main():
     last_hb = 0.0
     last_arm = time.time()
     last_dec = -1e9
+    next_dec = -1e9
     policy_t0 = None
     landing_sent = False
     lo, hi = Z_REF
@@ -191,13 +192,17 @@ def main():
                 if abs(math.degrees(err)) < args.yaw_tol_deg and state.offboard:
                     phase = "POLICY"
                     policy_t0 = now
+                    next_dec = now
                     mark_policy_phase("start")
                     policy.reset()
                     hi = max(Z_REF[1], float(pos[2]) + Z_HEADROOM)
                     print(f">>> HANDOFF to the chunk policy at z={pos[2]:.2f} "
                           f"(z band {lo:.1f}-{hi:.1f} m)", flush=True)
             elif phase == "POLICY":
-                if now - last_dec >= 1.0 / DECISION_HZ or not policy.ring:
+                # on a fixed 15 Hz schedule (not "15 Hz since the last one",
+                # which quantizes to every 5th 60 Hz tick = 12 Hz)
+                if now >= next_dec - 0.002 or not policy.ring:   # PX4 time is in ms
+                    next_dec = max(next_dec + 1.0 / DECISION_HZ, now)
                     depth = depth_sub.latest() if depth_sub else None
                     rec = policy.decide(now, pos, R, vel, om, goal, depth)
                     last_dec = now
