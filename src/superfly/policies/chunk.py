@@ -19,7 +19,9 @@ Heading frame: gravity aligned, x along yaw = atan2(R[1,0], R[0,0]).
 
 Executor (per decision, 15 Hz):
   * head = argmax softmax(gate), kept unless another head's probability beats
-    it by `hysteresis` (0.15);
+    it by `hysteresis` (0.15); with `dwell` > 0 (off by default; sim
+    --chunk-dwell, v8-chunk 4393ab4) a head just switched to needs a lead of
+    max(hysteresis, `dwell_margin` 0.3) for `dwell` seconds after the switch;
   * the selected chunk goes to WORLD frame at its issue time into a ring of the
     last `ensemble` (4) chunks; with `same_head` (default here) the ring is
     emptied on a head switch, so two routes are never blended;
@@ -105,7 +107,8 @@ def encode_state(pos, R, vel, omega_body, goal, goal_speed) -> np.ndarray:
 class ChunkPolicy:
     def __init__(self, path, lead: float = 0.5, hysteresis: float = 0.15,
                  ensemble: int = 4, decay: float = 0.5, same_head: bool = True,
-                 goal_speed: float = 0.0, threads: int = 4):
+                 goal_speed: float = 0.0, threads: int = 4, dwell: float = 0.0,
+                 dwell_margin: float = 0.3):
         import onnxruntime as ort
         self.path = str(path)
         self.sidecar = read_sidecar(path)
@@ -118,6 +121,7 @@ class ChunkPolicy:
         self.lead, self.hysteresis = float(lead), float(hysteresis)
         self.ensemble, self.decay = int(ensemble), float(decay)
         self.same_head = bool(same_head)
+        self.dwell, self.dwell_margin = float(dwell), float(dwell_margin)
         self.goal_speed = float(goal_speed)
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = int(threads)
@@ -135,6 +139,7 @@ class ChunkPolicy:
         self.prev_chunk = None          # (steps, 4) heading frame of its issue
         self.prev_yaw = None
         self.switches = 0
+        self.head_t = None              # time selection last moved to self.head
         self.last = {}
 
     # --- graph ---------------------------------------------------------------
@@ -188,14 +193,20 @@ class ChunkPolicy:
         v = c[:, :3] @ (rz(yaw).T @ rz(self.prev_yaw)).T
         return np.concatenate([v[:, 0], v[:, 1], v[:, 2], c[:, 3]])
 
-    def select_head(self, probs):
+    def select_head(self, probs, t=None):
         best = int(np.argmax(probs))
         if self.head is None:
             return best, "gate"
-        if best != self.head and probs[best] - probs[self.head] >= self.hysteresis - 1e-12:
+        margin = self.hysteresis
+        if (self.dwell > 0 and t is not None and self.head_t is not None
+                and t - self.head_t < self.dwell - 1e-9):
+            margin = max(margin, self.dwell_margin)
+        if best != self.head and probs[best] - probs[self.head] >= margin - 1e-12:
             self.switches += 1
             return best, "switch"
-        return self.head, "gate" if best == self.head else "hysteresis"
+        if best == self.head:
+            return self.head, "gate"
+        return self.head, "dwell" if margin > self.hysteresis else "hysteresis"
 
     def decide(self, t, pos, R, vel, omega_body, goal, depth):
         """One decision at time t (the observation's time). Returns the record."""
@@ -206,9 +217,11 @@ class ChunkPolicy:
             encode_depth(depth), encode_state(pos, R, vel, omega_body, goal,
                                               self.goal_speed), prev))
         probs = softmax(gate)
-        sel, reason = self.select_head(probs)
+        sel, reason = self.select_head(probs, float(t))
         if self.same_head and self.head is not None and sel != self.head:
             self.ring.clear()
+        if sel != self.head:
+            self.head_t = float(t)
         self.head = sel
         c = chunk[sel]
         S = self.steps

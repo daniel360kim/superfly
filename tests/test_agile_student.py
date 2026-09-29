@@ -350,6 +350,24 @@ def test_omega_channel_is_the_body_rate_unrotated():
     np.testing.assert_allclose(c, v, atol=1e-6)
 
 
+def test_chunk_head_dwell():
+    """ChunkPolicy.select_head with dwell (python sim --chunk-dwell, v8-chunk
+    4393ab4): inside `dwell` s of the last switch a new head needs a lead of
+    max(hysteresis, dwell_margin); off (dwell 0) it is plain hysteresis."""
+    from superfly.policies import chunk
+    p = chunk.ChunkPolicy.__new__(chunk.ChunkPolicy)
+    p.hysteresis, p.dwell, p.dwell_margin = 0.15, 0.5, 0.3
+    p.reset()
+    p.head, p.head_t = 0, 1.0
+    q = np.array([0.38, 0.58, 0.02, 0.01, 0.01])      # lead 0.2: beats 0.15, not 0.3
+    assert p.select_head(q, 1.2) == (0, "dwell")
+    assert p.select_head(q, 1.5) == (1, "switch")
+    p.head, p.head_t = 0, 1.0
+    assert p.select_head(np.array([0.3, 0.66, 0.02, 0.01, 0.01]), 1.1) == (1, "switch")
+    p.head, p.head_t, p.dwell = 0, 1.0, 0.0
+    assert p.select_head(q, 1.2) == (1, "switch")
+
+
 # --------------------------------------------------------------------------- #
 # 7. the MPC reference IS sim_episode's fit_cubic / eval_cubic
 # --------------------------------------------------------------------------- #

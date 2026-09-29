@@ -86,6 +86,10 @@ def main():
     ap.add_argument("--lead", type=float, default=0.5,
                     help="Executor reach into each chunk [s] (python sim --chunk-lead).")
     ap.add_argument("--hysteresis", type=float, default=0.15)
+    ap.add_argument("--dwell", type=float, default=0.0,
+                    help="Minimum time on a head [s]: inside it a switch needs --dwell-margin "
+                         "(python sim --chunk-dwell; 0 = off).")
+    ap.add_argument("--dwell-margin", type=float, default=0.3)
     ap.add_argument("--ensemble", type=int, default=4)
     ap.add_argument("--mix-heads", action="store_true",
                     help="Ensemble chunks across head switches (sim default off=same-head here).")
@@ -116,10 +120,11 @@ def main():
 
     policy = ChunkPolicy(args.checkpoint, lead=args.lead, hysteresis=args.hysteresis,
                          ensemble=args.ensemble, same_head=not args.mix_heads,
-                         goal_speed=args.goal_speed)
+                         goal_speed=args.goal_speed, dwell=args.dwell,
+                         dwell_margin=args.dwell_margin)
     print(f"[chunk] {Path(args.checkpoint).name}: heads {policy.heads}, "
           f"{policy.steps} x {policy.cdt:g} s, lead {policy.lead:g} s, "
-          f"hysteresis {policy.hysteresis:g}, ensemble {policy.ensemble} "
+          f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "
           f"({'same-head' if policy.same_head else 'mixed'}), v_cap {args.v_cap:g}, "
           f"forward {policy.forward_ms:.1f} ms", flush=True)
 
