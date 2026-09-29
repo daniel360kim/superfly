@@ -41,7 +41,7 @@ from pymavlink import mavutil
 from superfly.common.px4_offboard import (
     HEARTBEAT_HZ, DroneState, wait_for_heartbeat, request_stream_rates,
     set_offboard_mode, arm, retry_offboard_arm, send_position_target_ned,
-    send_land_command, send_heartbeat, set_param_float, receive_loop,
+    send_land_command, send_heartbeat, set_param_float, receive_loop, make_clock,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 from superfly.policies.chunk import ChunkPolicy
@@ -92,6 +92,12 @@ def main():
     ap.add_argument("--v-cap", type=float, default=3.5)
     ap.add_argument("--kv", type=float, default=3.0,
                     help="PX4 velocity P gain (MPC_XY/Z_VEL_P_ACC) = sim KV_VEL.")
+    ap.add_argument("--clock", choices=["wall", "px4"], default="px4",
+                    help="px4 (default): decisions, chunk ages and the ensemble run on "
+                         "PX4's clock = sim time under lockstep SITL (see "
+                         "px4_offboard.Px4Clock); wall = the host clock.")
+    ap.add_argument("--policy-timeout", type=float, default=None,
+                    help="Land (not reached) after this many --clock seconds of POLICY.")
     ap.add_argument("--hover-thrust", type=float, default=None,
                     help="MPC_THR_HOVER for the airframe (PX4's estimator refines it).")
     args = ap.parse_args()
@@ -106,6 +112,7 @@ def main():
     state = DroneState()
     stop = threading.Event()
     threading.Thread(target=receive_loop, args=(mav, state, stop), daemon=True).start()
+    clock = make_clock(args.clock, state)
 
     policy = ChunkPolicy(args.checkpoint, lead=args.lead, hysteresis=args.hysteresis,
                          ensemble=args.ensemble, same_head=not args.mix_heads,
@@ -146,26 +153,28 @@ def main():
 
     dt = 1.0 / CONTROL_HZ
     phase = "CLIMB"
-    t0 = time.time()
+    t0 = clock()
     next_step = t0
     last_hb = 0.0
-    last_arm = t0
-    last_dec = 0.0
+    last_arm = time.time()
+    last_dec = -1e9
+    policy_t0 = None
     landing_sent = False
     lo, hi = Z_REF
     n_dec = 0
     try:
         while True:
-            now = time.time()
-            if now - last_hb >= 1.0 / HEARTBEAT_HZ:
+            now = clock()
+            wall = time.time()
+            if wall - last_hb >= 1.0 / HEARTBEAT_HZ:
                 send_heartbeat(mav)
-                last_hb = now
+                last_hb = wall
             if now < next_step:
                 time.sleep(0.0005)
                 continue
             next_step += dt
-            if next_step < time.time():
-                next_step = time.time()
+            if next_step < now:
+                next_step = now
             pos, vel, R, om, yaw = state.get_full()
             verbose = int(now) != int(now - dt)
             if phase == "CLIMB":
@@ -181,6 +190,7 @@ def main():
                 err = math.atan2(math.sin(yaw_goal - ycur), math.cos(yaw_goal - ycur))
                 if abs(math.degrees(err)) < args.yaw_tol_deg and state.offboard:
                     phase = "POLICY"
+                    policy_t0 = now
                     mark_policy_phase("start")
                     policy.reset()
                     hi = max(Z_REF[1], float(pos[2]) + Z_HEADROOM)
@@ -192,7 +202,7 @@ def main():
                     rec = policy.decide(now, pos, R, vel, om, goal, depth)
                     last_dec = now
                     n_dec += 1
-                v, yr, n_used = policy.command(time.time())
+                v, yr, n_used = policy.command(now)
                 sp = float(np.linalg.norm(v))
                 if sp > args.v_cap:
                     v = v * (args.v_cap / sp)
@@ -220,6 +230,10 @@ def main():
                     phase = "LANDING"
                     mark_policy_phase("end")
                     print(f">>> goal reached at {pos.round(2)}; landing", flush=True)
+                elif args.policy_timeout is not None and now - policy_t0 > args.policy_timeout:
+                    phase = "LANDING"                   # no "end" marker: not reached
+                    print(f">>> POLICY TIMEOUT after {now - policy_t0:.1f} s ({args.clock} "
+                          f"clock) at {pos.round(2)}; landing", flush=True)
             elif phase == "LANDING":
                 if not landing_sent:
                     send_land_command(mav)

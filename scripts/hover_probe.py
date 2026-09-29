@@ -45,6 +45,7 @@ from superfly.common.px4_offboard import (
     HEARTBEAT_HZ, DroneState, wait_for_heartbeat, request_stream_rates,
     set_offboard_mode, arm, retry_offboard_arm, send_position_target_ned,
     send_velocity_target_ned, send_land_command, send_heartbeat, set_param_float,
+    Px4Clock,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 
@@ -95,6 +96,8 @@ def main():
                     thr["t"], thr["thrust"] = time.time(), float(msg.thrust)
     threading.Thread(target=rx, daemon=True).start()
 
+    clock = Px4Clock(state)          # phase durations in SIM time (lockstep)
+    clock.wait_ready()
     set_param_float(mav, "MPC_THR_HOVER", float(args.hover_guess))
     time.sleep(0.5)
     pos0, _, _, yaw0 = state.get()
@@ -109,19 +112,21 @@ def main():
     arm(mav)
 
     rows = []            # t, phase, z, vz, v_step (-vy ENU), thrust, tilt_deg, |omega_xy|
-    phase, t_phase = "CLIMB", time.time()
+    phase, t_phase = "CLIMB", clock()
     last_arm, last_hb = time.time(), 0.0
-    t0 = time.time()
+    t0 = clock()
+    w0 = time.time()
     dt = 0.02
     try:
         while True:
-            now = time.time()
-            if now - last_hb > 1.0 / HEARTBEAT_HZ:
+            wall = time.time()
+            now = clock()
+            if wall - last_hb > 1.0 / HEARTBEAT_HZ:
                 send_heartbeat(mav)
-                last_hb = now
+                last_hb = wall
             pos, vel, R, om, yaw = state.get_full()
             with lock:
-                th = thr["thrust"] if now - thr["t"] < 0.2 else None
+                th = thr["thrust"] if wall - thr["t"] < 0.2 else None
             tilt = math.degrees(math.acos(float(np.clip(R[2, 2], -1, 1))))
             rows.append((now - t0, phase, float(pos[2]), float(vel[2]), -float(vel[1]),
                          th, tilt, float(np.hypot(om[0], om[1]))))
@@ -133,7 +138,7 @@ def main():
                     phase, t_phase = "HOVER", now
                     mark_policy_phase("start")
                     print(f"[probe] HOVER at z={pos[2]:.2f} (t={now - t0:.1f}s)", flush=True)
-                elif now - t0 > 240:
+                elif wall - w0 > 600:
                     print("[probe] never settled in CLIMB", flush=True)
                     break
             elif phase == "HOVER":
@@ -149,7 +154,7 @@ def main():
                     mark_policy_phase("end")
                     send_land_command(mav)
             elif phase == "LAND":
-                if not state.armed or now - t_phase > 30:
+                if not state.armed or now - t_phase > 30 or wall - w0 > 900:
                     break
             time.sleep(dt)
     finally:

@@ -51,7 +51,7 @@ from superfly.common.px4_offboard import (
     HEARTBEAT_HZ, G, MAX_ACCEL, STREAM_HZ,
     DroneState, wait_for_heartbeat, request_stream_rates, set_offboard_mode,
     arm, retry_offboard_arm, send_attitude_target, send_position_target_ned,
-    send_land_command, send_heartbeat, set_param_float, receive_loop,
+    send_land_command, send_heartbeat, set_param_float, receive_loop, make_clock,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 from superfly.common.state_log import StateLog
@@ -220,6 +220,17 @@ def main():
                         help="Depth-veto depth-behind-surface tolerance [m].")
     parser.add_argument("--veto-radius-m", type=float, default=0.35,
                         help="Depth-veto pixel-window radius around each sample [m].")
+    parser.add_argument("--clock", choices=["wall", "px4"], default="wall",
+                        help="What the control loop, plan ages, rate gates and "
+                             "integrators run on. wall = historical. px4 = PX4's "
+                             "time_boot_ms, i.e. the SIM clock under lockstep SITL: "
+                             "the flight then does not depend on the sim's realtime "
+                             "factor (0.14 on a loaded airstation03 vs ~0.7 normally).")
+    parser.add_argument("--policy-timeout", type=float, default=None,
+                        help="End the POLICY phase (land, NOT reached) after this many "
+                             "seconds of --clock time. With --clock px4 it is a SIM-time "
+                             "budget, which the harness's wall-clock --timeout cannot be "
+                             "on a slow sim.")
     parser.add_argument("--no-debug-viz", action="store_true",
                         help="Disable UDP debug frames for sim overhead trajectory viz.")
     args = parser.parse_args()
@@ -269,6 +280,9 @@ def main():
     recv_thread = threading.Thread(target=receive_loop, args=(mav, state, stop_event),
                                    daemon=True)
     recv_thread.start()
+    clock = make_clock(args.clock, state)
+    print(f"Clock: {args.clock}" + (" (PX4 time_boot_ms = sim time under lockstep)"
+                                    if args.clock == "px4" else ""), flush=True)
 
     # G/MAX_ACCEL is an ASSUMPTION about the airframe, not a measurement; pass
     # None through so AgilePolicy can pick the student's measured value.
@@ -298,6 +312,7 @@ def main():
         veto_margin_m=args.veto_margin_m,
         veto_radius_m=args.veto_radius_m,
         thrust_max=args.thrust_max,
+        clock=clock,
     )
     debug_pub = None if args.no_debug_viz else AgileDebugPublisher()
     if debug_pub is not None:
@@ -340,11 +355,12 @@ def main():
 
     control_dt = 1.0 / control_hz
     heartbeat_dt = 1.0 / HEARTBEAT_HZ
-    last_heartbeat = time.time()
-    start_time = time.time()
-    next_step = time.time()
+    last_heartbeat = time.time()           # wall: heartbeats/arming are link chores
+    start_time = clock()
+    next_step = clock()
     last_arm_try = time.time()
-    last_rate_t = time.time()
+    last_rate_t = clock()
+    policy_t0 = None
     step_count = 0
 
     phase = "CLIMB"
@@ -360,12 +376,13 @@ def main():
 
     try:
         while True:
-            now = time.time()
+            now = clock()
             elapsed = now - start_time
 
-            if now - last_heartbeat >= heartbeat_dt:
+            wall = time.time()
+            if wall - last_heartbeat >= heartbeat_dt:
                 send_heartbeat(mav)
-                last_heartbeat = now
+                last_heartbeat = wall
 
             if now >= next_step:
                 pos, vel, R_enu, omega_body, yaw = state.get_full()
@@ -397,6 +414,7 @@ def main():
                     yaw_err = math.atan2(math.sin(yaw_goal - yaw_cur_ned), math.cos(yaw_goal - yaw_cur_ned))
                     if abs(math.degrees(yaw_err)) < args.yaw_tol_deg and state.offboard:
                         phase = "POLICY"
+                        policy_t0 = now
                         mark_policy_phase("start")
                         state.take_msg_rates(now - last_rate_t)  # reset counters
                         last_rate_t = now
@@ -418,7 +436,7 @@ def main():
                     send_attitude_target(mav, cmd.attitude_ned_frd_wxyz, cmd.thrust_norm)
                     if state_log is not None:
                         state_log.write(
-                            now, elapsed, phase, cmd.tracker, pos, vel,
+                            time.time(), elapsed, phase, cmd.tracker, pos, vel,
                             cmd.tilt_cmd_deg,
                             math.degrees(math.acos(float(np.clip(R_enu[2, 2], -1, 1)))),
                             cmd.thrust_norm, cmd.alt_sp, cmd.net_hz, cmd.mode_idx)
@@ -439,6 +457,11 @@ def main():
                         phase = "LANDING"
                         mark_policy_phase("end")
                         print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
+                    elif (args.policy_timeout is not None and policy_t0 is not None
+                          and now - policy_t0 > args.policy_timeout):
+                        phase = "LANDING"      # no "end" marker: not reached
+                        print(f"\n>>> POLICY TIMEOUT after {now - policy_t0:.1f} s "
+                              f"({args.clock} clock) at pos={pos.round(2)}; landing <<<\n")
                     if verbose:
                         rates = state.take_msg_rates(now - last_rate_t)
                         last_rate_t = now
@@ -484,8 +507,8 @@ def main():
 
                 step_count += 1
                 next_step += control_dt
-                if next_step < time.time():
-                    next_step = time.time()
+                if next_step < clock():
+                    next_step = clock()
             else:
                 time.sleep(0.001)
 

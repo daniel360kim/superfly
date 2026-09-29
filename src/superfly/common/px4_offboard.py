@@ -63,7 +63,20 @@ class DroneState:
         self.offboard = False
         self.position_valid = False
         self.last_update = 0.0
+        self.t_boot = None                   # PX4 time_boot_ms of the newest state [s]
         self.msg_counts = {name: 0 for name in STREAMED_MSGS.values()}
+
+    def _stamp(self, msg):
+        t = getattr(msg, "time_boot_ms", None)
+        if t is not None:
+            t = float(t) * 1e-3
+            self.t_boot = t if self.t_boot is None else max(self.t_boot, t)
+
+    def px4_time(self):
+        """PX4's clock [s] as of the newest streamed state (None before any).
+        Under lockstep SITL this is the SIMULATION clock."""
+        with self._lock:
+            return self.t_boot
 
     def update_from_attitude(self, msg):
         """Update from ATTITUDE_QUATERNION message (NED/FRD quaternion)."""
@@ -79,6 +92,7 @@ class DroneState:
                              dtype=np.float64)
             self.angular_rate_body = np.array([w_frd[0], -w_frd[1], -w_frd[2]])
             self.msg_counts["ATTITUDE_QUATERNION"] += 1
+            self._stamp(msg)
         self.last_update = time.time()
 
     def update_from_local_position(self, msg):
@@ -88,6 +102,7 @@ class DroneState:
             self.velocity_enu = np.array([msg.vy, msg.vx, -msg.vz])
             self.position_valid = True
             self.msg_counts["LOCAL_POSITION_NED"] += 1
+            self._stamp(msg)
         self.last_update = time.time()
 
     def update_from_heartbeat(self, msg):
@@ -119,6 +134,44 @@ class DroneState:
             for k in self.msg_counts:
                 self.msg_counts[k] = 0
         return rates
+
+
+class Px4Clock:
+    """The offboard's clock read off PX4 (time_boot_ms of the streamed state).
+
+    Under PX4 SITL lockstep, PX4's clock IS the simulator's, while the
+    offboards otherwise pace everything -- control ticks, plan ages, rate
+    gates, integrators -- on the wall clock. Those agree only at a realtime
+    factor of 1: on a loaded airstation03 Isaac ran at 0.14 x real time
+    (2026-09-29, historically 0.65-0.75), so a wall-clocked plan raced ~7x
+    ahead of the vehicle it was steering. With this clock the offboard lives
+    in sim time and the result does not depend on how busy the box is (only
+    how long it takes). Piecewise constant: it advances when a state message
+    arrives (stream_hz of PX4 time)."""
+
+    def __init__(self, state: "DroneState"):
+        self.state = state
+
+    def __call__(self) -> float:
+        t = self.state.px4_time()
+        return 0.0 if t is None else t
+
+    def wait_ready(self, timeout: float = 120.0) -> bool:
+        deadline = time.time() + timeout
+        while self.state.px4_time() is None and time.time() < deadline:
+            time.sleep(0.01)
+        return self.state.px4_time() is not None
+
+
+def make_clock(kind: str, state: "DroneState"):
+    """'wall' -> time.time (historical); 'px4' -> Px4Clock (sim time in SITL)."""
+    if kind == "px4":
+        clk = Px4Clock(state)
+        if not clk.wait_ready():
+            print("[clock] no PX4 state within 120 s -- the px4 clock cannot start",
+                  flush=True)
+        return clk
+    return time.time
 
 
 # ---------------------------------------------------------------------------

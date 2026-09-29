@@ -328,7 +328,11 @@ class AgilePolicy:
                  veto_step_m: float = STUDENT_VETO_STEP_M,
                  veto_margin_m: float = STUDENT_VETO_MARGIN_M,
                  veto_radius_m: float = STUDENT_VETO_RADIUS_M,
-                 thrust_max: float = 0.9):
+                 thrust_max: float = 0.9, clock=None):
+        # The clock every plan age / rate gate / integrator runs on: wall time
+        # by default; the offboard passes PX4's (= the sim's under lockstep
+        # SITL) with --clock px4, see px4_offboard.Px4Clock.
+        self._clock = clock if clock is not None else time.time
         # Which net: a .onnx artifact is an anyanything student (22-dim state,
         # metric 0.5 s waypoints, any mode/waypoint count); anything else is
         # the legacy TF2 PlaNet checkpoint prefix (21-dim state, 0.1 s plan).
@@ -776,7 +780,7 @@ class AgilePolicy:
             # park the reference's t=0 point ~0.4 m behind the vehicle for the
             # plan's whole life: a constant backwards position error into the
             # MPC, i.e. chronic braking.
-            now = time.time() if t_stamp is None else float(t_stamp)
+            now = self._clock() if t_stamp is None else float(t_stamp)
             self._plan_time = now
             self._net_stamps.append(now)
             if len(self._net_stamps) > 16:
@@ -834,7 +838,7 @@ class AgilePolicy:
             t, z = self._plan_z
             tau = self.control_dt
             if self._plan_time is not None:
-                tau += max(0.0, time.time() - self._plan_time)
+                tau += max(0.0, self._clock() - self._plan_time)
             return float((np.interp(tau + self.control_dt, t, z)
                           - np.interp(tau, t, z)) / self.control_dt)
         v_ref1 = minfo.get("v_ref1") if isinstance(minfo, dict) else None
@@ -944,7 +948,7 @@ class AgilePolicy:
         # Submit no faster than the rate the student was scored at: the worker
         # is latest-only, so without this gate a fast box would decide at
         # 1/forward_time instead of sim_episode's DECISION_HZ.
-        now = time.time()
+        now = self._clock()
         submit = (now - self._net_submit_t) >= (1.0 / self.net_decision_hz) \
             if self.net_decision_hz > 0 else True
         res = None
@@ -977,7 +981,7 @@ class AgilePolicy:
     # ------------------------------------------------------------------ #
     def compute(self, obs: AgileObs) -> AgileCmd:
         self._tick += 1
-        now = time.time()
+        now = self._clock()
         pos = np.asarray(obs.position_enu, np.float64)
         vel = np.asarray(obs.velocity_enu, np.float64)
         R_enu = np.asarray(obs.R_enu, np.float64)
@@ -1018,7 +1022,7 @@ class AgilePolicy:
             depth_in = self._depth_to_model_input(obs.depth)
             state_in = self._encode_state(pos, R_enu, vel, obs.angular_rate_body,
                                           goal, goal_dir)
-            t_submit = time.time()
+            t_submit = self._clock()
             alphas, trajectories = self.net.infer(depth_in, state_in)
             self._adopt_plan(alphas, trajectories, pos, R_enu, obs.depth, vel,
                              t_submit)
