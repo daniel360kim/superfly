@@ -1171,3 +1171,32 @@ def test_alt_setpoint_is_not_dragged_by_the_vehicles_own_velocity(monkeypatch):
     assert abs(policy._alt_sp - sp0) < 0.02, (
         f"a level plan moved the setpoint {policy._alt_sp - sp0:+.3f} m while the "
         "vehicle sagged at -0.8 m/s")
+
+
+def test_vehicle_drone_radius_and_names():
+    """--vehicle names and the clearance-scoring radius come from the spec:
+    both Starling airframes score at the real Starling 2 Max's extent
+    (prop tips 0.253 m, rounded up), the stock Iris keeps the historical 0.2."""
+    from superfly.compare.registry import (VEHICLES, vehicle_drone_radius, vehicle_spec,
+                                           vehicle_hover_thrust, vehicle_usd_url, STARLING_USD)
+    assert set(VEHICLES) == {"iris", "starling2max", "starling2max_iris"}
+    g = vehicle_spec("starling2max")["geometry"]
+    assert g["reach_3d_m"] <= vehicle_drone_radius("starling2max") < g["reach_3d_m"] + 0.01
+    assert vehicle_drone_radius("starling2max_iris") == vehicle_drone_radius("starling2max")
+    assert vehicle_drone_radius("iris") == 0.2
+    assert vehicle_hover_thrust("starling2max_iris", 0.5) == vehicle_hover_thrust("starling2max", 0.5)
+    assert vehicle_usd_url("starling2max") == STARLING_USD
+    assert vehicle_usd_url("starling2max_iris") is None and vehicle_usd_url("iris") is None
+
+
+def test_nucleus_token_file(tmp_path, monkeypatch):
+    from superfly.common import nucleus
+    for v in ("OMNI_USER", "OMNI_PASS", "OMNI_API_TOKEN"):
+        monkeypatch.delenv(v, raising=False)
+    f = tmp_path / "omni_env"
+    f.write_text("export OMNI_API_TOKEN=abc123\n")
+    monkeypatch.setattr(nucleus, "OMNI_ENV", f)
+    nucleus.ensure_credentials()
+    import os
+    assert os.environ["OMNI_USER"] == "$omni-api-token" and os.environ["OMNI_PASS"] == "abc123"
+    assert os.environ["OMNI_API_TOKEN"] == "abc123"

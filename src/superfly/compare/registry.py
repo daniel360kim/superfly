@@ -93,11 +93,35 @@ STUDENT_Z_REF_NOTE = ("agile_student hands over at 2.0 m: its labels only cover 
 #                     leaves the Iris (hover 0.58) ~2 g but the Starling only
 #                     ~1.4 g of its 2.0, so it is lifted to 1.0 there.
 VEHICLE_SPEC = _REPO / "configs" / "vehicles" / "starling2max.yaml"
+#: --vehicle choices (superfly.sim.vehicles): the stock Iris, the Starling 2 Max
+#: from the lab USD, and the Starling sys-ID on the Iris frame (the
+#: pre-2026-09-29 `starling2max`). Both Starlings share the spec.
+VEHICLES = ("iris", "starling2max", "starling2max_iris")
+STARLING_VEHICLES = ("starling2max", "starling2max_iris")
+#: The lab's Starling 2 Max USD (sys-ID mass/inertia/CoM applied; Slite
+#: dj1982T35dt0qG). $SUPERFLY_VEHICLE_USD points --vehicle starling2max at
+#: another copy (e.g. staged locally on OSMO, which cannot reach Nucleus).
+STARLING_USD = ("omniverse://airlab-nucleus.andrew.cmu.edu/Library/Assets/"
+                "ModalAI/starling_2_max/starling2max.usd")
+
+
+def vehicle_usd_url(vehicle: str):
+    """The vehicle USD --vehicle <name> spawns from when it is not Pegasus's
+    own Iris asset (None for iris / starling2max_iris)."""
+    if vehicle == "starling2max":
+        return os.environ.get("SUPERFLY_VEHICLE_USD", "") or STARLING_USD
+    return None
+
+
+#: Clearance-scoring radius of the stock Iris: the harness's historical 0.2 m,
+#: kept so iris baselines stay comparable -- NOT its extent (the Iris's swept
+#: prop tips reach 0.384 m from the centre, measured 2026-09-29).
+IRIS_DRONE_RADIUS = 0.2
 
 
 def vehicle_spec(vehicle: str) -> dict:
     """The yaml spec for --vehicle (empty for the stock Iris)."""
-    if vehicle != "starling2max":
+    if vehicle not in STARLING_VEHICLES:
         return {}
     try:
         import yaml
@@ -111,6 +135,21 @@ def vehicle_hover_thrust(vehicle: str, default: float) -> float:
     spec = vehicle_spec(vehicle)
     v = (spec.get("isaac_px4") or {}).get("hover_throttle")
     return float(v) if v is not None else float(default)
+
+
+def vehicle_drone_radius(vehicle: str) -> float:
+    """Clearance-scoring radius [m] (runner --drone-radius default): for both
+    Starling airframes the REAL Starling 2 Max's measured extent (swept prop
+    tips from the body centre, any attitude) rounded up --
+    configs/vehicles/starling2max.yaml geometry.collision_radius_m;
+    IRIS_DRONE_RADIUS for the stock Iris."""
+    if vehicle not in STARLING_VEHICLES:
+        return IRIS_DRONE_RADIUS
+    g = vehicle_spec(vehicle).get("geometry") or {}
+    r = g.get("collision_radius_m")
+    if r is None:
+        raise SystemExit(f"{VEHICLE_SPEC}: no geometry collision_radius_m for {vehicle}")
+    return float(r)
 
 
 def vehicle_agile_args(vehicle: str) -> list:

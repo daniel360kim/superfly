@@ -80,6 +80,7 @@ from superfly.compare import metrics
 from superfly.compare.registry import (
     method_registry, checkpoint_ready, resolve_python,
     DEFAULT_MAX_SPEED, effective_agile_max_speed,
+    VEHICLES, vehicle_drone_radius, vehicle_usd_url,
 )
 
 # Sentinels shared with the offboards + sim (superfly.common.sentinels):
@@ -1183,13 +1184,21 @@ def main():
                          "for agile too if set (agile defaults to its validated "
                          f"cruise speed if this is left at "
                          f"{DEFAULT_MAX_SPEED:.0f} m/s).")
-    ap.add_argument("--drone-radius", type=float, default=0.2,
-                    help="Collision radius [m] for clearance scoring.")
+    ap.add_argument("--drone-radius", type=float, default=None,
+                    help="Collision radius [m] for clearance scoring. Default: the "
+                         "vehicle's (registry.vehicle_drone_radius -- 0.26 for both "
+                         "Starling airframes, the real Starling 2 Max's swept prop tips "
+                         "rounded up; 0.2 for the stock Iris, historical). Recorded in "
+                         "every trial's metrics.json hyperparams and run_manifest.json.")
     ap.add_argument("--goal-radius", type=float, default=1.0,
                     help="Distance [m] to goal that counts as reached.")
-    ap.add_argument("--vehicle", choices=["iris", "starling2max"], default="iris",
+    ap.add_argument("--vehicle", choices=list(VEHICLES), default="iris",
                     help="Airframe for every trial (superfly.sim.vehicles): iris "
-                         "(historical stock default) or starling2max (sys-ID-matched).")
+                         "(historical stock default), starling2max (the lab's Starling 2 "
+                         "Max USD from Nucleus + the sys-ID; the credential is loaded "
+                         "from ~/.omni_env and the USD stat'ed before the first trial) "
+                         "or starling2max_iris (the same sys-ID on the Pegasus Iris frame "
+                         "-- what starling2max flew before 2026-09-29).")
     ap.add_argument("--connect", default="udp:localhost:14550")
     ap.add_argument("--headless", action="store_true",
                     help="Run Isaac Sim without the GUI viewport (faster; recommended "
@@ -1276,6 +1285,9 @@ def main():
                          "scored before the scene-mesh metric existed (extracts the "
                          "scene geometry via --sim-python if not already cached).")
     args = ap.parse_args()
+    if args.drone_radius is None:
+        args.drone_radius = vehicle_drone_radius(args.vehicle)
+    print(f"[score] drone_radius {args.drone_radius:.3f} m ({args.vehicle})", flush=True)
 
     if args.results_dir is None:
         if args.report_only:
@@ -1295,6 +1307,17 @@ def main():
         raise SystemExit("a scenarios JSON file is required (see the module "
                          "docstring for the entry schema).")
     scenarios = load_scenarios(args.scenarios)
+
+    # A Nucleus vehicle USD (--vehicle starling2max): the credential must be in
+    # the environment every sim inherits BEFORE Kit boots, and a rejected token
+    # must fail here, not as a sim blocked on a browser login mid-trial.
+    _vusd = vehicle_usd_url(args.vehicle)
+    if _vusd and _vusd.startswith("omniverse://") and not args.dry_run:
+        from superfly.common import nucleus
+        src = nucleus.ensure_credentials()
+        print(f"[vehicle] {args.vehicle}: {_vusd} (credential from {src})", flush=True)
+        if args.sim_python:
+            print(f"[vehicle] {nucleus.stat_usd(_vusd, args.sim_python)}", flush=True)
 
     # Results layout: <results-dir>/command.txt (exact harness invocation),
     # scenarios.json (verbatim copy of the config), run_manifest.json (parsed

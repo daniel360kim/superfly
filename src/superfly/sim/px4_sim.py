@@ -515,8 +515,9 @@ class PegasusApp:
             Rotation.from_euler("XYZ", [0.0, 0.0, self.SPAWN_YAW_DEG], degrees=True).as_quat(),
             config=config_multirotor,
         )
-        # --vehicle starling2max without the (Nucleus) lab USD: the sys-ID body
-        # is applied to the spawned Iris here, before physics starts.
+        # Per-vehicle USD fix-ups before physics starts: starling2max (lab USD)
+        # gets the sys-ID mass + explicit rotor masses; starling2max_iris gets
+        # the sys-ID body and the Starling rotor positions on the Iris frame.
         _ovr = apply_vehicle_overrides(self.world.stage, "/World/quadrotor", vehicle)
         if _ovr:
             print(f"[vehicle] {_ovr}", flush=True)
@@ -553,7 +554,10 @@ class PegasusApp:
             cam["pitch_deg"] = float(_ovr)
         # SUPERFLY_CAM_NEAR (metres) sets the depth camera's NEAR clipping plane
         # (far kept, Pegasus default 100 m). Found 2026-09-29: with the default
-        # 0.05 m the vehicle's own rotor blades (the iris-derived airframe; the
+        # 0.05 m the vehicle's own rotor blades (the iris-derived airframe,
+        # --vehicle starling2max_iris since 2026-09-29; the lab Starling USD puts
+        # no airframe point in the frustum at all -- measured -- so there 0.3 is
+        # kept only for comparability; the
         # camera sits 0.10 m ahead of the body origin, behind the rotor disc
         # front) show as two rotating blade silhouettes at <= 0.3 m in the upper
         # half of the agile frame (in flight: median 5 %, p90 10 % of the whole
@@ -1380,11 +1384,14 @@ def main():
                         help="Agile policy only: write the overhead trajectory/depth debug "
                              "PNG to PATH each sim frame. Can be used with --no-debug-frames "
                              "to avoid the heavier camera_debug/depth_debug outputs.")
-    parser.add_argument("--vehicle", choices=["iris", "starling2max"], default="iris",
-                        help="Airframe to fly: iris (Pegasus stock, historical default) or "
-                             "starling2max (AirLab sys-ID: lab USD mass/inertia, measured "
-                             "rotor constants, 55/85 ms first-order motor lag; USD source "
-                             "overridable via $SUPERFLY_VEHICLE_USD).")
+    parser.add_argument("--vehicle", choices=["iris", "starling2max", "starling2max_iris"],
+                        default="iris",
+                        help="Airframe to fly: iris (Pegasus stock, historical default), "
+                             "starling2max (the lab's Starling 2 Max USD + AirLab sys-ID: "
+                             "mass/inertia, measured rotor constants, 55/85 ms first-order "
+                             "motor lag; USD overridable via $SUPERFLY_VEHICLE_USD; Nucleus "
+                             "needs OMNI_API_TOKEN) or starling2max_iris (the same sys-ID on "
+                             "the Pegasus Iris frame, the pre-2026-09-29 starling2max).")
     parser.add_argument("--agile-depth-flip", choices=["none", "both", "v", "h"],
                         default="none",
                         help="Agile policy only: flip the depth image before publishing. "
