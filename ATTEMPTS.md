@@ -4,6 +4,48 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-09-29 — Starling 2 Max student evaluation in Isaac (overnight queue) — PENDING
+
+Held-out evaluation only (never a data source): both `*_student_v1` suites,
+seeds 0-4, `--vehicle starling2max`, plain selection, cam pitch -13, one trial
+at a time, via `anyanything/scratch_t6/isaac_eval/{isaac_eval.sh,queue_runner.sh}`.
+What had to change first (all on `reorg`):
+- **Starling USD unreachable**: the lab `starling2max.usd` is on Nucleus and
+  airstation03's login is expired; headless Kit blocks on a browser login and
+  PX4 waits for a heartbeat forever. `starling2max` now = sys-ID body on the
+  local Iris frame (66edd9c). Motor map u*730+100 so u=1 is the 830 rad/s
+  saturation (7edc9a3).
+- **Iris-specific hover throttle**: agile_student's 0.577 is the Iris's.
+  hover_probe (new method) measures PX4's hover collective: Starling 0.6662
+  (predicted 0.667), Iris 0.5807. Spec `isaac_px4.hover_throttle` 0.666 ->
+  registry; also `--t-max 19.62`, `--thrust-max 1.0` (2539c23). PX4 keeps
+  none_iris gains: stable (hover rate RMS 0.013 rad/s; 2 m/s step 23 deg
+  tilt, no oscillation). The PX4 build also carries ModalAI's
+  `10099_starling` airframe (SAFE_Benchmark) -- untried, its MPC_THR_MAX 0.6
+  and hover 0.28 are for a T/W 3.5 plant.
+- **Selector heads flew the worst mode**: ONNX alpha was always ranked as a
+  cost; the t6 `selection: selector` heads are logits. Sidecar now honoured.
+- **Realtime factor 0.13-0.16** tonight (5090 shared with 3 trainings, 16
+  sim workers; historically 0.65-0.75) with wall-clocked offboards = a student
+  reference ~7x ahead of the vehicle. `--clock px4` (sim time) +
+  `--policy-timeout` in sim seconds; not niceness (nice 0 gave the same RTF).
+  Any wall-clocked Isaac trial on a busy box (e.g. t6_iter's isaac stage,
+  iris, no --clock) is suspect.
+- **Concurrent campaigns kill each other** (stop_stale_sims): per-user flock
+  in run_comparison (f429b20).
+- `agile_student_chunk` (chunk_v1 students, PX4 velocity + yaw rate) added;
+  byte-parity with sim_episode.OnnxChunkPolicy on 40 random states.
+Results: `scratch_t6/isaac_eval/results/<tag>.json` (queue runs on).
+First numbers: v8base_s1 (MobileNet v8 baseline, cost head) **5/10**
+(diffaero 2/5, diffphys 3/5): all 10 reach the goal, 5 collide -- the
+student flies into an obstacle at ~1.7 m/s, is pinned against it (measured
+tilt 41 deg vs 20-30 commanded, v ~ 0 for 3-13 s), slides off and still
+arrives; clearance -0.05..-0.13 m (one -0.39) at the 0.2 m radius.
+Cruise ~2 m/s (peak 2.1-3.3), z 0.5-4.0 m (no sag: hover estimate 0.648-0.651
+against PX4's 0.666), decisions 13.6-13.8 Hz of sim time.
+agile_student_chunk t6_chunkv8_s1 (python sim arrive 9 %) diffaero s0:
+reached, clean (0.37 m), 1.07 m/s mean, head switch on 56 % of decisions.
+
 ## 2026-08-21 — checkpoints/ runs renamed to command-family scheme — SHIPPED
 
 `<command-family>[_<qualifier>]_<version>` (thrust_*/vel_*/vel_planar_*;
