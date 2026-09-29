@@ -100,4 +100,14 @@ isaac_px4:
   # 2026-09-29: median 0.6662, p10-p90 0.6652-0.6669, 569 settled samples;
   # predicted (sqrt(m g / 4 / kT) - 100) / 730 = 0.667). The same probe on the
   # Iris reads 0.5807, the agile_student default 0.577 (measured 2026-09-16).
+  # Re-probed 2026-09-29 on BOTH Starling airframes (same probe, depth near
+  # plane 0.05 m, cam pitch -13):
+  #   starling2max (lab USD)   hover 0.6673 (p10-p90 0.6666-0.6679, 1061 samples),
+  #                            hover omega_xy rms 0.011, 2 m/s step: 1.84 m/s,
+  #                            tilt max 29.3 deg, omega_xy rms 0.81; depth frames
+  #                            show NO airframe (props stay >= 4.8 deg outside the
+  #                            91 deg hfov) -> the 0.3 m near plane is optional there
+  #   starling2max_iris        hover 0.6668, omega rms 0.017; step 1.85 m/s, tilt
+  #                            36.1 deg, omega rms 1.10; Iris blades fill the upper
+  #                            third of the depth frame at near 0.05
   hover_throttle: 0.666
