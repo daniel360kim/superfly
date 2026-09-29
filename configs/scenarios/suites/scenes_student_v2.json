@@ -1,0 +1,236 @@
+[
+  {
+    "name": "conifer_forest",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/ConiferForest/ConiferForest_stage.stage.usd",
+    "env_scale": 0.01,
+    "obstacles": "none",
+    "start": [
+      111.2,
+      368.6,
+      -148.79
+    ],
+    "goal": [
+      44.0,
+      384.2,
+      -147.09
+    ],
+    "climb_alt": 2,
+    "timeout": 240,
+    "pre_policy_timeout": 600,
+    "category": "forest (sparse conifers)",
+    "placement": {
+      "start_ground_z": -149.09,
+      "goal_ground_z": -149.73,
+      "cruise_z": -147.09,
+      "goal_agl_at_cruise": 2.64,
+      "line_m": 69.0,
+      "line_obstacle_crossings": 4,
+      "line_crossings_taller_than_band": 4,
+      "line_blocked_m": 14.6,
+      "first_obstacle_on_line_m": 3.6,
+      "route_m": 73.7,
+      "detour": 1.07,
+      "route_ground_z": [
+        -149.83,
+        -149.06
+      ],
+      "method": "planar route at spawn+2.0 m (agile_student_chunk handover; executor band spawn+0.5..4.0 m): occupancy = any scene sample in spawn+[1.2, 2.8] m on a 0.4 m grid, route cells >= 0.7 m from it, ground within spawn-1.5..+1.0 m; checked at cruise +-0.25 m. Geometry: extract_scene_mesh.py crop x-130..130 y330..580, h 0.30 m"
+    },
+    "why": "ConiferForest: a 1.6 km mountain landscape. The trees stand in open, sparse stands, and most of them are on slopes too steep for the fixed 4 m executor band. This pair is on a flat terrace at the foot of a ridge (ground z -149.8 to -149.1 along the whole route). The start is at the east end of the terrace, with the ridge wall about 5 m to its north-east. The goal is 69 m to the west. The straight line runs through the crowns of three conifers, whose wide lower branches fill the cruise band (4 crossings, 15 m of the line blocked). The planar route weaves between the trunks (74 m, detour 1.07) and exists at the cruise height +-0.25 m. It tests tree crowns, a large open field of view, and sky and distant terrain in the depth image."
+  },
+  {
+    "name": "wild_forest",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/LowPoly/WildForestScene.usd",
+    "env_scale": 0.01,
+    "obstacles": "none",
+    "start": [
+      77.7,
+      -30.5,
+      1.3
+    ],
+    "goal": [
+      79.9,
+      -87.9,
+      3.0
+    ],
+    "climb_alt": 2,
+    "timeout": 240,
+    "pre_policy_timeout": 600,
+    "category": "forest (dense, deciduous + rocks)",
+    "placement": {
+      "start_ground_z": 1.0,
+      "goal_ground_z": 1.0,
+      "cruise_z": 3.0,
+      "goal_agl_at_cruise": 2.0,
+      "line_m": 57.4,
+      "line_obstacle_crossings": 16,
+      "line_crossings_taller_than_band": 1,
+      "line_blocked_m": 19.2,
+      "first_obstacle_on_line_m": 1.8,
+      "route_m": 64.0,
+      "detour": 1.11,
+      "route_ground_z": [
+        1.0,
+        1.4
+      ],
+      "method": "planar route at spawn+2.0 m (agile_student_chunk handover; executor band spawn+0.5..4.0 m): occupancy = any scene sample in spawn+[1.2, 2.8] m on a 0.4 m grid, route cells >= 0.7 m from it, ground within spawn-1.5..+1.0 m; checked at cruise +-0.25 m. Geometry: extract_scene_mesh.py crop x0..170 y-160..160, h 0.74 m (foliage-coarsened)"
+    },
+    "why": "LowPoly WildForestScene: a dense wild forest in a hilly valley. Off the valley floor the terrain rises more than the executor's 4 m band allows and the undergrowth fills 0.3-2.8 m everywhere, so the only corridor that can be flown flat at spawn+2 m is the stream channel on the valley floor (ground z 1.0-1.4). The start sits at the upstream end of the channel; the goal 57 m downstream. The straight line runs under overhanging branches and shrubs from the banks (16 separate obstacle crossings, 19 m of the line blocked). A planar route exists at 2.0-2.25 m (64 m, detour 1.11) and closes at 1.75 m, so this is the hardest pair in the set: a narrow forest trail where the policy may have to climb or thread through foliage."
+  },
+  {
+    "name": "full_warehouse",
+    "usd_environment": "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/full_warehouse.usd",
+    "env_scale": 1.0,
+    "obstacles": "none",
+    "start": [
+      2.0,
+      -18.0,
+      0.3
+    ],
+    "goal": [
+      -22.0,
+      28.5,
+      2.0
+    ],
+    "climb_alt": 2,
+    "timeout": 240,
+    "pre_policy_timeout": 600,
+    "category": "indoor warehouse",
+    "placement": {
+      "start_ground_z": -0.0,
+      "goal_ground_z": 0.0,
+      "cruise_z": 2.0,
+      "goal_agl_at_cruise": 2.0,
+      "line_m": 52.3,
+      "line_obstacle_crossings": 2,
+      "line_crossings_taller_than_band": 2,
+      "line_blocked_m": 7.0,
+      "first_obstacle_on_line_m": 35.9,
+      "route_m": 56.3,
+      "detour": 1.08,
+      "route_ground_z": [
+        -0.0,
+        0.0
+      ],
+      "method": "planar route at spawn+2.0 m (agile_student_chunk handover; executor band spawn+0.5..4.0 m): occupancy = any scene sample in spawn+[1.2, 2.8] m on a 0.4 m grid, route cells >= 0.7 m from it, ground within spawn-1.5..+1.0 m; checked at cruise +-0.25 m. Geometry: scene_audit samples.npz (whole stage, h 0.24 m)"
+    },
+    "why": "Isaac Full Warehouse (stock Isaac 5.1 asset over https: the Nucleus AbandonedWarehouse fails the collider drop test, so this is the indoor stage). Closed hall 36 x 55 m, ceiling 9 m, seven rows of pallet racks (y 9-25) that stand above the 4 m executor band, so they cannot be over-flown. The start is in the open loading area at the south; the goal is in the cross-aisle behind the racks at the north-west. The 52 m straight line cuts diagonally through two rack rows; the drone has to enter one aisle and fly down it (planar route 56 m, detour 1.08). It tests walls on every side, long uniform rack faces and indoor lighting."
+  },
+  {
+    "name": "downtown",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/Dmytro/ModernCityDowntown.stage.usd",
+    "env_scale": 1.0,
+    "obstacles": "none",
+    "start": [
+      33.8,
+      -95.0,
+      0.45
+    ],
+    "goal": [
+      -15.4,
+      -39.4,
+      2.15
+    ],
+    "climb_alt": 2,
+    "timeout": 240,
+    "pre_policy_timeout": 600,
+    "category": "urban street / plaza",
+    "placement": {
+      "start_ground_z": 0.15,
+      "goal_ground_z": 0.15,
+      "cruise_z": 2.15,
+      "goal_agl_at_cruise": 2.0,
+      "line_m": 74.2,
+      "line_obstacle_crossings": 8,
+      "line_crossings_taller_than_band": 4,
+      "line_blocked_m": 13.8,
+      "first_obstacle_on_line_m": 4.0,
+      "route_m": 91.7,
+      "detour": 1.23,
+      "route_ground_z": [
+        0.1,
+        1.04
+      ],
+      "method": "planar route at spawn+2.0 m (agile_student_chunk handover; executor band spawn+0.5..4.0 m): occupancy = any scene sample in spawn+[1.2, 2.8] m on a 0.4 m grid, route cells >= 0.7 m from it, ground within spawn-1.5..+1.0 m; checked at cruise +-0.25 m. Geometry: extract_scene_mesh.py crop x-100..80 y-110..95, h 0.43 m"
+    },
+    "why": "Dmytro ModernCityDowntown: city blocks, a tree-lined plaza, street furniture. The start is in the narrow gap between two office blocks south-east of the plaza. The goal is on the street west of the central plaza. The 74 m straight line crosses the corner of the block beside the start (a wall a few metres ahead at handover), a cluster of round outdoor tables, and the plaza's south edge (8 obstacle crossings, 4 taller than the band). The drone has to leave the gap, turn along the street, pass the tables and follow the plaza edge (planar route 92 m, detour 1.23)."
+  },
+  {
+    "name": "retro_neighborhood",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/RetroNeighborhood/RetroNeighborhood.stage.usd",
+    "env_scale": 1.0,
+    "obstacles": "none",
+    "start": [
+      -37.7,
+      16.0,
+      0.3
+    ],
+    "goal": [
+      -77.3,
+      -38.0,
+      2.0
+    ],
+    "climb_alt": 2,
+    "timeout": 240,
+    "pre_policy_timeout": 600,
+    "category": "suburban street",
+    "placement": {
+      "start_ground_z": -0.0,
+      "goal_ground_z": -0.19,
+      "cruise_z": 2.0,
+      "goal_agl_at_cruise": 2.19,
+      "line_m": 67.0,
+      "line_obstacle_crossings": 10,
+      "line_crossings_taller_than_band": 6,
+      "line_blocked_m": 11.6,
+      "first_obstacle_on_line_m": 4.2,
+      "route_m": 92.6,
+      "detour": 1.38,
+      "route_ground_z": [
+        -0.19,
+        -0.0
+      ],
+      "method": "planar route at spawn+2.0 m (agile_student_chunk handover; executor band spawn+0.5..4.0 m): occupancy = any scene sample in spawn+[1.2, 2.8] m on a 0.4 m grid, route cells >= 0.7 m from it, ground within spawn-1.5..+1.0 m; checked at cruise +-0.25 m. Geometry: scene_audit samples.npz (whole stage, h 0.40 m)"
+    },
+    "why": "RetroNeighborhood: a suburban grid with detached houses, fenced yards, street trees and parked cars. The start is on the northern street. The goal is on the western cross street, 67 m away. The straight line crosses a fenced front yard, a whole house (taller than the 4 m band) and the fence and trees behind it (10 crossings, 6 taller than the band). The drone has to give up the line and go round the block by the street, a planar route of 93 m (detour 1.38). This is the 'stop, turn and go far round' case, in a real street."
+  },
+  {
+    "name": "abandoned_factory",
+    "usd_environment": "omniverse://airlab-nucleus.andrew.cmu.edu/Library/Stages/AbandonedFactory/AbandonedFactory.stage.usd",
+    "env_scale": 1.0,
+    "obstacles": "none",
+    "start": [
+      -3.4,
+      -11.6,
+      0.84
+    ],
+    "goal": [
+      9.6,
+      57.7,
+      2.54
+    ],
+    "climb_alt": 2,
+    "timeout": 240,
+    "pre_policy_timeout": 600,
+    "category": "industrial / cluttered",
+    "placement": {
+      "start_ground_z": 0.54,
+      "goal_ground_z": 0.53,
+      "cruise_z": 2.54,
+      "goal_agl_at_cruise": 2.01,
+      "line_m": 70.5,
+      "line_obstacle_crossings": 6,
+      "line_crossings_taller_than_band": 2,
+      "line_blocked_m": 7.2,
+      "first_obstacle_on_line_m": 56.7,
+      "route_m": 77.2,
+      "detour": 1.1,
+      "route_ground_z": [
+        0.46,
+        1.45
+      ],
+      "method": "planar route at spawn+2.0 m (agile_student_chunk handover; executor band spawn+0.5..4.0 m): occupancy = any scene sample in spawn+[1.2, 2.8] m on a 0.4 m grid, route cells >= 0.7 m from it, ground within spawn-1.5..+1.0 m; checked at cruise +-0.25 m. Geometry: extract_scene_mesh.py crop x-90..70 y-90..70, h 0.64 m"
+    },
+    "why": "AbandonedFactory: a derelict plant with tanks, pipe racks, sheds, broken walls and overgrown trees on flat ground (z 0.5). The start is in the open yard south of the main shed. The goal is in the walled tank yard to the north, 71 m away. The straight line passes the shed's west wall and then runs into the tank yard's perimeter wall and the scrap and vegetation in front of it (6 crossings, 2 taller than the band). The drone has to find the opening in the wall at x -3..5, y 48 (planar route 77 m, detour 1.10). The stage renders dark (audit luminance 0.07), so read the depth video."
+  }
+]
