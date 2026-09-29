@@ -1,0 +1,132 @@
+[
+  {
+    "name": "diffphys_s5",
+    "obstacles": "diffphys",
+    "seed": 5,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s6",
+    "obstacles": "diffphys",
+    "seed": 6,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s7",
+    "obstacles": "diffphys",
+    "seed": 7,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s8",
+    "obstacles": "diffphys",
+    "seed": 8,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s9",
+    "obstacles": "diffphys",
+    "seed": 9,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s10",
+    "obstacles": "diffphys",
+    "seed": 10,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s11",
+    "obstacles": "diffphys",
+    "seed": 11,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s12",
+    "obstacles": "diffphys",
+    "seed": 12,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s13",
+    "obstacles": "diffphys",
+    "seed": 13,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  },
+  {
+    "name": "diffphys_s14",
+    "obstacles": "diffphys",
+    "seed": 14,
+    "scale": 5.0,
+    "goal": [
+      -3.0,
+      50.0,
+      2.0
+    ],
+    "timeout": 120,
+    "climb_alt": 5
+  }
+]
