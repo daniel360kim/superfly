@@ -1,0 +1,362 @@
+[
+ {
+  "name": "wall_w06_s0",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    4.15,
+    4.0,
+    3.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 6.0,
+   "x_center": 0.0,
+   "near_face_y": 4.0,
+   "far_face_y": 4.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 10.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_w06_s1",
+  "obstacles": "boxes",
+  "seed": 1,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    6.15,
+    4.0,
+    3.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 6.0,
+   "x_center": 0.0,
+   "near_face_y": 6.0,
+   "far_face_y": 6.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 8.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_w10_s0",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    4.15,
+    4.0,
+    5.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 10.0,
+   "x_center": 0.0,
+   "near_face_y": 4.0,
+   "far_face_y": 4.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 10.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_w10_s1",
+  "obstacles": "boxes",
+  "seed": 1,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    6.15,
+    4.0,
+    5.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 10.0,
+   "x_center": 0.0,
+   "near_face_y": 6.0,
+   "far_face_y": 6.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 8.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_w16_s0",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    4.15,
+    4.0,
+    8.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 16.0,
+   "x_center": 0.0,
+   "near_face_y": 4.0,
+   "far_face_y": 4.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 10.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_w16_s1",
+  "obstacles": "boxes",
+  "seed": 1,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    6.15,
+    4.0,
+    8.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 16.0,
+   "x_center": 0.0,
+   "near_face_y": 6.0,
+   "far_face_y": 6.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 8.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_w24_s0",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    4.15,
+    4.0,
+    12.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 24.0,
+   "x_center": 0.0,
+   "near_face_y": 4.0,
+   "far_face_y": 4.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 10.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_w24_s1",
+  "obstacles": "boxes",
+  "seed": 1,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    6.15,
+    4.0,
+    12.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 24.0,
+   "x_center": 0.0,
+   "near_face_y": 6.0,
+   "far_face_y": 6.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 8.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_off12_s0",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    3.0,
+    5.15,
+    4.0,
+    6.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 12.0,
+   "x_center": 3.0,
+   "near_face_y": 5.0,
+   "far_face_y": 5.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 9.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "wall_off12_s1",
+  "obstacles": "boxes",
+  "seed": 1,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    -3.0,
+    5.15,
+    4.0,
+    6.0,
+    0.15,
+    4.0
+   ]
+  ],
+  "wall": {
+   "width": 12.0,
+   "x_center": -3.0,
+   "near_face_y": 5.0,
+   "far_face_y": 5.3,
+   "height": 8.0,
+   "thickness": 0.3,
+   "goal_behind_m": 9.0
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ }
+]

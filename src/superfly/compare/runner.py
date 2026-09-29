@@ -17,7 +17,11 @@ procedural obstacle field supplies the spawn):
       "environment": "Box Room",           // named Pegasus scene, OR:
       "usd_environment": "omniverse://.../stage.usd",
       "env_scale": 0.01,                   // scale for usd_environment
-      "obstacles": "none",                 // none | diffphys | diffaero
+      "obstacles": "none",                 // none | diffphys | diffaero | boxes
+      "boxes": [[cx,cy,cz, hx,hy,hz], ...], // "boxes" only: explicit boxes (world
+                                           // ENU, ground z = 0, optional r,p,y rad);
+                                           // needs start + goal, spawns on the
+                                           // ground at start XY like a field
       "seed": 0,                           // procedural-field RNG seed
       "scale": 5.0,                        // procedural-field size
       "start": [x, y, z],                  // spawn; optional for procedural
@@ -504,14 +508,23 @@ def load_scenarios(path):
             scale=float(entry.get("scale", 5.0)),
             climb_alt=entry.get("climb_alt"),
             obstacle_assets=bool(entry.get("obstacle_assets", False)),
+            boxes=entry.get("boxes"),
             timeout=entry.get("timeout"),
             pre_policy_timeout=entry.get("pre_policy_timeout"),
             landing_timeout=entry.get("landing_timeout"),
         )
-        if s["obstacles"] not in ("none", "diffphys", "diffaero"):
+        if s["obstacles"] not in ("none", "diffphys", "diffaero", "boxes"):
             raise SystemExit(f"scenario {s['name']}: obstacles must be "
-                             f"none|diffphys|diffaero, got {s['obstacles']!r}")
-        if s["obstacles"] == "none":
+                             f"none|diffphys|diffaero|boxes, got {s['obstacles']!r}")
+        if s["obstacles"] == "boxes":
+            if "start" not in entry or "goal" not in entry or not entry.get("boxes"):
+                raise SystemExit(f"scenario {s['name']}: 'start', 'goal' and a non-empty "
+                                 f"'boxes' list are required when obstacles is boxes")
+            from superfly.sim.obstacle_field import from_boxes
+            from_boxes(entry["boxes"], entry["start"], entry["goal"])   # validate here
+            s["start"] = np.asarray(entry["start"], float)
+            s["goal"] = np.asarray(entry["goal"], float)
+        elif s["obstacles"] == "none":
             if "start" not in entry or "goal" not in entry:
                 raise SystemExit(f"scenario {s['name']}: 'start' and 'goal' are "
                                  f"required when obstacles is none: {entry}")
@@ -558,6 +571,12 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
                     "--record-video-scale", str(VIDEO_SCALE)]
     if scenario.get("obstacle_assets"):
         sim_cmd += ["--obstacle-assets"]
+    if scenario["obstacles"] == "boxes":
+        # the explicit boxes travel as a file next to the trial's traj.npz
+        boxes_file = Path(npz_path).parent / "boxes.json"
+        boxes_file.parent.mkdir(parents=True, exist_ok=True)
+        boxes_file.write_text(json.dumps(scenario["boxes"]))
+        sim_cmd += ["--boxes-json", str(boxes_file)]
     if scenario["usd_environment"]:
         # retarget_usd: identity unless GSDS_USD_STAGE_ROOT is set (OSMO).
         sim_cmd += ["--usd-environment", retarget_usd(scenario["usd_environment"]),

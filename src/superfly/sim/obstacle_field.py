@@ -314,6 +314,32 @@ def generate_diffaero(seed: int = 0, scale: float = 5.0, heading_deg: float = 90
     return fld
 
 
+def from_boxes(boxes, p_init, p_target) -> ObstacleField:
+    """An explicit field of boxes, for hand-built scenarios ("obstacles":
+    "boxes" in a scenarios JSON, e.g. a single wall across the start->goal
+    line). Each box is (cx,cy,cz, hx,hy,hz) axis-aligned or
+    (cx,cy,cz, hx,hy,hz, roll,pitch,yaw) with XYZ-euler radians -- the same
+    tuples the procedural fields carry, so spawning, the trajectory npz and
+    metrics.py score it unchanged. Positions are world ENU metres, z up, the
+    ground at z = 0 (a box resting on the ground has cz = hz)."""
+    out = []
+    for b in boxes:
+        b = tuple(float(v) for v in b)
+        if len(b) not in (6, 9):
+            raise ValueError(f"box must have 6 or 9 numbers, got {len(b)}: {b}")
+        if min(b[3:6]) <= 0:
+            raise ValueError(f"box half-extents must be > 0: {b}")
+        out.append(b)
+    if not out:
+        raise ValueError("an explicit box field needs at least one box")
+    if len({len(b) for b in out}) != 1:          # the npz stores one (n, k) array
+        out = [b if len(b) == 9 else b + (0.0, 0.0, 0.0) for b in out]
+    fld = ObstacleField(boxes=out, scale=0.0)
+    fld.p_init = np.asarray(p_init, dtype=np.float64)
+    fld.p_target = np.asarray(p_target, dtype=np.float64)
+    return fld
+
+
 if __name__ == "__main__":
     print("=== DiffPhysDrone distribution ===")
     for s in (0, 1, 2):

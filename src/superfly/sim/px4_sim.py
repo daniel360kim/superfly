@@ -315,7 +315,7 @@ class PegasusApp:
                  record_video_fps: float = 15.0, record_video_scale: int = 4,
                  agile_overhead_debug_path: str = None,
                  agile_depth_flip: str = "none",
-                 vehicle: str = "iris"):
+                 vehicle: str = "iris", boxes_json: str = None):
         self.SPAWN_YAW_DEG = spawn_yaw_deg
         self.auto_stop = auto_stop
         self.debug_frames = debug_frames
@@ -406,6 +406,20 @@ class PegasusApp:
         _SPAWN_DEFAULT = (0.0, 0.0, 1.0)
         if obstacles == "none":
             spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]), float(spawn_xyz[2])]
+        elif obstacles == "boxes":
+            # explicit boxes from a JSON list (--boxes-json): hand-built
+            # scenarios such as a single wall across the start->goal line.
+            # The spawn is the literal --spawn; p_target is the --goal.
+            import json as _json
+            from superfly.sim.obstacle_field import from_boxes
+            if not boxes_json:
+                raise SystemExit("--obstacles boxes needs --boxes-json PATH")
+            spawn_pos = [float(spawn_xyz[0]), float(spawn_xyz[1]), float(spawn_xyz[2])]
+            self.field = from_boxes(_json.loads(Path(boxes_json).read_text()), spawn_pos,
+                                    goal_xyz if goal_xyz is not None else spawn_pos)
+            print("[obstacle_field]", self.field.summary())
+            self._asset_clear_xy = (spawn_pos[0], spawn_pos[1])
+            self._spawn_obstacles(self.field)
         elif obstacles == "diffaero":
             from superfly.sim.obstacle_field import generate_diffaero
             self.field = generate_diffaero(seed=seed, scale=scale)
@@ -1323,9 +1337,15 @@ def main():
                              "diffaero (9x16, 86 deg, 5 m, Euclidean, forward), "
                              "depthnav (72x128, 89 deg, 0.25-20 m, planar, forward), or "
                              "agile (640x480 render -> 224x224, 91 deg, 20 m, planar, forward).")
-    parser.add_argument("--obstacles", choices=["diffphys", "diffaero", "none"], default="diffphys",
-                        help="Obstacle-field distribution: diffphys, diffaero, or none "
+    parser.add_argument("--obstacles", choices=["diffphys", "diffaero", "boxes", "none"],
+                        default="diffphys",
+                        help="Obstacle-field distribution: diffphys, diffaero, boxes "
+                             "(explicit boxes from --boxes-json), or none "
                              "(scene geometry only, no procedural primitives).")
+    parser.add_argument("--boxes-json", type=str, default=None, metavar="PATH",
+                        help="--obstacles boxes: JSON list of boxes, each "
+                             "[cx,cy,cz,hx,hy,hz] (axis-aligned) or with roll,pitch,yaw "
+                             "[rad] appended; world ENU metres, ground at z = 0.")
     parser.add_argument("--obstacle-assets", action="store_true",
                         help="Replace each procedural obstacle primitive with a realistic USD "
                              "asset (OBSTACLE_ASSETS), scaled to the primitive's extent. Keeps the "
@@ -1411,6 +1431,7 @@ def main():
         ),
         agile_depth_flip=args.agile_depth_flip,
         vehicle=args.vehicle,
+        boxes_json=args.boxes_json,
     )
     pg_app.run()
 
