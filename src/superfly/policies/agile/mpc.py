@@ -499,7 +499,12 @@ def build_reference(world_pts, pos_current, cruise_alt, yaw_des, dt_wp=0.1,
 # ---------------------------------------------------------------------------
 
 class MPC:
-    def __init__(self, json_file='/tmp/acados_quad_agile_upstream.json'):
+    def __init__(self, json_file=None):
+        # AGILE_MPC_JSON: per-instance json (parallel campaigns set it together
+        # with AGILE_MPC_CODE_EXPORT_DIR, which the json bakes in); unset = the
+        # historical path.
+        json_file = json_file or os.environ.get("AGILE_MPC_JSON",
+                                                "/tmp/acados_quad_agile_upstream.json")
         try:
             self.solver = make_solver(json_file, 'FULL_CONDENSING_QPOASES')
         except Exception as exc:

@@ -88,7 +88,10 @@ from superfly.compare.registry import (
 # POLICY_PHASE_FILE, which lets --timeout budget the policy flight only,
 # with separate caps for the pre-policy (arm/climb/yaw) and post-policy
 # (landing) phases. depthnav (thrust variant) never writes "end".
-from superfly.common.sentinels import OFFBOARD_DONE_FILE, POLICY_PHASE_FILE
+# The paths are per-instance (SUPERFLY_INSTANCE, set in main() once a parallel
+# campaign holds its slot), so the harness resolves them at call time.
+from superfly.common import sentinels
+from superfly.common.instance import gcs_port, tmp_path
 
 # Fixed run parameters that used to be CLI flags but never needed changing.
 VIDEO_FPS = 15.0          # --record-video MP4 frame rate
@@ -187,7 +190,56 @@ def _sanitized_env():
     return env
 
 
-def stop_px4():
+def _user_procs(pattern):
+    """[(pid, cmdline)] of THIS user's processes whose command line matches the
+    pgrep regex `pattern` (never this process)."""
+    try:
+        out = subprocess.run(["pgrep", "-a", "-u", str(os.getuid()), "-f", pattern],
+                             capture_output=True, text=True)
+    except FileNotFoundError:
+        return []   # pgrep unavailable; best effort only
+    procs = []
+    for line in out.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) != os.getpid():
+            procs.append((int(pid), cmd))
+    return procs
+
+
+def _flag_value(cmd, flag):
+    """Value following `flag` in a whitespace-split command line, else None."""
+    toks = cmd.split()
+    for k, t in enumerate(toks[:-1]):
+        if t == flag:
+            return toks[k + 1]
+    return None
+
+
+def _term_then_kill(pids, grace=2.0):
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if pids:
+        time.sleep(grace)
+        for pid in pids:   # by PID, this user only -- never a bare pkill
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass   # already gone after SIGTERM -- the normal case
+
+
+def _is_mine(inst_of_proc, instance):
+    """Parallel mode (instance i): a process is this slot's to clean up when it
+    carries instance i, or -- slot 0 only -- when it carries NO instance (a
+    legacy leftover: it holds TCP 4560 / UDP 15001 / px4_lock-0, exactly
+    instance 0's resources, and cannot be live because legacy campaigns hold
+    the campaign lock exclusively)."""
+    return inst_of_proc == instance or (inst_of_proc is None and instance == 0)
+
+
+def stop_px4(instance=None):
     """Kill the currently-managed PX4 SITL process (and its process group --
     `make px4_sitl <model>` forks through cmake/sh down to the actual px4
     binary, so the whole tree needs killing together), PLUS any other px4
@@ -210,6 +262,19 @@ def stop_px4():
             pass
     _px4_proc = None
 
+    if instance is not None:
+        # Parallel campaign: only THIS slot's PX4 (px4 -i <instance>) -- the
+        # other slots' instances are live trials.
+        pids = []
+        for pid, cmd in _user_procs("bin/px4( |$)"):
+            if not cmd.split()[0].endswith("bin/px4"):
+                continue
+            i = _flag_value(cmd, "-i")
+            if _is_mine(int(i) if i is not None and i.isdigit() else None, instance):
+                pids.append(pid)
+        _term_then_kill(pids)
+        return
+
     try:
         out = subprocess.run(["pgrep", "-u", str(os.getuid()), "-f", "bin/px4"],
                              capture_output=True, text=True)
@@ -230,7 +295,37 @@ def stop_px4():
         pass  # pgrep/pkill unavailable; best effort only
 
 
-def start_px4(px4_dir: Path, model: str, log_path: Path):
+def _instance_px4_rc(px4_dir: Path, instance: int) -> Path:
+    """Per-instance overrides of the two PX4 startup fragments rcS sources
+    through PATH ("user defined params/mavlink streams for instances can be
+    in PATH"): a directory holding
+      px4-rc.mavlink -- the stock file with ONE change: the GCS link sends to
+                        UDP gcs_port(instance) instead of 14550 (stock PX4
+                        points every instance's GCS link at 14550, where
+                        concurrent offboards would cross-talk). Same link mode,
+                        rates and streams as the legacy link the offboards use.
+      px4-rc.params  -- the stock file + SDLOG_MODE -1: no ulog per trial
+                        (~20 MB each on airstation03's ~99 % disk; nothing
+                        reads them). SUPERFLY_PX4_ULOG=1 keeps logging.
+    Returned directory goes first on the px4 process's PATH."""
+    etc = px4_dir / "build" / "px4_sitl_default" / "etc" / "init.d-posix"
+    d = Path(tmp_path("/tmp/superfly_px4_rc", instance))
+    d.mkdir(parents=True, exist_ok=True)
+    mav = (etc / "px4-rc.mavlink").read_text()
+    gcs = "mavlink start -x -u $udp_gcs_port_local -r 4000000 -f\n"
+    if mav.count(gcs) != 1:
+        raise SystemExit(f"{etc / 'px4-rc.mavlink'}: GCS link line not found -- cannot "
+                         f"give PX4 instance {instance} its own GCS port.")
+    mav = mav.replace(gcs, gcs[:-1] + f" -o {gcs_port(instance)}\n")
+    (d / "px4-rc.mavlink").write_text(mav)
+    params = (etc / "px4-rc.params").read_text()
+    if os.environ.get("SUPERFLY_PX4_ULOG", "0") != "1":
+        params += "\n# superfly parallel instance: no ulog (disk)\nparam set SDLOG_MODE -1\n"
+    (d / "px4-rc.params").write_text(params)
+    return d
+
+
+def start_px4(px4_dir: Path, model: str, log_path: Path, instance=None):
     """Launch a fresh PX4 SITL in its own process group (so stop_px4 can kill
     it and any children together), appending its output to log_path.
 
@@ -238,7 +333,15 @@ def start_px4(px4_dir: Path, model: str, log_path: Path):
     PX4_SYS_AUTOSTART from PX4_MODEL_AUTOSTART); falls back to
     `make px4_sitl <model>` when the binary hasn't been built yet. stdin is a
     pipe: push_px4_boot_params writes `param set` lines into it, which PX4's
-    pxh shell consumes once the startup script finishes."""
+    pxh shell consumes once the startup script finishes.
+
+    instance (parallel campaigns): `px4 -i <instance>` -- PX4's own
+    multi-instance mode: simulator TCP 4560+i, MAV_SYS_ID i+1, lock
+    /tmp/px4_lock-i, working directory rootfs/<i>. That directory's
+    parameters.bson is re-seeded from rootfs/parameters.bson (the file every
+    legacy trial boots from -- CAL_*, MPC_THR_HOVER, FD_* ... persisted there)
+    before every boot, so each instance starts from the same parameters a
+    legacy trial would; the GCS port / ulog overrides: _instance_px4_rc."""
     global _px4_proc, _px4_log_pos
     _px4_log_pos = log_path.stat().st_size if log_path.exists() else 0
     log_f = open(log_path, "a")
@@ -247,7 +350,20 @@ def start_px4(px4_dir: Path, model: str, log_path: Path):
     rootfs = px4_dir / "build" / "px4_sitl_default" / "rootfs"
     autostart = PX4_MODEL_AUTOSTART.get(model)
     env = _sanitized_env()
-    if px4_bin.exists() and rootfs.is_dir() and autostart is not None:
+    if instance is not None:
+        if not (px4_bin.exists() and rootfs.is_dir() and autostart is not None):
+            raise SystemExit("parallel PX4 instances need the built px4 binary "
+                             f"({px4_bin}) and a known --px4-model autostart id.")
+        wd = rootfs / str(instance)
+        wd.mkdir(exist_ok=True)
+        if (rootfs / "parameters.bson").exists():
+            shutil.copy2(rootfs / "parameters.bson", wd / "parameters.bson")
+        env["PX4_SYS_AUTOSTART"] = autostart
+        env["PATH"] = f"{_instance_px4_rc(px4_dir, instance)}:{env.get('PATH', '')}"
+        cmd, cwd = [str(px4_bin), "-i", str(instance)], rootfs
+        log_f.write(f"\n=== starting `{px4_bin} -i {instance}` (PX4_SYS_AUTOSTART={autostart}, "
+                    f"wd {wd}, GCS link -> udp {gcs_port(instance)}) ===\n")
+    elif px4_bin.exists() and rootfs.is_dir() and autostart is not None:
         env["PX4_SYS_AUTOSTART"] = autostart
         cmd, cwd = [str(px4_bin)], rootfs
         log_f.write(f"\n=== starting `{px4_bin}` (PX4_SYS_AUTOSTART={autostart}) "
@@ -312,8 +428,9 @@ def wait_px4_booted(log_path: Path, timeout: float):
     while time.time() < deadline:
         text = _new_log_text(log_path)
         if "PX4 server already running" in text:
-            _die_with_log_tail(log_path, "PX4 refused to start -- instance 0 lock still "
-                               "held by a stale process (try `pkill -9 -f bin/px4`).")
+            _die_with_log_tail(log_path, "PX4 refused to start -- its instance lock "
+                               "(/tmp/px4_lock-<i>) is still held by a stale process "
+                               "(try `pkill -9 -f bin/px4`).")
         if "Waiting for simulator to accept connection" in text or "INFO  [mavlink]" in text:
             return
         if _px4_proc is not None and _px4_proc.poll() is not None:
@@ -325,20 +442,21 @@ def wait_px4_booted(log_path: Path, timeout: float):
     _die_with_log_tail(log_path, f"PX4 didn't reach a ready state within {timeout:.0f}s.")
 
 
-def restart_px4(px4_dir: Path, model: str, boot_timeout: float, log_path: Path):
+def restart_px4(px4_dir: Path, model: str, boot_timeout: float, log_path: Path,
+                instance=None):
     """Kill whatever PX4 SITL is currently running (this harness's own, or any
     stale leftover) and launch + wait for a fresh one, so every trial starts
     from a guaranteed-clean flight-controller state (EKF home, arming latches,
     simulated battery all reset)."""
     print("  [px4] restarting PX4 SITL for a clean state ...")
-    stop_px4()
+    stop_px4(instance)
     time.sleep(1.0)  # let the old process's lockfile fully release
-    start_px4(px4_dir, model, log_path)
+    start_px4(px4_dir, model, log_path, instance)
     print(f"  [px4] waiting up to {boot_timeout:.0f}s for PX4 to boot ...")
     wait_px4_booted(log_path, boot_timeout)
     push_px4_boot_params()
     print("  [px4] PX4 SITL up (failsafe params queued), waiting for Isaac "
-          "to connect on TCP 4560.")
+          f"to connect on TCP {4560 + (instance or 0)}.")
 
 
 # Every process pattern a crashed/abandoned trial can leave behind. run_px4_sim
@@ -351,13 +469,37 @@ STALE_PATTERNS = ("run_px4_sim.py", "depthnav_offboard.py",
                   "chunk_offboard.py", "hover_probe.py")
 
 
-def stop_stale_sims():
+def stop_stale_sims(instance=None):
     """Kill any leftover sim/offboard process from a manual run or a crashed
     trial that outlived its harness (see STALE_PATTERNS for why each matters).
     Only THIS user's processes are touched (shared GPU box: another user's
     jobs must never be killed), and the kill is by explicit PID from pgrep --
     never a bare pkill of a pattern that could match someone else's command
-    line (or a compound shell command containing the pattern itself)."""
+    line (or a compound shell command containing the pattern itself).
+
+    instance (parallel campaigns): only this slot's processes -- a sim whose
+    argv carries --px4-instance <instance>, an offboard whose --connect is
+    this slot's GCS port (+ legacy leftovers in slot 0, see _is_mine); the
+    other slots' processes are live trials."""
+    if instance is not None:
+        port = f"udp:localhost:{gcs_port(instance)}"
+        for pattern in STALE_PATTERNS:
+            pids = []
+            for pid, cmd in _user_procs(pattern):
+                if pattern == "run_px4_sim.py":
+                    v = _flag_value(cmd, "--px4-instance")
+                    inst = int(v) if v is not None and v.isdigit() else None
+                else:
+                    c = _flag_value(cmd, "--connect")
+                    inst = instance if c == port else (
+                        None if c in (None, "udp:localhost:14550") else -1)
+                if _is_mine(inst, instance):
+                    pids.append(pid)
+            if pids:
+                print(f"  [cleanup] SIGTERMing {len(pids)} stale {pattern} process(es) "
+                      f"of instance {instance}: {pids}")
+                _term_then_kill(pids)
+        return
     me = str(os.getuid())
     for pattern in STALE_PATTERNS:
         try:
@@ -562,6 +704,9 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
                "--log-traj", str(npz_path)]
     if args.headless:
         sim_cmd.append("--headless")
+    inst = getattr(args, "instance", None)
+    if inst is not None:
+        sim_cmd += ["--px4-instance", str(inst)]
     if video_dir is not None:
         # depth.mp4 = policy-input depth grid (turbo colormap); rgb.mp4 =
         # onboard RGB drone_camera at the same viewpoint.
@@ -618,9 +763,12 @@ def build_commands(method, cfg, args, scenario, npz_path, video_dir=None):
         print(f"  [{method}] climb-alt {climb_alt} -> {cfg['climb_alt']} "
               f"(method override; set AGILE_STUDENT_CLIMB_ALT=scenario to disable)")
         climb_alt = cfg["climb_alt"]
+    # parallel campaigns: PX4 instance i's GCS link is re-pointed at its own
+    # port (_instance_px4_rc), the offboard listens there
+    connect = args.connect if inst is None else f"udp:localhost:{gcs_port(inst)}"
     off_cmd = [off_python, cfg["offboard"],
                "--checkpoint", str(ckpt),
-               "--connect", args.connect,
+               "--connect", connect,
                "--depth",
                "--goal", *goal_vals,
                "--climb-alt", str(climb_alt)]
@@ -668,22 +816,41 @@ def run_trial(method, cfg, args, scenario):
 
     # A stale Isaac sim from an earlier manual run keeps TCP 4560 bound and
     # breaks this trial's MAVLink backend (Errno 98) -- clear it first.
-    stop_stale_sims()
+    inst = getattr(args, "instance", None)
+    stop_stale_sims(inst)
 
     if not args.no_px4_manage:
         restart_px4(Path(args.px4_dir), PX4_MODEL, PX4_BOOT_TIMEOUT,
-                   results / "px4_sitl.log")
+                   results / "px4_sitl.log", inst)
 
     # Fresh sentinels so a stale file doesn't stop the sim immediately (or
     # start the policy-phase timer from a previous trial's handoff).
-    Path(OFFBOARD_DONE_FILE).unlink(missing_ok=True)
-    Path(POLICY_PHASE_FILE).unlink(missing_ok=True)
+    done_file = sentinels.offboard_done_file()
+    ready_file = sentinels.sim_ready_file()
+    Path(done_file).unlink(missing_ok=True)
+    Path(sentinels.policy_phase_file()).unlink(missing_ok=True)
+    Path(ready_file).unlink(missing_ok=True)
     sim = subprocess.Popen(sim_cmd, cwd=str(_SCRIPTS))
     off = None
     off_log = None
     try:
-        print(f"  [warmup] giving Isaac {args.warmup:.0f}s to boot before offboard ...")
-        _sleep_or_die(sim, args.warmup, "sim exited during warmup")
+        if args.fast_start:
+            # The fixed warmup left the vehicle parked for ~40 s of SIM time
+            # (it starts counting before Kit has even booted). Launch the
+            # offboard once the sim loop has stepped (run_px4_sim writes the
+            # ready file), after a short settle; --warmup stays the cap.
+            print(f"  [warmup] fast start: offboard {args.ready_settle:.0f}s after the sim "
+                  f"steps (at most {args.warmup:.0f}s) ...")
+            t_ready = _wait_file_or_die(sim, ready_file, args.warmup,
+                                        "sim exited during warmup")
+            if t_ready is None:
+                print(f"  [warmup] no ready file after {args.warmup:.0f}s; launching anyway")
+            else:
+                print(f"  [warmup] sim stepping after {t_ready:.1f}s")
+                _sleep_or_die(sim, args.ready_settle, "sim exited during warmup")
+        else:
+            print(f"  [warmup] giving Isaac {args.warmup:.0f}s to boot before offboard ...")
+            _sleep_or_die(sim, args.warmup, "sim exited during warmup")
         # The offboard's per-tick POLICY lines (tilt cmd/meas, thrust, alt sp,
         # net Hz, depth probe) are the only record of what the policy actually
         # commanded -- they are what a speed/altitude post-mortem needs, and
@@ -710,7 +877,7 @@ def run_trial(method, cfg, args, scenario):
         wait_offboard_phased(off, args, scenario)
         # Ensure the sim's --auto-stop trips even if offboard was killed (its
         # own on-exit sentinel write only runs on a clean/Ctrl-C exit).
-        Path(OFFBOARD_DONE_FILE).write_text(str(time.time()))
+        Path(done_file).write_text(str(time.time()))
         try:
             sim.wait(timeout=SIM_GRACE)
         except subprocess.TimeoutExpired:
@@ -784,6 +951,10 @@ def run_trial(method, cfg, args, scenario):
     res["scenario"] = {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                        for k, v in scenario.items()}
     res["commands"] = dict(sim=" ".join(sim_cmd), offboard=" ".join(off_cmd))
+    res["harness"] = dict(instance=inst, isaac_slots=args.isaac_slots,
+                          fast_start=bool(args.fast_start),
+                          ready_settle_s=args.ready_settle if args.fast_start else None,
+                          warmup_s=args.warmup)
     (trial_dir / "metrics.json").write_text(json.dumps(res, indent=2, default=str))
     print("  result: " + json.dumps({k: res.get(k) for k in
           ("success", "collided", "min_clearance_m", "time_to_goal_s", "peak_speed_mps")}))
@@ -795,7 +966,7 @@ def _read_policy_phase():
     (None where the event hasn't happened yet)."""
     t_start = t_end = None
     try:
-        for line in Path(POLICY_PHASE_FILE).read_text().splitlines():
+        for line in Path(sentinels.policy_phase_file()).read_text().splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] == "start":
                 t_start = float(parts[1])
@@ -844,6 +1015,19 @@ def wait_offboard_phased(off, args, scenario):
                 _kill_offboard(off, f"landing exceeded {landing:.0f}s")
                 return
         time.sleep(0.5)
+
+
+def _wait_file_or_die(proc, path, secs, msg):
+    """Wait up to `secs` for `path` to exist (bail if the subprocess dies).
+    Returns the seconds waited, or None on timeout."""
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        if proc.poll() is not None:
+            raise SystemExit(f"[error] {msg} (exit code {proc.returncode}).")
+        if Path(path).exists():
+            return time.time() - t0
+        time.sleep(0.25)
+    return None
 
 
 def _sleep_or_die(proc, secs, msg):
@@ -980,7 +1164,28 @@ def main():
         ap.add_argument(f"--{m}-python", default=None, help=f"Interpreter for {m} offboard.")
         ap.add_argument(f"--{m}-checkpoint", default=None, help=f"Checkpoint override for {m}.")
     ap.add_argument("--warmup", type=float, default=45.0,
-                    help="Seconds to let Isaac boot before launching offboard.")
+                    help="Seconds to let Isaac boot before launching offboard (with "
+                         "--fast-start: the most it waits for the sim to step).")
+    ap.add_argument("--fast-start", action="store_true",
+                    default=os.environ.get("SUPERFLY_FAST_START", "0") == "1",
+                    help="Launch the offboard --ready-settle s after the sim loop first "
+                         "steps (run_px4_sim's ready file) instead of after the fixed "
+                         "--warmup: the vehicle no longer idles ~40 s of sim time on the "
+                         "pad. Climb, yaw, handoff and scoring are unchanged. Default "
+                         "$SUPERFLY_FAST_START=1, else off.")
+    ap.add_argument("--ready-settle", type=float, default=3.0,
+                    help="--fast-start: seconds between the sim's first step and the "
+                         "offboard launch (default 3).")
+    ap.add_argument("--isaac-slots", type=int,
+                    default=int(os.environ.get("SUPERFLY_ISAAC_SLOTS", "0") or 0),
+                    help="Concurrent Isaac campaigns of this account on this box. 0 "
+                         "(default; $SUPERFLY_ISAAC_SLOTS): legacy -- one campaign at a "
+                         "time, PX4 instance 0, GCS UDP 14550, fixed /tmp sentinels. K >= 1: "
+                         "this campaign takes one of K slots i (waiting for a free one) "
+                         "and namespaces everything by i: PX4 `-i i` (simulator TCP "
+                         "4560+i, wd rootfs/i), GCS link UDP 14650+i, depth/debug UDP "
+                         "15001/15002+10i, sentinels and acados dirs *_<uid>_<i>. "
+                         "Legacy and slotted campaigns exclude each other.")
     ap.add_argument("--timeout", type=float, default=180.0,
                     help="Default max POLICY-phase flight time [s] per trial (measured "
                          "from the climb/yaw -> policy handoff, excluding takeoff and "
@@ -1077,18 +1282,58 @@ def main():
     # (2026-09-29: a t6_iter isaac stage started mid-trial and silently killed
     # a Starling eval's sim + offboard; no traj.npz, no error). Serialize on a
     # per-user lock instead; flock is released when the process dies.
-    lock_f = None
+    #
+    # --isaac-slots K >= 1 (parallel): the same lock taken SHARED, plus one of
+    # K per-slot locks exclusively. Slotted campaigns never touch another
+    # slot's processes (stop_stale_sims / stop_px4 are scoped to their
+    # instance), and a legacy campaign (exclusive lock) still excludes them
+    # all, and they it -- its GCS listener on 14550 and instance-0 resources
+    # must not meet a slotted campaign.
+    lock_f = slot_f = None
+    args.instance = None
     if not args.dry_run:
         import fcntl
         lock_path = f"/tmp/superfly_isaac_campaign_{os.getuid()}.lock"
         lock_f = open(lock_path, "w")
+        mode = fcntl.LOCK_SH if args.isaac_slots >= 1 else fcntl.LOCK_EX
         try:
-            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_f, mode | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"[lock] another Isaac campaign holds {lock_path}; waiting for it ...",
-                  flush=True)
-            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            print(f"[lock] {'a legacy' if mode == fcntl.LOCK_SH else 'another'} Isaac "
+                  f"campaign holds {lock_path}; waiting for it ...", flush=True)
+            fcntl.flock(lock_f, mode)
             print("[lock] acquired", flush=True)
+        if args.isaac_slots >= 1:
+            waited = False
+            while slot_f is None:
+                for i in range(args.isaac_slots):
+                    f = open(f"/tmp/superfly_isaac_slot_{os.getuid()}_{i}.lock", "w")
+                    try:
+                        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        f.close()
+                        continue
+                    slot_f, args.instance = f, i
+                    break
+                if slot_f is None:
+                    if not waited:
+                        print(f"[lock] all {args.isaac_slots} Isaac slots busy; waiting ...",
+                              flush=True)
+                        waited = True
+                    time.sleep(5.0)
+            # children (sim, offboard) inherit the instance: sentinels, UDP
+            # ports and the acados build dirs follow it
+            os.environ["SUPERFLY_INSTANCE"] = str(args.instance)
+            for var, default in (("AGILE_MPC_CODE_EXPORT_DIR", "/tmp/acados_agile_c_generated_code"),
+                                 ("AGILE_MPC_JSON", "/tmp/acados_quad_agile_upstream.json")):
+                base = os.environ.get(var, default)
+                if var == "AGILE_MPC_JSON":
+                    root, ext = os.path.splitext(base)
+                    os.environ[var] = tmp_path(root, args.instance) + ext
+                else:
+                    os.environ[var] = tmp_path(base, args.instance)
+            print(f"[lock] Isaac slot {args.instance} of {args.isaac_slots} (PX4 -i "
+                  f"{args.instance}, GCS udp {gcs_port(args.instance)})", flush=True)
 
     registry = method_registry()
     ran_any = False
@@ -1122,7 +1367,7 @@ def main():
             ran_any = True
     finally:
         if not args.no_px4_manage:
-            stop_px4()
+            stop_px4(args.instance)
 
     if args.dry_run:
         print("\n[dry-run] no processes launched.")

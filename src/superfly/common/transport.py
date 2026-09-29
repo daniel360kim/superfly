@@ -40,7 +40,11 @@ import sys
 import zlib
 import numpy as np
 
-DEPTH_PORT = 15001            # local UDP port for depth frames
+from superfly.common.instance import depth_port
+
+# local UDP port for depth frames: 15001, +10 per SUPERFLY_INSTANCE (parallel
+# campaigns; unset = 15001)
+DEPTH_PORT = depth_port()
 
 CODEC_RAW_F32 = 0
 CODEC_ZLIB_U16_MM = 1

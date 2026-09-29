@@ -190,6 +190,14 @@ def main():
                          "px4_offboard.Px4Clock); wall = the host clock.")
     ap.add_argument("--policy-timeout", type=float, default=None,
                     help="Land (not reached) after this many --clock seconds of POLICY.")
+    ap.add_argument("--post-goal-hold", type=float, default=None, metavar="S",
+                    help="After the goal is REACHED: send the land command as usual, keep "
+                         "streaming for S --clock seconds, then exit without waiting for "
+                         "touchdown (PX4 is in AUTO.LAND by then; no disarm is sent). The "
+                         "harness scores clearance/speed up to the first 3D goal-sphere entry, "
+                         "~0.2 s after the handoff, so S >= 1 leaves every metric unchanged "
+                         "and saves the ~8 s descent. A policy TIMEOUT still lands fully (its "
+                         "clearance window runs to the log end). Default: land fully.")
     ap.add_argument("--hover-thrust", type=float, default=None,
                     help="MPC_THR_HOVER for the airframe (PX4's estimator refines it).")
     args = ap.parse_args()
@@ -293,6 +301,8 @@ def main():
     next_dec = -1e9
     policy_t0 = None
     landing_sent = False
+    reached_t = None            # --clock time of the goal handoff (--post-goal-hold)
+    skip_disarm = False
     lo, hi = float(args.z_min), Z_REF[1]
     n_dec = 0
     t_prev = None
@@ -426,6 +436,7 @@ def main():
                           flush=True)
                 if dist < args.goal_radius:
                     phase = "LANDING"
+                    reached_t = now
                     mark_policy_phase("end")
                     print(f">>> goal reached at {pos.round(2)}; landing", flush=True)
                 elif args.policy_timeout is not None and now - policy_t0 > args.policy_timeout:
@@ -439,6 +450,12 @@ def main():
                 if not state.armed:
                     print(">>> landed and disarmed", flush=True)
                     break
+                if (args.post_goal_hold is not None and reached_t is not None
+                        and now - reached_t >= args.post_goal_hold):
+                    print(f">>> post-goal hold {args.post_goal_hold:g} s done at {pos.round(2)} "
+                          f"-- exiting without waiting for touchdown", flush=True)
+                    skip_disarm = True
+                    break
     except KeyboardInterrupt:
         pass
     finally:
@@ -449,9 +466,10 @@ def main():
         if dec_log is not None:
             dec_log.close()
         stop.set()
-        mav.mav.command_long_send(mav.target_system, mav.target_component,
-                                  mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                                  0, 0, 0, 0, 0, 0, 0, 0)
+        if not skip_disarm:     # an in-air disarm would drop the vehicle
+            mav.mav.command_long_send(mav.target_system, mav.target_component,
+                                      mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                      0, 0, 0, 0, 0, 0, 0, 0)
         mark_offboard_done()
 
 

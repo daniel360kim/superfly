@@ -21,7 +21,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-AGILE_DEBUG_PORT = 15002
+from superfly.common.instance import agile_debug_port
+
+AGILE_DEBUG_PORT = agile_debug_port()   # 15002, +10 per SUPERFLY_INSTANCE (unset = 15002)
 _MAGIC = b"AGDB"
 _VERSION = 1
 _HEADER = struct.Struct("<4sBIBBBBB")  # magic, ver, seq, n_modes, n_wp, mode_idx, tracker, pad

@@ -210,7 +210,7 @@ RGB_W, RGB_H = 640, 360
 # for what each file means; --auto-stop polls OFFBOARD_DONE_FILE, and
 # POLICY_PHASE_FILE is read at trajectory-save time so the .npz carries the
 # policy window and metrics.py can clip clearance/speed to the policy flight).
-from superfly.common.sentinels import OFFBOARD_DONE_FILE, POLICY_PHASE_FILE
+from superfly.common.sentinels import OFFBOARD_DONE_FILE, POLICY_PHASE_FILE, SIM_READY_FILE
 
 
 class Mp4Writer:
@@ -315,8 +315,14 @@ class PegasusApp:
                  record_video_fps: float = 15.0, record_video_scale: int = 4,
                  agile_overhead_debug_path: str = None,
                  agile_depth_flip: str = "none",
-                 vehicle: str = "iris", boxes_json: str = None):
+                 vehicle: str = "iris", boxes_json: str = None,
+                 px4_instance: int = 0):
         self.SPAWN_YAW_DEG = spawn_yaw_deg
+        # Parallel campaigns (runner --isaac-slots): this sim pairs with PX4
+        # SITL instance px4_instance, whose simulator link is TCP 4560 + it
+        # (Pegasus adds vehicle_id to connection_baseport). 0 = historical.
+        self.px4_instance = int(px4_instance)
+        Path(SIM_READY_FILE).unlink(missing_ok=True)
         self.auto_stop = auto_stop
         self.debug_frames = debug_frames
         self.agile_overhead_debug_path = agile_overhead_debug_path
@@ -455,7 +461,7 @@ class PegasusApp:
                   f"{_backend_extra['input_scaling'][0]:g} + "
                   f"{_backend_extra['zero_position_armed'][0]:g} rad/s")
         mavlink_config = PX4MavlinkBackendConfig({
-            "vehicle_id": 0,
+            "vehicle_id": self.px4_instance,
             "px4_autolaunch": False,
             **_backend_extra,
         })
@@ -1257,6 +1263,7 @@ class PegasusApp:
                   "automatically once the offboard script exits (landed, "
                   "Ctrl-C, or crash), no manual Ctrl-C needed.")
         self.timeline.play()
+        self._ready_marked = False
         exit_reason = "unknown"
         try:
             while True:
@@ -1267,6 +1274,14 @@ class PegasusApp:
                     exit_reason = "stop_sim (auto-stop done-file)"
                     break
                 self.world.step(render=True)
+                if not self._ready_marked:
+                    # first completed step: Kit booted, stage loaded, PX4
+                    # attached -- runner --fast-start launches the offboard now
+                    self._ready_marked = True
+                    try:
+                        Path(SIM_READY_FILE).write_text(f"{time.time()}\n")
+                    except Exception:
+                        pass
                 self._publish_depth()
                 if self.policy == "agile":
                     self._dump_agile_overhead_debug()
@@ -1289,6 +1304,7 @@ class PegasusApp:
             # carb messages reach the console reliably.
             carb.log_warn(f"sim loop exit after {time.time() - t0:.1f}s: {exit_reason}; "
                           f"done_file={Path(OFFBOARD_DONE_FILE).exists()}")
+            Path(SIM_READY_FILE).unlink(missing_ok=True)
             if self._traj is not None:
                 self._save_trajectory()
             self._close_videos()
@@ -1398,6 +1414,10 @@ def main():
                         help="Goal position (X Y [Z]) to save in the trajectory npz, overriding "
                              "the obstacle field's p_target. Used by compare/run_comparison.py "
                              "so metrics.py scores against the actual offboard goal.")
+    parser.add_argument("--px4-instance", type=int, default=None, metavar="N",
+                        help="PX4 SITL instance to attach to (simulator TCP 4560+N). "
+                             "Default: $SUPERFLY_INSTANCE, else 0 (historical). Set by "
+                             "run_comparison.py --isaac-slots for parallel trials.")
     # parse_known_args so Isaac Sim's own argv flags don't trip argparse
     args, _ = parser.parse_known_args()
 
@@ -1432,6 +1452,8 @@ def main():
         agile_depth_flip=args.agile_depth_flip,
         vehicle=args.vehicle,
         boxes_json=args.boxes_json,
+        px4_instance=(args.px4_instance if args.px4_instance is not None
+                      else int(os.environ.get("SUPERFLY_INSTANCE", "").strip() or 0)),
     )
     pg_app.run()
 
