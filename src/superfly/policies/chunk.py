@@ -395,6 +395,123 @@ class ClearanceShield:
         return v, info
 
 
+REASON_CODES = {"gate": 0, "switch": 1, "hysteresis": 2, "dwell": 3}
+
+
+class DecisionLog:
+    """Per-decision record of the FULL network output (chunk_offboard, on by
+    default whenever the runner sets SUPERFLY_STATE_LOG; --no-net-log = off):
+    ``chunk_outputs.npy`` + ``chunk_outputs.json`` next to chunk_decisions.csv.
+
+    One structured row per decision (15 Hz), ~1.4 kB: all heads' chunks as the
+    network emitted them (H x [vx_1..T | vy | vz | yr], heading frame, SI, step
+    j at t = j dt), the gate logits, the selected head / reason, the pose the
+    decision was taken at, and the setpoint actually sent on that tick. A
+    150 s flight is ~3 MB; typical trials < 1 MB.
+
+    The file is a valid .npy after EVERY row (the header's row count is
+    rewritten in place, fixed width), so ``np.load`` reads a flight whose
+    offboard was killed. Every write is guarded: a logging failure disables the
+    log and never reaches the control loop. Nothing here feeds back into
+    control. Reproduce a head's path in the local frame with ``chunk_paths``."""
+
+    VERSION = 1
+
+    def __init__(self, path, heads, steps: int, meta: dict | None = None):
+        self.path = Path(path)
+        H, T = len(heads), int(steps)
+        self.dtype = np.dtype([
+            ("t", "<f8"),                  # the chunk_decisions.csv clock (s since offboard start)
+            ("pos", "<f4", (3,)),          # local ENU (= csv x, y, z)
+            ("vel", "<f4", (3,)),          # local ENU
+            ("R", "<f4", (3, 3)),          # local ENU <- FLU body
+            ("omega", "<f4", (3,)),        # FLU body rate
+            ("yaw", "<f4"),                # heading yaw = atan2(R[1,0], R[0,0]): the chunk frame
+            ("head", "i1"),                # executed head (after hysteresis / dwell)
+            ("reason", "i1"),              # REASON_CODES
+            ("gate", "<f4", (H,)),         # gate LOGITS (softmax -> the csv p0..p4)
+            ("chunk", "<f4", (H, 4 * T)),  # raw network chunk per head
+            ("cmd", "<f4", (4,)),          # setpoint sent on the decision tick: v ENU, yaw rate
+            ("n_ens", "i1"),               # chunks in the temporal ensemble on that tick
+        ])
+        self.n = 0
+        self.ok = True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._f = open(self.path, "wb")
+        self._f.write(self._header(0))
+        self._f.flush()
+        info = {
+            "format": f"superfly chunk_outputs v{self.VERSION}",
+            "heads": list(heads), "steps": T,
+            "chunk_layout": "chunk[h] = [vx_1..vx_T | vy_1..vy_T | vz_1..vz_T | yr_1..yr_T], "
+                            "heading frame (x along yaw, gravity aligned), SI; step j is t = j*dt "
+                            "after the decision",
+            "frames": "pos/vel/goal local ENU of the offboard (origin PX4 home, the frame of "
+                      "chunk_decisions.csv x,y,z); R = local ENU <- FLU body; heading frame = "
+                      "rz(yaw), yaw = atan2(R[1,0], R[0,0])",
+            "integration": "p_0 = pos; p_j = pos + rz(yaw) @ sum_{i<=j} v_i * dt (the executor's "
+                           "vh @ rz(yaw).T and the student's ChunkClearanceLoss.positions)",
+            "t": "same clock as chunk_decisions.csv t (--clock, seconds since offboard start)",
+            "gate": "logits; probabilities = softmax(gate) (csv p0..p4)",
+            "reason_codes": REASON_CODES,
+            "cmd": "setpoint on the decision tick after the ensemble, lead, v-cap, z band, "
+                   "shield, yaw clip (and the smooth plant, if on) = csv cmd_vx..cmd_yr",
+        }
+        info.update(meta or {})
+        Path(str(self.path.with_suffix("")) + ".json").write_text(json.dumps(info, indent=1) + "\n")
+
+    def _header(self, n: int) -> bytes:
+        """npy v1.0 header, fixed width whatever n (the count is %12d)."""
+        d = ("{'descr': %r, 'fortran_order': False, 'shape': (%12d,), }"
+             % (np.lib.format.dtype_to_descr(self.dtype), int(n)))
+        pre = 10                                          # magic (8) + uint16 length
+        pad = (-(pre + len(d) + 1)) % 64
+        d = d + " " * pad + "\n"
+        return b"\x93NUMPY\x01\x00" + len(d).to_bytes(2, "little") + d.encode("latin1")
+
+    def add(self, t, pos, vel, R, omega, last: dict, cmd_v, cmd_yr, n_ens) -> None:
+        if not self.ok:
+            return
+        try:
+            r = np.zeros((), self.dtype)
+            r["t"], r["pos"], r["vel"] = float(t), pos, vel
+            r["R"], r["omega"], r["yaw"] = R, omega, last["yaw"]
+            r["head"] = int(last["head"])
+            r["reason"] = REASON_CODES.get(last.get("reason"), -1)
+            r["gate"], r["chunk"] = last["gate"], last["chunk"]
+            r["cmd"] = (*np.asarray(cmd_v, float).reshape(3), float(cmd_yr))
+            r["n_ens"] = int(n_ens)
+            self._f.seek(0, 2)
+            self._f.write(r.tobytes())
+            self.n += 1
+            self._f.seek(0)
+            self._f.write(self._header(self.n))
+            self._f.flush()
+        except Exception as e:                       # never let the log touch control
+            self.ok = False
+            print(f"[chunk] net log disabled: {type(e).__name__}: {e}", flush=True)
+
+    def close(self) -> None:
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
+def chunk_paths(chunk, pos, yaw: float, dt: float = CHUNK_DT) -> np.ndarray:
+    """Positions of every head's chunk, integrated from the decision pose:
+    (H, 4T) chunk + pos (3,) + heading yaw -> (H, T + 1, 3), p_0 = pos,
+    p_j = pos + rz(yaw) @ sum_{i<=j} v_i dt -- the executor's heading-to-world
+    rotation and the student's ChunkClearanceLoss.positions."""
+    c = np.asarray(chunk, float)
+    c = c.reshape(-1, c.shape[-1])
+    T = c.shape[1] // 4
+    v = np.stack([c[:, 0:T], c[:, T:2 * T], c[:, 2 * T:3 * T]], -1)       # (H, T, 3) heading
+    p = np.cumsum(v, 1) * float(dt) @ rz(float(yaw)).T
+    p = np.concatenate([np.zeros((len(c), 1, 3)), p], 1)
+    return p + np.asarray(pos, float).reshape(1, 1, 3)
+
+
 def yaw_toward(yaw: float, vel, gain: float, v_min: float = 0.5) -> float:
     """Extra yaw rate turning the camera toward the horizontal velocity
     (chunk_offboard --yaw-to-vel): gain * wrap(heading(vel) - yaw), 0 below
@@ -534,7 +651,10 @@ class ChunkPolicy:
         self.prev_chunk = np.concatenate([vh, c[3 * S:4 * S, None]], 1)
         self.prev_yaw = yaw
         self.last = {"head": sel, "reason": reason, "probs": probs,
-                     "v1": vh[0] @ Rh.T, "switches": self.switches}
+                     "v1": vh[0] @ Rh.T, "switches": self.switches,
+                     # the full network output of this decision (DecisionLog);
+                     # references only, nothing is copied or recomputed
+                     "chunk": chunk, "gate": gate, "yaw": yaw}
         return self.last
 
     def command(self, t):

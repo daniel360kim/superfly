@@ -37,6 +37,12 @@ filters the plant's target AND its output (written back into the plant).
 --yaw-to-vel K (off by default) adds K * (heading(velocity) - yaw) to the yaw
 rate so the camera turns with the velocity during swerves.
 
+Logs (when the runner sets SUPERFLY_STATE_LOG): chunk_decisions.csv (one row
+per decision, unchanged) and, unless --no-net-log, chunk_outputs.npy + .json
+beside it -- every head's raw chunk, the gate logits, the decision pose (pos,
+vel, R, heading yaw) and the setpoint sent, ~1.4 kB per decision
+(superfly.policies.chunk.DecisionLog; paths via chunk_paths). Logging only.
+
 Phases as agile_offboard: CLIMB (position hold) -> YAW (face goal) -> POLICY
 -> LANDING when within --goal-radius horizontally.
 """
@@ -64,7 +70,7 @@ from superfly.common.px4_offboard import (
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 from superfly.policies.chunk import (ChunkPolicy, SmoothRef, ObstacleMemory, ClearanceShield,
-                                     yaw_toward)
+                                     DecisionLog, yaw_toward)
 
 CONTROL_HZ = 60.0          # a multiple of DECISION_HZ: exactly every 4th tick decides
 DECISION_HZ = 15.0          # sim_episode.DECISION_HZ
@@ -182,6 +188,12 @@ def main():
     ap.add_argument("--yaw-to-vel", type=float, default=0.0,
                     help="Add K * (heading(velocity) - yaw) to the yaw rate [1/s] above 0.5 m/s "
                          "(0 = off): turns the camera with the velocity during swerves.")
+    ap.add_argument("--no-net-log", action="store_true",
+                    help="Do not write chunk_outputs.npy/.json (default: written next to "
+                         "chunk_decisions.csv whenever SUPERFLY_STATE_LOG is set -- every head's "
+                         "raw chunk, the gate logits and the decision pose, ~1.4 kB per decision; "
+                         "read by scratch_t6/isaac_eval/render_net_overlay.py). Logging only: "
+                         "control is identical either way.")
     ap.add_argument("--kv", type=float, default=3.0,
                     help="PX4 velocity P gain (MPC_XY/Z_VEL_P_ACC) = sim KV_VEL.")
     ap.add_argument("--clock", choices=["wall", "px4"], default="px4",
@@ -290,6 +302,21 @@ def main():
                       + (",mem_n,sh_ticks,sh_dv,sh_n,sh_dmin" if shield else "")
                       + (",yaw_vel_yr" if args.yaw_to_vel > 0 else "")
                       + "\n")
+    net_log = None
+    if sl and not args.no_net_log:
+        try:
+            net_log = DecisionLog(
+                Path(sl).with_name("chunk_outputs.npy"), policy.heads, policy.steps,
+                meta=dict(dt=policy.cdt, checkpoint=Path(args.checkpoint).name,
+                          goal_local_enu=[float(x) for x in goal], lead=policy.lead,
+                          hysteresis=policy.hysteresis, dwell=policy.dwell,
+                          ensemble=policy.ensemble, same_head=policy.same_head,
+                          v_cap=args.v_cap, z_min=args.z_min, smooth=bool(args.smooth),
+                          shield=bool(args.shield), yaw_to_vel=args.yaw_to_vel,
+                          decision_hz=DECISION_HZ, clock=args.clock))
+        except Exception as e:      # logging must never stop a flight
+            print(f"[chunk] net log off: {type(e).__name__}: {e}", flush=True)
+            net_log = None
 
     dt = 1.0 / CONTROL_HZ
     phase = "CLIMB"
@@ -425,6 +452,8 @@ def main():
                            f"{sh_stat['n']},{min(sh_stat['dmin'], 99.0):.3f}" if shield is not None else "")
                         + (f",{yv_yr:.3f}" if args.yaw_to_vel > 0 else "") + "\n")
                     sh_stat.update(ticks=0, dv=0.0, dmin=float("inf"), n=0)
+                if net_log is not None and last_dec == now:
+                    net_log.add(now - t0, pos, vel, R, om, policy.last, v, yr, n_used)
                 dist = float(np.linalg.norm((goal - pos)[:2]))
                 if verbose:
                     print(f"[POLICY t={now - t0:.1f}] pos={pos.round(2)} |v|={np.linalg.norm(vel):.2f} "
@@ -465,6 +494,8 @@ def main():
                   f"remembered point {sh_tot['dmin']:.2f} m", flush=True)
         if dec_log is not None:
             dec_log.close()
+        if net_log is not None:
+            net_log.close()
         stop.set()
         if not skip_disarm:     # an in-air disarm would drop the vehicle
             mav.mav.command_long_send(mav.target_system, mav.target_component,

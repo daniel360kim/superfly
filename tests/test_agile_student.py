@@ -368,6 +368,50 @@ def test_chunk_head_dwell():
     assert p.select_head(q, 1.2) == (1, "switch")
 
 
+def test_chunk_decision_log_roundtrip(tmp_path):
+    """chunk_offboard's per-decision network log (chunk_outputs.npy): a valid
+    .npy after every row (np.load of a killed flight works), the fields as
+    written, the JSON sidecar, and chunk_paths = the executor's own world
+    velocities (ring "v" = vh @ rz(yaw).T) integrated p_j = sum_{i<=j} v_i dt."""
+    import json as _json
+    from superfly.policies import chunk
+    T, H = 15, 5
+    rng = np.random.default_rng(0)
+    log = chunk.DecisionLog(tmp_path / "chunk_outputs.npy", chunk.HEADS, T, meta={"lead": 0.5})
+    assert np.load(tmp_path / "chunk_outputs.npy").shape == (0,)
+    rows = []
+    for k in range(3):
+        c, g = rng.normal(size=(H, 4 * T)), rng.normal(size=H)
+        yaw = 0.3 * k - 0.4
+        R = _rot(0.05, -0.1, yaw)
+        last = {"head": k % H, "reason": "switch" if k else "gate", "chunk": c, "gate": g,
+                "yaw": chunk.heading_yaw(R)}
+        pos = np.array([k, 2.0 * k, 1.5])
+        log.add(0.1 * k, pos, np.ones(3), R, np.zeros(3), last, np.array([1.0, 0.5, 0.0]), 0.2, 2)
+        rows.append((pos, R, c, g, last))
+        a = np.load(tmp_path / "chunk_outputs.npy")         # valid mid-flight
+        assert a.shape == (k + 1,)
+    log.close()
+    a = np.load(tmp_path / "chunk_outputs.npy")
+    meta = _json.loads((tmp_path / "chunk_outputs.json").read_text())
+    assert meta["heads"] == list(chunk.HEADS) and meta["steps"] == T and meta["lead"] == 0.5
+    for k, (pos, R, c, g, last) in enumerate(rows):
+        np.testing.assert_allclose(a["chunk"][k], c, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(a["gate"][k], g, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(a["R"][k], R, atol=1e-6)
+        assert a["head"][k] == k % H and a["reason"][k] == (1 if k else 0)
+        np.testing.assert_allclose(a["cmd"][k], [1.0, 0.5, 0.0, 0.2], atol=1e-6)
+        # the executor's world-frame velocities for head h
+        yaw = chunk.heading_yaw(R)
+        P = chunk.chunk_paths(a["chunk"][k], a["pos"][k], float(a["yaw"][k]))
+        assert P.shape == (H, T + 1, 3)
+        for h in range(H):
+            vh = np.stack([c[h, :T], c[h, T:2 * T], c[h, 2 * T:3 * T]], 1)
+            vw = vh @ chunk.rz(yaw).T
+            np.testing.assert_allclose(P[h, 0], pos, atol=1e-5)
+            np.testing.assert_allclose(P[h, 1:], pos + np.cumsum(vw, 0) * 0.1, atol=1e-4)
+
+
 
 # --------------------------------------------------------------------------- #
 # 6b. chunk executor clearance shield (chunk_offboard --shield)
