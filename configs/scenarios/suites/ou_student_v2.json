@@ -1,0 +1,178 @@
+[
+ {
+  "name": "ou2_bar10_c20",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    5.05,
+    2.0,
+    8.0,
+    0.05,
+    0.05
+   ]
+  ],
+  "ou": {
+   "kind": "thin_bar",
+   "width": 16.0,
+   "z_centre": 2.0,
+   "thickness": 0.1,
+   "near_face_y": 5.0,
+   "expect": "over|under",
+   "why": "probe: thin wide bar exactly at camera height reads as go-around"
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "ou2_bar10_c215",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    5.05,
+    2.15,
+    8.0,
+    0.05,
+    0.05
+   ]
+  ],
+  "ou": {
+   "kind": "thin_bar",
+   "width": 16.0,
+   "z_centre": 2.15,
+   "thickness": 0.1,
+   "near_face_y": 5.0,
+   "expect": "under|over"
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "ou2_bar20_c20_w30",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    5.1,
+    2.0,
+    15.0,
+    0.1,
+    0.1
+   ]
+  ],
+  "ou": {
+   "kind": "thin_bar",
+   "width": 30.0,
+   "z_centre": 2.0,
+   "thickness": 0.2,
+   "near_face_y": 5.0,
+   "expect": "over|under"
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "ou2_hurdle_t35",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    5.15,
+    1.75,
+    8.0,
+    0.15,
+    1.75
+   ]
+  ],
+  "ou": {
+   "kind": "hurdle",
+   "width": 16.0,
+   "top": 3.5,
+   "above_flight": 1.5,
+   "near_face_y": 5.0,
+   "expect": "over"
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ },
+ {
+  "name": "ou2_lintel_b11",
+  "obstacles": "boxes",
+  "seed": 0,
+  "start": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "goal": [
+   0.0,
+   14.3,
+   2.0
+  ],
+  "boxes": [
+   [
+    0.0,
+    5.15,
+    4.55,
+    8.0,
+    0.15,
+    3.45
+   ]
+  ],
+  "ou": {
+   "kind": "lintel",
+   "width": 16.0,
+   "bottom": 1.1,
+   "below_flight": 0.9,
+   "near_face_y": 5.0,
+   "expect": "under"
+  },
+  "climb_alt": 2,
+  "timeout": 150
+ }
+]
