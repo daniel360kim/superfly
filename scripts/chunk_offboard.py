@@ -216,6 +216,9 @@ def main():
     ap.add_argument("--mem-cam-pitch", type=float, default=0.0,
                     help="--shield: effective camera pitch [deg, + = down] for the back-"
                          "projection (Isaac with SUPERFLY_CAM_PITCH_DEG=-13: level = 0).")
+    ap.add_argument("--yaw-lead", type=float, default=0.0,
+                    help="Read each chunk's yaw rate on the step containing tau + YAW_LEAD [s] "
+                         "(0 = at tau, the old behaviour; the turn test used YAW_LEAD = --lead).")
     ap.add_argument("--yaw-to-vel", type=float, default=0.0,
                     help="Add K * (heading(velocity) - yaw) to the yaw rate [1/s] above 0.5 m/s "
                          "(0 = off): turns the camera with the velocity during swerves.")
@@ -265,7 +268,7 @@ def main():
                          stuck_window=args.stuck, stuck_progress=args.stuck_progress,
                          stuck_v=args.stuck_v, stuck_hold=args.stuck_hold,
                          stuck_min_dist=args.stuck_min_dist, stuck_disp=args.stuck_disp,
-                         v_cap=args.v_cap)
+                         v_cap=args.v_cap, yaw_lead=args.yaw_lead)
     print(f"[chunk] {Path(args.checkpoint).name}: heads {policy.heads}, "
           f"{policy.steps} x {policy.cdt:g} s, lead {policy.lead:g} s, "
           f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "
@@ -299,6 +302,8 @@ def main():
               f"{args.mem_cap}, cam pitch {args.mem_cam_pitch:g} deg", flush=True)
         if not args.depth:
             print("[chunk] WARNING: --shield without --depth: the memory stays empty", flush=True)
+    if args.yaw_lead > 0:
+        print(f"[chunk] YAW-LEAD: chunk yaw rate read at tau + {args.yaw_lead:g} s", flush=True)
     if args.yaw_to_vel > 0:
         print(f"[chunk] YAW-TO-VEL: + {args.yaw_to_vel:g} * (heading(v) - yaw) rad/s", flush=True)
     sh_stat = dict(ticks=0, dv=0.0, dmin=float("inf"), n=0)   # since the last csv row
@@ -355,7 +360,7 @@ def main():
                           hysteresis=policy.hysteresis, dwell=policy.dwell,
                           ensemble=policy.ensemble, same_head=policy.same_head,
                           v_cap=args.v_cap, v_cap_xy=bool(args.v_cap_xy), z_min=args.z_min, smooth=bool(args.smooth),
-                          shield=bool(args.shield), yaw_to_vel=args.yaw_to_vel,
+                          shield=bool(args.shield), yaw_to_vel=args.yaw_to_vel, yaw_lead=args.yaw_lead,
                           side_dwell=args.side_dwell, side_margin=args.side_margin,
                           flip_margin=args.flip_margin, stuck=args.stuck,
                           stuck_progress=args.stuck_progress, stuck_v=args.stuck_v,

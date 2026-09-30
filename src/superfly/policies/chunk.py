@@ -619,7 +619,7 @@ class ChunkPolicy:
                  flip_margin: float = 0.0, stuck_window: float = 0.0, stuck_progress: float = 0.5,
                  stuck_v: float = 0.5, stuck_hold: float = 2.5, stuck_min_dist: float = 1.5,
                  stuck_disp: float = 1.0,
-                 v_cap: float | None = None):
+                 v_cap: float | None = None, yaw_lead: float = 0.0):
         import onnxruntime as ort
         self.path = str(path)
         self.sidecar = read_sidecar(path)
@@ -641,6 +641,11 @@ class ChunkPolicy:
                                     stuck_disp)
                       if stuck_window and stuck_window > 0 else None)
         self.v_cap = None if v_cap is None else float(v_cap)   # the watchdog's commanded speed only
+        # 2026-09-30 turn test: the yaw rate is read on the chunk step containing tau + yaw_lead
+        # (0 = on the step containing tau, the old behaviour). The velocity is read at tau + lead;
+        # reading yaw with no lead flew ~0.5 rad/s where the chunks ramp to ~0.9 (wide turns).
+        # Python sim twin: scratch_t6/turn_probe/students/fly_turn.py TURN_YAW_LEAD (yaw_lead = lead).
+        self.yaw_lead = float(yaw_lead)
         self.goal_speed = float(goal_speed)
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = int(threads)
@@ -796,7 +801,7 @@ class ChunkPolicy:
             i1 = min(i0 + 1, self.steps - 1)
             f = x - i0
             vs.append((1 - f) * e["v"][i0] + f * e["v"][i1])
-            ys.append(e["yr"][min(max(int(math.floor(tau / self.cdt + 1e-9)), 0),
+            ys.append(e["yr"][min(max(int(math.floor((tau + self.yaw_lead) / self.cdt + 1e-9)), 0),
                                   self.steps - 1)])
             ws.append(self.decay ** age)
         if not ws:
