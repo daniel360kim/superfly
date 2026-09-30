@@ -133,6 +133,27 @@ def main():
                     help="Minimum time on a head [s]: inside it a switch needs --dwell-margin "
                          "(python sim --chunk-dwell; 0 = off).")
     ap.add_argument("--dwell-margin", type=float, default=0.3)
+    # Plan B track 3 (2026-09-30): odometry-only executor guards, off by default = unchanged;
+    # python sim twins --chunk-side-dwell/--chunk-side-margin/--chunk-flip-margin/--chunk-stuck*
+    ap.add_argument("--side-dwell", type=float, default=0.0,
+                    help="Once the executed head is left/right, leaving it within this many s "
+                         "needs --side-margin (0 = off). Isaac walls 2026-09-29: 11-17 executed "
+                         "L/R flips in front of the wall, most after 1-2 decisions.")
+    ap.add_argument("--side-margin", type=float, default=1.0,
+                    help="Margin inside the side dwell (1.0 = hard: no switch).")
+    ap.add_argument("--flip-margin", type=float, default=0.0,
+                    help="Margin for a switch into the side head opposite the last executed side "
+                         "head, at any time (0 = off; a stronger hysteresis for side changes).")
+    ap.add_argument("--stuck", type=float, default=0.0, metavar="WINDOW",
+                    help="Stuck watchdog window [s] (0 = off): goal distance down by < "
+                         "--stuck-progress over it while the mean commanded speed >= --stuck-v and "
+                         "the goal > --stuck-min-dist away -> the best non-straight head by gate "
+                         "(not the one in use, not one already tried) is forced for --stuck-hold s. "
+                         "EnglishCollege 2026-09-29: pinned ~150 s commanding 1.2 m/s.")
+    ap.add_argument("--stuck-progress", type=float, default=0.5)
+    ap.add_argument("--stuck-v", type=float, default=0.5)
+    ap.add_argument("--stuck-hold", type=float, default=2.5)
+    ap.add_argument("--stuck-min-dist", type=float, default=1.5)
     ap.add_argument("--ensemble", type=int, default=4)
     ap.add_argument("--mix-heads", action="store_true",
                     help="Ensemble chunks across head switches (sim default off=same-head here).")
@@ -229,12 +250,22 @@ def main():
     policy = ChunkPolicy(args.checkpoint, lead=args.lead, hysteresis=args.hysteresis,
                          ensemble=args.ensemble, same_head=not args.mix_heads,
                          goal_speed=args.goal_speed, dwell=args.dwell,
-                         dwell_margin=args.dwell_margin)
+                         dwell_margin=args.dwell_margin, side_dwell=args.side_dwell,
+                         side_margin=args.side_margin, flip_margin=args.flip_margin,
+                         stuck_window=args.stuck, stuck_progress=args.stuck_progress,
+                         stuck_v=args.stuck_v, stuck_hold=args.stuck_hold,
+                         stuck_min_dist=args.stuck_min_dist, v_cap=args.v_cap)
     print(f"[chunk] {Path(args.checkpoint).name}: heads {policy.heads}, "
           f"{policy.steps} x {policy.cdt:g} s, lead {policy.lead:g} s, "
           f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "
           f"({'same-head' if policy.same_head else 'mixed'}), v_cap {args.v_cap:g}, "
           f"z floor {args.z_min:g}, forward {policy.forward_ms:.1f} ms", flush=True)
+    if args.side_dwell > 0 or args.flip_margin > 0 or args.stuck > 0:
+        print(f"[chunk] GUARDS: side dwell {args.side_dwell:g} s (margin {args.side_margin:g}), "
+              f"flip margin {args.flip_margin:g}, stuck watchdog "
+              + (f"{args.stuck:g} s / {args.stuck_progress:g} m / {args.stuck_v:g} m/s, hold "
+                 f"{args.stuck_hold:g} s, beyond {args.stuck_min_dist:g} m" if args.stuck > 0 else "off"),
+              flush=True)
     smooth = None
     if args.smooth:
         smooth = SmoothRef(kv=args.kv, jerk=args.smooth_jerk, acc_max=args.smooth_acc,
@@ -313,6 +344,10 @@ def main():
                           ensemble=policy.ensemble, same_head=policy.same_head,
                           v_cap=args.v_cap, z_min=args.z_min, smooth=bool(args.smooth),
                           shield=bool(args.shield), yaw_to_vel=args.yaw_to_vel,
+                          side_dwell=args.side_dwell, side_margin=args.side_margin,
+                          flip_margin=args.flip_margin, stuck=args.stuck,
+                          stuck_progress=args.stuck_progress, stuck_v=args.stuck_v,
+                          stuck_hold=args.stuck_hold, stuck_min_dist=args.stuck_min_dist,
                           decision_hz=DECISION_HZ, clock=args.clock))
         except Exception as e:      # logging must never stop a flight
             print(f"[chunk] net log off: {type(e).__name__}: {e}", flush=True)
@@ -488,6 +523,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if policy.stuck is not None:
+            print(f"[chunk] STUCK summary: {len(policy.stuck.fires)} fire(s) "
+                  f"{policy.stuck.fires}", flush=True)
         if shield is not None:
             print(f"[chunk] SHIELD summary: active {sh_tot['ticks']}/{sh_tot['pol_ticks']} policy ticks "
                   f"({sh_tot['ticks'] / CONTROL_HZ:.1f} s), max |dv| {sh_tot['dv']:.2f} m/s, nearest "

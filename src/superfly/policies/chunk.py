@@ -22,6 +22,14 @@ Executor (per decision, 15 Hz):
     it by `hysteresis` (0.15); with `dwell` > 0 (off by default; sim
     --chunk-dwell, v8-chunk 4393ab4) a head just switched to needs a lead of
     max(hysteresis, `dwell_margin` 0.3) for `dwell` seconds after the switch;
+  * Plan B track 3 (2026-09-30; off by default = unchanged; odometry only, so
+    they carry to an RGB student; python sim twins in v8-chunk sim_episode):
+    `side_dwell` -- once the executed head is left/right, leaving it within
+    side_dwell s needs `side_margin` (1.0 = hard); `flip_margin` -- a switch
+    into the side head opposite the last executed side head needs this margin
+    at any time; `stuck_window` -- StuckWatchdog: no goal progress over the
+    window while commanding speed -> the best non-straight head is forced for
+    `stuck_hold` s (reason "stuck");
   * the selected chunk goes to WORLD frame at its issue time into a ring of the
     last `ensemble` (4) chunks; with `same_head` (default here) the ring is
     emptied on a head switch, so two routes are never blended;
@@ -523,11 +531,88 @@ def yaw_toward(yaw: float, vel, gain: float, v_min: float = 0.5) -> float:
     return float(gain) * math.atan2(math.sin(e), math.cos(e))
 
 
+class StuckWatchdog:
+    """Odometry-only stuck detector of the chunk executor (chunk_offboard
+    --stuck; python sim --chunk-stuck, superfly_expert_sampler v8-chunk
+    sim_episode.StuckWatchdog -- the same class, same numbers).
+
+    At every decision the executor feeds it the distance to the goal
+    (observe, before selection) and the speed it then commands (commanded,
+    after the ensemble). It fires when, over the last `window` s, the goal
+    distance fell by less than `progress` m while the mean commanded speed was
+    at least `v_min` m/s and the goal is still more than `min_dist` m away (a
+    hover at a stop goal is not "stuck"). Then it forces the best non-straight
+    head by gate probability -- never the head in use, never one it already
+    forced since the last healthy window -- for `hold` s, and releases; the
+    next fire needs a fresh full window. Nothing here reads depth: it carries
+    to any input modality."""
+
+    def __init__(self, window: float = 3.0, progress: float = 0.5, v_min: float = 0.5,
+                 hold: float = 2.5, min_dist: float = 1.5):
+        self.window, self.progress, self.v_min = float(window), float(progress), float(v_min)
+        self.hold, self.min_dist = float(hold), float(min_dist)
+        self.reset()
+
+    def reset(self):
+        self.hist: list[list] = []          # [t, goal distance, commanded speed or None]
+        self.forced = None
+        self.until = None
+        self.tried: list[int] = []
+        self.fires: list[tuple] = []         # (t, forced head) per fire
+
+    def observe(self, t: float, dist: float):
+        self.hist.append([float(t), float(dist), None])
+        while len(self.hist) > 1 and self.hist[1][0] <= t - self.window + 1e-9:
+            del self.hist[0]                 # keep exactly one entry at or before t - window
+
+    def commanded(self, speed: float):
+        if self.hist:
+            self.hist[-1][2] = float(speed)
+
+    def force(self, t: float, probs, current, heads):
+        """The head to fly at this decision, or None (not stuck / released)."""
+        if self.forced is not None:
+            if t < self.until - 1e-9:
+                return self.forced
+            self.forced = self.until = None
+            self.hist = self.hist[-1:]       # a fresh window before the next fire
+            return None
+        if len(self.hist) < 2 or t - self.hist[0][0] < self.window - 1e-9:
+            return None
+        d_now = self.hist[-1][1]
+        sp = [h[2] for h in self.hist[:-1] if h[2] is not None]
+        stuck = (d_now > self.min_dist and self.hist[0][1] - d_now < self.progress
+                 and bool(sp) and float(np.mean(sp)) >= self.v_min)
+        if not stuck:
+            self.tried = []
+            return None
+        side = [i for i, h in enumerate(heads) if h != "straight" and i != current and i < len(probs)]
+        cand = [i for i in side if i not in self.tried]
+        if not cand:
+            self.tried, cand = [], side
+        if not cand:
+            return None
+        f = max(cand, key=lambda i: (float(probs[i]), -i))
+        self.tried.append(f)
+        self.forced, self.until = f, float(t) + self.hold
+        self.fires.append((round(float(t), 3), int(f)))
+        return f
+
+
 class ChunkPolicy:
+    # the executor guards' "off" values, for instances built without __init__ (tests)
+    heads = list(HEADS)
+    side_dwell, side_margin, flip_margin = 0.0, 1.0, 0.0
+    stuck = None
+    v_cap = None
+
     def __init__(self, path, lead: float = 0.5, hysteresis: float = 0.15,
                  ensemble: int = 4, decay: float = 0.5, same_head: bool = True,
                  goal_speed: float = 0.0, threads: int = 4, dwell: float = 0.0,
-                 dwell_margin: float = 0.3):
+                 dwell_margin: float = 0.3, side_dwell: float = 0.0, side_margin: float = 1.0,
+                 flip_margin: float = 0.0, stuck_window: float = 0.0, stuck_progress: float = 0.5,
+                 stuck_v: float = 0.5, stuck_hold: float = 2.5, stuck_min_dist: float = 1.5,
+                 v_cap: float | None = None):
         import onnxruntime as ort
         self.path = str(path)
         self.sidecar = read_sidecar(path)
@@ -541,6 +626,13 @@ class ChunkPolicy:
         self.ensemble, self.decay = int(ensemble), float(decay)
         self.same_head = bool(same_head)
         self.dwell, self.dwell_margin = float(dwell), float(dwell_margin)
+        # Plan B track 3 (2026-09-30), off by default = unchanged; python sim twins
+        # --chunk-side-dwell / --chunk-side-margin / --chunk-flip-margin / --chunk-stuck*
+        self.side_dwell, self.side_margin = float(side_dwell), float(side_margin)
+        self.flip_margin = float(flip_margin)
+        self.stuck = (StuckWatchdog(stuck_window, stuck_progress, stuck_v, stuck_hold, stuck_min_dist)
+                      if stuck_window and stuck_window > 0 else None)
+        self.v_cap = None if v_cap is None else float(v_cap)   # the watchdog's commanded speed only
         self.goal_speed = float(goal_speed)
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = int(threads)
@@ -559,6 +651,9 @@ class ChunkPolicy:
         self.prev_yaw = None
         self.switches = 0
         self.head_t = None              # time selection last moved to self.head
+        self.last_side = None           # the last executed left/right head (flip_margin)
+        if getattr(self, "stuck", None) is not None:
+            self.stuck.reset()
         self.last = {}
 
     # --- graph ---------------------------------------------------------------
@@ -616,16 +711,30 @@ class ChunkPolicy:
         best = int(np.argmax(probs))
         if self.head is None:
             return best, "gate"
-        margin = self.hysteresis
+        if self.stuck is not None and t is not None:
+            f = self.stuck.force(float(t), probs, self.head, self.heads)
+            if f is not None:
+                if f != self.head:
+                    self.switches += 1
+                return f, "stuck"
+        margin, why = self.hysteresis, "hysteresis"
         if (self.dwell > 0 and t is not None and self.head_t is not None
                 and t - self.head_t < self.dwell - 1e-9):
-            margin = max(margin, self.dwell_margin)
+            if self.dwell_margin > margin:
+                margin, why = self.dwell_margin, "dwell"
+        side = [i for i, h in enumerate(self.heads) if h in ("left", "right")]
+        if (self.side_dwell > 0 and self.head in side and t is not None and self.head_t is not None
+                and t - self.head_t < self.side_dwell - 1e-9 and self.side_margin > margin):
+            margin, why = self.side_margin, "side_dwell"
+        if (self.flip_margin > 0 and best in side and self.last_side is not None
+                and best != self.last_side and self.flip_margin > margin):
+            margin, why = self.flip_margin, "flip"
         if best != self.head and probs[best] - probs[self.head] >= margin - 1e-12:
             self.switches += 1
             return best, "switch"
         if best == self.head:
             return self.head, "gate"
-        return self.head, "dwell" if margin > self.hysteresis else "hysteresis"
+        return self.head, why
 
     def decide(self, t, pos, R, vel, omega_body, goal, depth):
         """One decision at time t (the observation's time). Returns the record."""
@@ -636,12 +745,17 @@ class ChunkPolicy:
             encode_depth(depth), encode_state(pos, R, vel, omega_body, goal,
                                               self.goal_speed), prev))
         probs = softmax(gate)
+        if self.stuck is not None:
+            self.stuck.observe(float(t), float(np.linalg.norm(np.asarray(goal, float)
+                                                              - np.asarray(pos, float))))
         sel, reason = self.select_head(probs, float(t))
         if self.same_head and self.head is not None and sel != self.head:
             self.ring.clear()
         if sel != self.head:
             self.head_t = float(t)
         self.head = sel
+        if sel < len(self.heads) and self.heads[sel] in ("left", "right"):
+            self.last_side = sel
         c = chunk[sel]
         S = self.steps
         vh = np.stack([c[0:S], c[S:2 * S], c[2 * S:3 * S]], 1)
@@ -650,6 +764,9 @@ class ChunkPolicy:
         del self.ring[self.ensemble:]
         self.prev_chunk = np.concatenate([vh, c[3 * S:4 * S, None]], 1)
         self.prev_yaw = yaw
+        if self.stuck is not None:      # the speed the offboard will command (after --v-cap)
+            sp = float(np.linalg.norm(self.command(t)[0]))
+            self.stuck.commanded(min(sp, self.v_cap) if self.v_cap is not None else sp)
         self.last = {"head": sel, "reason": reason, "probs": probs,
                      "v1": vh[0] @ Rh.T, "switches": self.switches,
                      # the full network output of this decision (DecisionLog);

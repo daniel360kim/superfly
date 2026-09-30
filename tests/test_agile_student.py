@@ -368,6 +368,85 @@ def test_chunk_head_dwell():
     assert p.select_head(q, 1.2) == (1, "switch")
 
 
+def _bare_chunk_policy(**kw):
+    from superfly.policies import chunk
+    p = chunk.ChunkPolicy.__new__(chunk.ChunkPolicy)
+    p.hysteresis, p.dwell, p.dwell_margin = 0.15, 0.0, 0.3
+    for k, v in kw.items():
+        setattr(p, k, v)
+    p.reset()
+    return p
+
+
+def test_chunk_side_dwell_and_flip_margin():
+    """Plan B track 3 guards (chunk_offboard --side-dwell / --flip-margin), the
+    same cases as v8-chunk tests/test_sim_chunk.py Track3ExecutorTest."""
+    p = _bare_chunk_policy(side_dwell=0.5, side_margin=1.0)
+    p.head, p.head_t = 1, 1.0                                  # left, entered at 1.0
+    q = np.array([0.05, 0.1, 0.85, 0.0, 0.0])
+    assert p.select_head(q, 1.3) == (1, "side_dwell")
+    assert p.select_head(q, 1.5) == (2, "switch")
+    p.head, p.head_t = 0, 1.0
+    assert p.select_head(q, 1.1) == (2, "switch")
+    soft = _bare_chunk_policy(side_dwell=0.5, side_margin=0.5)
+    soft.head, soft.head_t = 1, 1.0
+    assert soft.select_head(q, 1.1) == (2, "switch")
+    assert soft.select_head(np.array([0.2, 0.3, 0.5, 0, 0]), 1.1) == (1, "side_dwell")
+    f = _bare_chunk_policy(flip_margin=0.4)
+    f.head, f.head_t, f.last_side = 0, 0.0, 1
+    assert f.select_head(np.array([0.3, 0.1, 0.6, 0, 0]), 5.0) == (0, "flip")
+    assert f.select_head(np.array([0.3, 0.6, 0.1, 0, 0]), 5.0) == (1, "switch")
+    f.head, f.last_side = 0, 1
+    assert f.select_head(np.array([0.1, 0.0, 0.5, 0.4, 0]), 5.0) == (2, "switch")
+    off = _bare_chunk_policy()
+    off.head, off.head_t, off.last_side = 1, 1.0, 1
+    assert off.select_head(q, 1.1) == (2, "switch")
+
+
+def test_chunk_stuck_watchdog():
+    """chunk_offboard --stuck: the same cases as the python sim's
+    StuckWatchdog tests (fires after the window at the best non-straight head
+    not in use, holds, releases, cycles through tried heads; never fires while
+    progressing, hovering or near the goal)."""
+    from superfly.policies import chunk
+    heads = list(chunk.HEADS)
+    w = chunk.StuckWatchdog(window=3.0, progress=0.5, v_min=0.5, hold=2.0, min_dist=1.5)
+    probs = np.array([0.1, 0.2, 0.5, 0.15, 0.05])
+    t, fired = 0.0, None
+    while t < 10.0 and fired is None:
+        w.observe(t, 10.0 - 0.05 * t)
+        fired = w.force(t, probs, 2, heads)
+        w.commanded(1.2)
+        t = round(t + 1 / 15, 6)
+    assert fired == 1 and abs(w.fires[0][0] - 3.0) < 0.07
+    assert w.force(w.fires[0][0] + 1.0, probs, 1, heads) == 1
+    assert w.force(w.fires[0][0] + 2.01, probs, 1, heads) is None
+    for dist, speed in ((lambda k: 10.0 - 1.2 * k / 15, 1.2), (lambda k: 10.0, 0.1), (lambda k: 1.0, 1.2)):
+        w2 = chunk.StuckWatchdog(window=3.0)
+        for k in range(60):
+            w2.observe(k / 15, dist(k))
+            assert w2.force(k / 15, probs, 0, heads) is None
+            w2.commanded(speed)
+    w3 = chunk.StuckWatchdog(window=1.0, hold=0.5)
+    probs = np.array([0.5, 0.2, 0.15, 0.1, 0.05])
+    for k in range(200):
+        w3.observe(k / 15, 10.0)
+        w3.force(k / 15, probs, 0, heads)
+        w3.commanded(1.0)
+    assert [f for _, f in w3.fires][:5] == [1, 2, 3, 4, 1]
+    # in the executor: select_head forces it, reason "stuck", counted as a switch
+    p = _bare_chunk_policy(stuck=chunk.StuckWatchdog(window=2.0, hold=1.0))
+    p.head, p.head_t = 0, 0.0
+    q = np.array([0.8, 0.02, 0.1, 0.05, 0.03])
+    out = []
+    for k in range(40):
+        p.stuck.observe(k / 15, 7.0)
+        out.append(p.select_head(q, k / 15))
+        p.head = out[-1][0]
+        p.stuck.commanded(1.2)
+    assert out[29] == (0, "gate") and out[30] == (2, "stuck") and p.switches == 1
+
+
 def test_chunk_decision_log_roundtrip(tmp_path):
     """chunk_offboard's per-decision network log (chunk_outputs.npy): a valid
     .npy after every row (np.load of a killed flight works), the fields as
