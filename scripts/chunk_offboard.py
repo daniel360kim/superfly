@@ -154,6 +154,9 @@ def main():
     ap.add_argument("--stuck-v", type=float, default=0.5)
     ap.add_argument("--stuck-hold", type=float, default=2.5)
     ap.add_argument("--stuck-min-dist", type=float, default=1.5)
+    ap.add_argument("--stuck-disp", type=float, default=1.0,
+                    help="--stuck: only if the vehicle moved less than this [m] over the window "
+                         "(a detour along a wall is not stuck).")
     ap.add_argument("--ensemble", type=int, default=4)
     ap.add_argument("--mix-heads", action="store_true",
                     help="Ensemble chunks across head switches (sim default off=same-head here).")
@@ -254,7 +257,8 @@ def main():
                          side_margin=args.side_margin, flip_margin=args.flip_margin,
                          stuck_window=args.stuck, stuck_progress=args.stuck_progress,
                          stuck_v=args.stuck_v, stuck_hold=args.stuck_hold,
-                         stuck_min_dist=args.stuck_min_dist, v_cap=args.v_cap)
+                         stuck_min_dist=args.stuck_min_dist, stuck_disp=args.stuck_disp,
+                         v_cap=args.v_cap)
     print(f"[chunk] {Path(args.checkpoint).name}: heads {policy.heads}, "
           f"{policy.steps} x {policy.cdt:g} s, lead {policy.lead:g} s, "
           f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "
@@ -264,7 +268,8 @@ def main():
         print(f"[chunk] GUARDS: side dwell {args.side_dwell:g} s (margin {args.side_margin:g}), "
               f"flip margin {args.flip_margin:g}, stuck watchdog "
               + (f"{args.stuck:g} s / {args.stuck_progress:g} m / {args.stuck_v:g} m/s, hold "
-                 f"{args.stuck_hold:g} s, beyond {args.stuck_min_dist:g} m" if args.stuck > 0 else "off"),
+                 f"{args.stuck_hold:g} s, beyond {args.stuck_min_dist:g} m, moved < {args.stuck_disp:g} m"
+                 if args.stuck > 0 else "off"),
               flush=True)
     smooth = None
     if args.smooth:
@@ -348,6 +353,7 @@ def main():
                           flip_margin=args.flip_margin, stuck=args.stuck,
                           stuck_progress=args.stuck_progress, stuck_v=args.stuck_v,
                           stuck_hold=args.stuck_hold, stuck_min_dist=args.stuck_min_dist,
+                          stuck_disp=args.stuck_disp,
                           decision_hz=DECISION_HZ, clock=args.clock))
         except Exception as e:      # logging must never stop a flight
             print(f"[chunk] net log off: {type(e).__name__}: {e}", flush=True)

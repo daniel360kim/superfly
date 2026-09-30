@@ -541,16 +541,19 @@ class StuckWatchdog:
     after the ensemble). It fires when, over the last `window` s, the goal
     distance fell by less than `progress` m while the mean commanded speed was
     at least `v_min` m/s and the goal is still more than `min_dist` m away (a
-    hover at a stop goal is not "stuck"). Then it forces the best non-straight
+    hover at a stop goal is not "stuck") AND the vehicle moved less than
+    `disp` m over the window (a detour along a wall moves away from the goal
+    at speed: not "stuck" -- Isaac 2026-09-30, without this term the watchdog
+    broke every w24 detour). Then it forces the best non-straight
     head by gate probability -- never the head in use, never one it already
     forced since the last healthy window -- for `hold` s, and releases; the
     next fire needs a fresh full window. Nothing here reads depth: it carries
     to any input modality."""
 
     def __init__(self, window: float = 3.0, progress: float = 0.5, v_min: float = 0.5,
-                 hold: float = 2.5, min_dist: float = 1.5):
+                 hold: float = 2.5, min_dist: float = 1.5, disp: float = 1.0):
         self.window, self.progress, self.v_min = float(window), float(progress), float(v_min)
-        self.hold, self.min_dist = float(hold), float(min_dist)
+        self.hold, self.min_dist, self.disp = float(hold), float(min_dist), float(disp)
         self.reset()
 
     def reset(self):
@@ -560,8 +563,9 @@ class StuckWatchdog:
         self.tried: list[int] = []
         self.fires: list[tuple] = []         # (t, forced head) per fire
 
-    def observe(self, t: float, dist: float):
-        self.hist.append([float(t), float(dist), None])
+    def observe(self, t: float, dist: float, pos=None):
+        self.hist.append([float(t), float(dist), None,
+                          None if pos is None else np.asarray(pos, float).copy()])
         while len(self.hist) > 1 and self.hist[1][0] <= t - self.window + 1e-9:
             del self.hist[0]                 # keep exactly one entry at or before t - window
 
@@ -581,8 +585,10 @@ class StuckWatchdog:
             return None
         d_now = self.hist[-1][1]
         sp = [h[2] for h in self.hist[:-1] if h[2] is not None]
+        p0, p1 = self.hist[0][3], self.hist[-1][3]
+        moved = float(np.linalg.norm(p1 - p0)) if p0 is not None and p1 is not None else 0.0
         stuck = (d_now > self.min_dist and self.hist[0][1] - d_now < self.progress
-                 and bool(sp) and float(np.mean(sp)) >= self.v_min)
+                 and moved < self.disp and bool(sp) and float(np.mean(sp)) >= self.v_min)
         if not stuck:
             self.tried = []
             return None
@@ -612,6 +618,7 @@ class ChunkPolicy:
                  dwell_margin: float = 0.3, side_dwell: float = 0.0, side_margin: float = 1.0,
                  flip_margin: float = 0.0, stuck_window: float = 0.0, stuck_progress: float = 0.5,
                  stuck_v: float = 0.5, stuck_hold: float = 2.5, stuck_min_dist: float = 1.5,
+                 stuck_disp: float = 1.0,
                  v_cap: float | None = None):
         import onnxruntime as ort
         self.path = str(path)
@@ -630,7 +637,8 @@ class ChunkPolicy:
         # --chunk-side-dwell / --chunk-side-margin / --chunk-flip-margin / --chunk-stuck*
         self.side_dwell, self.side_margin = float(side_dwell), float(side_margin)
         self.flip_margin = float(flip_margin)
-        self.stuck = (StuckWatchdog(stuck_window, stuck_progress, stuck_v, stuck_hold, stuck_min_dist)
+        self.stuck = (StuckWatchdog(stuck_window, stuck_progress, stuck_v, stuck_hold, stuck_min_dist,
+                                    stuck_disp)
                       if stuck_window and stuck_window > 0 else None)
         self.v_cap = None if v_cap is None else float(v_cap)   # the watchdog's commanded speed only
         self.goal_speed = float(goal_speed)
@@ -747,7 +755,7 @@ class ChunkPolicy:
         probs = softmax(gate)
         if self.stuck is not None:
             self.stuck.observe(float(t), float(np.linalg.norm(np.asarray(goal, float)
-                                                              - np.asarray(pos, float))))
+                                                              - np.asarray(pos, float))), pos)
         sel, reason = self.select_head(probs, float(t))
         if self.same_head and self.head is not None and sel != self.head:
             self.ring.clear()

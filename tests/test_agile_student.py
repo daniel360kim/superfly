@@ -434,6 +434,16 @@ def test_chunk_stuck_watchdog():
         w3.force(k / 15, probs, 0, heads)
         w3.commanded(1.0)
     assert [f for _, f in w3.fires][:5] == [1, 2, 3, 4, 1]
+    # a detour along a wall (moving at 1.2 m/s, goal distance growing) is not stuck
+    for step, want in ((1.2 / 15, False), (0.01 / 15, True)):
+        w5 = chunk.StuckWatchdog(window=3.0)
+        fired = False
+        for k in range(90):
+            p = np.array([4.0, step * k, 2.0])
+            w5.observe(k / 15, float(np.linalg.norm(np.array([14.0, 0, 2.0]) - p)), p)
+            fired |= w5.force(k / 15, np.array([0.1, 0.5, 0.3, 0.05, 0.05]), 1, heads) is not None
+            w5.commanded(1.2)
+        assert fired == want
     # in the executor: select_head forces it, reason "stuck", counted as a switch
     p = _bare_chunk_policy(stuck=chunk.StuckWatchdog(window=2.0, hold=1.0))
     p.head, p.head_t = 0, 0.0
