@@ -161,6 +161,13 @@ def main():
     ap.add_argument("--mix-heads", action="store_true",
                     help="Ensemble chunks across head switches (sim default off=same-head here).")
     ap.add_argument("--v-cap", type=float, default=3.5)
+    ap.add_argument("--v-cap-xy", action="store_true",
+                    help="--v-cap limits the HORIZONTAL speed only; the vertical setpoint passes "
+                         "unscaled (the z band still applies). Off (default) = the whole 3-D "
+                         "setpoint is scaled, so a chunk asking (vx 2.75, vz 0.5) flies "
+                         "(1.47, 0.27) under --v-cap 1.5 -- the climb rate falls with the "
+                         "forward speed (python sim twin: scratch_t6/ou_bench/sim_run_ou.py "
+                         "OU_XYCAP=1).")
     ap.add_argument("--z-min", type=float, default=Z_REF[0],
                     help="Floor of the executor's z band [m] (python sim --chunk-z-min; default "
                          "0.5 = sim_episode.Z_REF[0]). The vertical setpoint is limited so the "
@@ -347,7 +354,7 @@ def main():
                           goal_local_enu=[float(x) for x in goal], lead=policy.lead,
                           hysteresis=policy.hysteresis, dwell=policy.dwell,
                           ensemble=policy.ensemble, same_head=policy.same_head,
-                          v_cap=args.v_cap, z_min=args.z_min, smooth=bool(args.smooth),
+                          v_cap=args.v_cap, v_cap_xy=bool(args.v_cap_xy), z_min=args.z_min, smooth=bool(args.smooth),
                           shield=bool(args.shield), yaw_to_vel=args.yaw_to_vel,
                           side_dwell=args.side_dwell, side_margin=args.side_margin,
                           flip_margin=args.flip_margin, stuck=args.stuck,
@@ -426,9 +433,14 @@ def main():
                     last_dec = now
                     n_dec += 1
                 v, yr, n_used = policy.command(now)
-                sp = float(np.linalg.norm(v))
-                if sp > args.v_cap:
-                    v = v * (args.v_cap / sp)
+                if args.v_cap_xy:
+                    sp = float(np.hypot(v[0], v[1]))
+                    if sp > args.v_cap:
+                        v = np.array([v[0] * args.v_cap / sp, v[1] * args.v_cap / sp, v[2]])
+                else:
+                    sp = float(np.linalg.norm(v))
+                    if sp > args.v_cap:
+                        v = v * (args.v_cap / sp)
                 # sim_episode.velocity_setpoint: >= Z_SOFT_T to either bound
                 vz_lo = (lo - pos[2]) / Z_SOFT_T
                 vz_hi = (hi - pos[2]) / Z_SOFT_T
