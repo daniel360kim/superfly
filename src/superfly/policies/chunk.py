@@ -25,9 +25,10 @@ students). The RGB tensor is the policy camera's 640x480 uint8 frame through
 superfly.policies.rgb_preproc.rgb_to_net (exact area resize to the input size,
 /255, ImageNet norm here or in the graph), configured by the sidecar:
     "rgb_input": {"layout": "nchw"|"nhwc", "norm": "imagenet"|"in_graph"|"uint8",
-                  "size": [W, H]}
+                  "size": [W, H], "quantize": true|false}
 each key optional (layout and size default to the graph's static input shape,
-norm to "uint8" for a uint8 input, else "imagenet"). A graph with an rgb input
+norm to "uint8" for a uint8 input, else "imagenet"; quantize -- round the resized
+frame to uint8 levels like the training shards -- to true). A graph with an rgb input
 gets the blank (all-far) depth on any depth input it also has, so no depth can
 leak into an RGB evaluation.
 
@@ -712,6 +713,7 @@ class ChunkPolicy:
         norm = cfg.get("norm") or ("uint8" if is_u8 else "imagenet")
         return {"name": i.name, "layout": layout, "size": [int(size[0]), int(size[1])],
                 "norm": norm, "dtype": np.uint8 if is_u8 else np.float32,
+                "quantize": bool(cfg.get("quantize", True)),
                 "norm_from_sidecar": "norm" in cfg}
 
     def encode_rgb(self, frame):
@@ -719,7 +721,8 @@ class ChunkPolicy:
         from superfly.policies.rgb_preproc import rgb_to_net, blank_frame
         c = self.rgb
         f = blank_frame() if frame is None else frame
-        x = rgb_to_net(f, norm=c["norm"], layout=c["layout"], out_wh=tuple(c["size"]))
+        x = rgb_to_net(f, norm=c["norm"], layout=c["layout"], out_wh=tuple(c["size"]),
+                       quantize=c.get("quantize", True))
         return x.astype(c["dtype"], copy=False)
 
     def _feed(self, depth_in, state_in, prev, rgb_in=None):

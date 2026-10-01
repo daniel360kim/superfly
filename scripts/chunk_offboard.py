@@ -301,7 +301,7 @@ def main():
         print(f"[chunk] RGB student: input {policy.rgb['name']!r} {policy.inputs[policy.rgb['name']]} "
               f"layout {policy.rgb['layout']}, size {policy.rgb['size']}, norm {policy.rgb['norm']}"
               f"{'' if policy.rgb['norm_from_sidecar'] else ' (DEFAULT -- the sidecar has no rgb_input.norm)'}"
-              f", area resize (superfly.policies.rgb_preproc); depth inputs get the blank frame", flush=True)
+              f", quantize {policy.rgb['quantize']}, area resize (superfly.policies.rgb_preproc); depth inputs get the blank frame", flush=True)
     print(f"[chunk] {Path(args.checkpoint).name}: heads {policy.heads}, "
           f"{policy.steps} x {policy.cdt:g} s, lead {policy.lead:g} s, "
           f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "

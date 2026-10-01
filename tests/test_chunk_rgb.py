@@ -188,3 +188,14 @@ def test_depth_student_unchanged(tmp_path):
     assert pol.modality == "depth" and pol.rgb is None
     pol.decide(0.0, [0, 0, 2], np.eye(3), [0, 0, 0], [0, 0, 0], [5, 0, 2], np.ones((224, 224), np.float32))
     assert abs(pol.last["gate"][0] - 1000.0 / 80.0) < 1e-3      # 1 m -> mm/80 = 12.5
+
+
+def test_quantized_input_equals_training_shards():
+    """rgb_to_net (default quantize) == cv2.INTER_AREA uint8 / 255 (the W3 shard path) exactly."""
+    cv2 = pytest.importorskip("cv2")
+    x = _img(5)
+    q = rgb_to_net(x, norm="in_graph")[0].transpose(1, 2, 0)
+    ref = cv2.resize(x, (256, 192), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    assert np.array_equal(q, ref)
+    f = rgb_to_net(x, norm="in_graph", quantize=False)[0].transpose(1, 2, 0)
+    assert 0 < np.abs(f - ref).max() <= 0.5 / 255 + 1e-6

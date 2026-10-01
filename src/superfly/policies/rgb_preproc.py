@@ -11,6 +11,7 @@ Contract (RGB_START_PROPOSAL 7, Starling nose camera, 2026-10-01):
            takes floor/ceil windows at a non-integer factor (up to 1/2 px shift
            and a different kernel), and NOT plain bilinear (point-samples thin
            obstacles; PRE_RGB_FINDINGS 2.3).
+  quantize rounded to uint8 levels (the training shards store cv2.INTER_AREA uint8)
   scale    /255 -> [0, 1] float32
   norm     ImageNet mean/std, either here (norm="imagenet") or inside the ONNX
            graph (norm="in_graph": this function stops at [0, 1])
@@ -77,10 +78,14 @@ def area_resize(img, out_wh=(NET_W, NET_H)) -> np.ndarray:
 
 
 def rgb_to_net(img_u8, norm: str = "imagenet", layout: str = "nchw",
-               out_wh=(NET_W, NET_H), dtype=np.float32) -> np.ndarray:
+               out_wh=(NET_W, NET_H), dtype=np.float32, quantize: bool = True) -> np.ndarray:
     """Camera frame (H, W, 3|4) uint8 RGB(A) -> network input with a batch dim.
     norm: "imagenet" (mean/std here) | "in_graph" or "none" ([0, 1] only) |
-    "uint8" (area-resized, rounded, uint8 -- for a graph that takes bytes)."""
+    "uint8" (area-resized, rounded, uint8 -- for a graph that takes bytes).
+    quantize (default True): round the resized image to uint8 levels before /255 --
+    exactly the training shards (W3 rgb_student.resize.area_resize_u8 = cv2.INTER_AREA
+    on uint8, == rint(area_resize) bit for bit: the 2.5x weights are multiples of 0.04,
+    so no .5 ties). False keeps the float average (|diff| <= 0.5/255)."""
     x = np.asarray(img_u8)
     if x.ndim != 3 or x.shape[2] < 3:
         raise ValueError(f"expected (H, W, 3) RGB, got {x.shape}")
@@ -89,8 +94,10 @@ def rgb_to_net(img_u8, norm: str = "imagenet", layout: str = "nchw",
         y = area_resize(x, out_wh)
     else:
         y = x.astype(np.float64)
+    if quantize or norm == "uint8":
+        y = np.clip(np.rint(y), 0, 255)
     if norm == "uint8":
-        y = np.clip(np.rint(y), 0, 255).astype(np.uint8)
+        y = y.astype(np.uint8)
     else:
         y = (y / 255.0).astype(np.float32)
         if norm == "imagenet":
