@@ -53,7 +53,7 @@ os.environ.setdefault("SUPERFLY_CAM_PITCH_DEG", "0")
 
 import superfly.sim.px4_sim as S  # noqa: E402  (boots SimulationApp)
 import numpy as np  # noqa: E402
-from pxr import UsdGeom, Usd  # noqa: E402
+from pxr import UsdGeom, Usd  # noqa: E402  (Usd also used for the kinematic hold below)
 
 app = S.PegasusApp(policy="agile", obstacles="boxes", boxes_json=args.boxes_json,
                    spawn_xyz=tuple(args.spawn), spawn_yaw_deg=args.yaw,
@@ -68,6 +68,15 @@ except Exception as e:  # older API
     for p in app.world.stage.Traverse():
         if p.IsA(UsdPhysics.Scene):
             UsdPhysics.Scene(p).CreateGravityMagnitudeAttr(0.0)
+# hold the vehicle exactly at the spawn pose: kinematic rigid bodies (gravity off alone
+# still let the unpowered airframe sink 0.3 m over the probe, 2026-10-01 first run)
+from pxr import UsdPhysics  # noqa: E402
+n_kin = 0
+for prim in Usd.PrimRange(app.world.stage.GetPrimAtPath("/World/quadrotor")):
+    if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)
+        n_kin += 1
+print(f"[probe] {n_kin} rigid bodies under /World/quadrotor made kinematic", flush=True)
 app.timeline.play()
 
 
@@ -81,6 +90,7 @@ def xf(path):
 
 rgb = depth = None
 body_hist = []
+cap_T = None
 for k in range(args.steps):
     app.world.step(render=True)
     T = xf("/World/quadrotor/body")
@@ -92,6 +102,7 @@ for k in range(args.steps):
         d = app._camera._camera.get_depth() if getattr(app._camera, "_camera_full_set", False) else None
         if r is not None and np.asarray(r).size and d is not None and np.asarray(d).size:
             rgb, depth = np.asarray(r)[..., :3].copy(), np.asarray(d, np.float32).copy()
+            cap_T = T
 
 rcam = app._rgb_policy_camera._stage_prim_path
 dcam = app._camera._stage_prim_path
@@ -105,7 +116,8 @@ for a in cp.GetAttributes():
         pass
 bh = np.asarray(body_hist)
 print(f"[probe] body drift over {len(bh)} steps: {np.ptp(bh, axis=0) if len(bh) else None}", flush=True)
-np.savez(args.out, rgb=rgb, depth=depth, body_T=xf("/World/quadrotor/body"),
+np.savez(args.out, rgb=rgb, depth=depth, body_T=cap_T, body_T_end=xf("/World/quadrotor/body"),
+         body_hist=bh,
          rgbcam_T=xf(rcam), depthcam_T=xf(dcam), rgbcam_path=rcam, depthcam_path=dcam,
          cam_attrs=json.dumps(attrs, default=str), boxes=json.load(open(args.boxes_json)),
          spawn=np.asarray(args.spawn), yaw_deg=args.yaw, body_drift=np.ptp(bh, axis=0) if len(bh) else None,
