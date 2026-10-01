@@ -537,6 +537,8 @@ def main():
                     if memory is not None:
                         memory.add(now, depth, pos, R)
                     n_dec += 1
+                # (the logs below key on `applied`, not on now == last decision time: under
+                # --clock px4 two loop ticks can read the same PX4 millisecond)
                 applied = sched.apply_due(now)
                 if applied is not None:
                     last_dec = now
@@ -601,7 +603,7 @@ def main():
                     if sh_dv > 1e-3:
                         sh_stat["ticks"] += 1
                         sh_tot["ticks"] += 1
-                if dec_log is not None and last_dec == now:
+                if dec_log is not None and applied is not None:
                     p = policy.last["probs"]
                     dec_log.write(",".join(f"{x:.4f}" for x in (
                         now - t0, *pos, *vel, yaw)) + f",{policy.last['head']},"
@@ -614,7 +616,7 @@ def main():
                         + (f",{yv_yr:.3f}" if args.yaw_to_vel > 0 else "")
                         + (f",{applied['t'] - t0:.4f}" if lat_s > 0 else "") + "\n")
                     sh_stat.update(ticks=0, dv=0.0, dmin=float("inf"), n=0)
-                if net_log is not None and last_dec == now:
+                if net_log is not None and applied is not None:
                     # posed at the observation (what the net saw; == this tick without latency)
                     net_log.add(applied["t"] - t0, applied["pos"], applied["vel"], applied["R"],
                                 applied["omega"], policy.last, v, yr, n_used)
