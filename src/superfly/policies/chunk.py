@@ -620,6 +620,52 @@ class StuckWatchdog:
         return f
 
 
+class DecisionSchedule:
+    """When to decide and when each decision takes effect (chunk_offboard). Defaults
+    (15 Hz, no latency) = the old inline schedule: a fixed-rate grid on the control
+    loop, and a decision whenever the ring is empty. With latency_s > 0 every
+    observation (ChunkPolicy.observe at the decision tick) waits in `pending` until
+    t_obs + latency_s, then ChunkPolicy.apply runs on the first tick at or after it
+    (onboard-latency emulation, 2026-10-01: VOXL 2 DINOv3 98-129 ms, 6-7.5 Hz)."""
+
+    def __init__(self, policy, decision_hz: float = 15.0, latency_s: float = 0.0, stamp: str = "obs"):
+        if decision_hz <= 0:
+            raise ValueError("decision_hz must be > 0")
+        if stamp not in ("obs", "apply"):
+            raise ValueError("stamp must be obs | apply")
+        self.policy, self.hz, self.latency, self.stamp = policy, float(decision_hz), max(0.0, float(latency_s)), stamp
+        self.realized = []       # observation-to-effect delays [s]
+        self.n_obs = 0
+        self.reset()
+
+    def reset(self, now=None):
+        """now: the first decision tick (chunk_offboard: the handoff); None = the first due() call."""
+        self.next = now
+        self.pending = []
+
+    def due(self, now: float) -> bool:
+        """Decide on this tick? (PX4 time is in ms: 2 ms tolerance.)"""
+        return (self.next is None or now >= self.next - 0.002
+                or (not self.policy.ring and not self.pending))
+
+    def observed(self, now: float, obs: dict) -> None:
+        base = now if self.next is None else self.next
+        self.next = max(base + 1.0 / self.hz, now)
+        obs["t_due"] = obs["t"] + self.latency
+        self.pending.append(obs)
+        self.n_obs += 1
+
+    def apply_due(self, now: float):
+        """Apply every pending observation that is due; returns the last one applied
+        on this tick (None if none)."""
+        applied = None
+        while self.pending and now >= self.pending[0]["t_due"] - 1e-9:
+            applied = self.pending.pop(0)
+            self.policy.apply(applied, now, stamp=self.stamp)
+            self.realized.append(now - applied["t"])
+        return applied
+
+
 class ChunkPolicy:
     # the executor guards' "off" values, for instances built without __init__ (tests)
     heads = list(HEADS)
@@ -812,42 +858,64 @@ class ChunkPolicy:
 
     def decide(self, t, pos, R, vel, omega_body, goal, depth, rgb=None):
         """One decision at time t (the observation's time). Returns the record.
-        rgb: the policy camera's (H, W, 3) uint8 frame (RGB students only)."""
+        rgb: the policy camera's (H, W, 3) uint8 frame (RGB students only).
+        = apply(observe(...)): the network output takes effect at once."""
+        return self.apply(self.observe(t, pos, R, vel, omega_body, goal, depth, rgb))
+
+    def observe(self, t, pos, R, vel, omega_body, goal, depth, rgb=None) -> dict:
+        """The network half of a decision: run the graph on the observation taken at
+        time t. Nothing in the executor changes until apply() -- so an onboard
+        inference latency can be emulated by applying the result later (chunk_offboard
+        --infer-latency-ms; the executor keeps flying the chunks it has meanwhile)."""
         yaw = heading_yaw(R)
-        Rh = rz(yaw)
         prev = self.prev_input(yaw)
         chunk, gate = self._infer(self._feed(
             encode_depth(depth), encode_state(pos, R, vel, omega_body, goal,
                                               self.goal_speed), prev,
             self.encode_rgb(rgb) if self.rgb is not None else None))
+        return {"t": float(t), "yaw": yaw, "chunk": chunk, "gate": gate,
+                "pos": np.asarray(pos, float).copy(), "vel": np.asarray(vel, float).copy(),
+                "R": np.asarray(R, float).copy(), "omega": np.asarray(omega_body, float).copy(),
+                "dist": float(np.linalg.norm(np.asarray(goal, float) - np.asarray(pos, float)))}
+
+    def apply(self, obs: dict, t_apply=None, stamp: str = "obs") -> dict:
+        """The executor half: head selection, the ring, prev_chunk -- at t_apply (default
+        the observation time = no latency). stamp "obs" (default): the chunk keeps the
+        observation's time origin, so after a latency L the executor reads it L s in
+        (a time-stamped onboard executor); "apply": the chunk starts at t_apply (an
+        executor that does not compensate)."""
+        t = obs["t"]
+        ta = t if t_apply is None else float(t_apply)
+        yaw, chunk, gate = obs["yaw"], obs["chunk"], obs["gate"]
+        Rh = rz(yaw)
         probs = softmax(gate)
         if self.stuck is not None:
-            self.stuck.observe(float(t), float(np.linalg.norm(np.asarray(goal, float)
-                                                              - np.asarray(pos, float))), pos)
-        sel, reason = self.select_head(probs, float(t))
+            self.stuck.observe(t, obs["dist"], obs["pos"])
+        sel, reason = self.select_head(probs, t)
         if self.same_head and self.head is not None and sel != self.head:
             self.ring.clear()
         if sel != self.head:
-            self.head_t = float(t)
+            self.head_t = t
         self.head = sel
         if sel < len(self.heads) and self.heads[sel] in ("left", "right"):
             self.last_side = sel
         c = chunk[sel]
         S = self.steps
         vh = np.stack([c[0:S], c[S:2 * S], c[2 * S:3 * S]], 1)
-        self.ring.insert(0, {"t": float(t), "v": vh @ Rh.T,
+        self.ring.insert(0, {"t": ta if stamp == "apply" else t, "v": vh @ Rh.T,
                              "yr": np.asarray(c[3 * S:4 * S], float)})
         del self.ring[self.ensemble:]
         self.prev_chunk = np.concatenate([vh, c[3 * S:4 * S, None]], 1)
         self.prev_yaw = yaw
         if self.stuck is not None:      # the speed the offboard will command (after --v-cap)
-            sp = float(np.linalg.norm(self.command(t)[0]))
+            sp = float(np.linalg.norm(self.command(ta)[0]))
             self.stuck.commanded(min(sp, self.v_cap) if self.v_cap is not None else sp)
         self.last = {"head": sel, "reason": reason, "probs": probs,
                      "v1": vh[0] @ Rh.T, "switches": self.switches,
                      # the full network output of this decision (DecisionLog);
                      # references only, nothing is copied or recomputed
-                     "chunk": chunk, "gate": gate, "yaw": yaw}
+                     "chunk": chunk, "gate": gate, "yaw": yaw,
+                     "t_obs": t, "t_apply": ta}
         return self.last
 
     def command(self, t):

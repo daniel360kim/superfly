@@ -199,3 +199,76 @@ def test_quantized_input_equals_training_shards():
     assert np.array_equal(q, ref)
     f = rgb_to_net(x, norm="in_graph", quantize=False)[0].transpose(1, 2, 0)
     assert 0 < np.abs(f - ref).max() <= 0.5 / 255 + 1e-6
+
+
+# --- onboard-latency emulation (DecisionSchedule, ChunkPolicy.observe / apply) -------------
+
+def _policy(tmp_path):
+    pytest.importorskip("onnxruntime")
+    from superfly.policies.chunk import ChunkPolicy
+    p = tmp_path / "s.onnx"
+    _tiny_rgb_graph(p, "nchw")
+    return ChunkPolicy(p, threads=1)
+
+
+def _obs(pol, t, k=0):
+    return pol.observe(t, [0.1 * k, 0, 2], np.eye(3), [1, 0, 0], [0, 0, 0], [5, 0, 2], None, rgb=_img(k % 3))
+
+
+def test_observe_apply_equals_decide(tmp_path):
+    a, b = _policy(tmp_path), _policy(tmp_path)
+    for k in range(5):
+        t = k / 15
+        ra = a.decide(t, [0.1 * k, 0, 2], np.eye(3), [1, 0, 0], [0, 0, 0], [5, 0, 2], None, rgb=_img(k % 3))
+        rb = b.apply(_obs(b, t, k))
+        assert ra["head"] == rb["head"] and np.allclose(ra["gate"], rb["gate"])
+    assert [e["t"] for e in a.ring] == [e["t"] for e in b.ring]
+    assert np.allclose(a.command(0.4)[0], b.command(0.4)[0])
+
+
+def _run(sched, pol, T=2.0, hz=60.0):
+    """the offboard's loop shape: decide when due, then apply what is due, then command."""
+    log = []
+    for i in range(int(T * hz) + 1):
+        now = i / hz
+        if sched.due(now):
+            sched.observed(now, _obs(pol, now, i))
+        ap = sched.apply_due(now)
+        log.append((now, ap["t"] if ap is not None else None, len(pol.ring)))
+    return log
+
+
+def test_schedule_default_is_the_old_15hz_immediate(tmp_path):
+    from superfly.policies.chunk import DecisionSchedule
+    pol = _policy(tmp_path)
+    s = DecisionSchedule(pol)
+    log = _run(s, pol, T=1.0)
+    applied = [(now, to) for now, to, _ in log if to is not None]
+    assert all(abs(now - to) < 1e-12 for now, to in applied)          # effect on the decision tick
+    assert len(applied) == 16 and s.n_obs == 16                      # every 4th 60 Hz tick, 0..1 s
+    assert np.allclose(np.diff([to for _, to in applied]), 1 / 15)
+
+
+def test_schedule_latency_7p5hz_130ms(tmp_path):
+    from superfly.policies.chunk import DecisionSchedule
+    pol = _policy(tmp_path)
+    s = DecisionSchedule(pol, decision_hz=7.5, latency_s=0.130)
+    log = _run(s, pol, T=2.0)
+    obs_t = [to for _, to, _ in log if to is not None]
+    assert np.allclose(np.diff(obs_t), 1 / 7.5)                       # every 8th tick
+    # nothing to fly before the first effect: the first observation lands at the first tick >= 0.13 s
+    first = next(i for i, (_, to, _) in enumerate(log) if to is not None)
+    assert all(n == 0 for _, _, n in log[:first]) and abs(log[first][0] - 8 / 60) < 1e-9
+    assert np.allclose(s.realized, 8 / 60)                           # 0.13 s quantized to the 60 Hz tick
+    assert len(s.pending) <= 1
+    # stamp obs: the chunk keeps the observation time origin
+    assert pol.ring[0]["t"] == obs_t[-1]
+
+
+def test_schedule_stamp_apply(tmp_path):
+    from superfly.policies.chunk import DecisionSchedule
+    pol = _policy(tmp_path)
+    s = DecisionSchedule(pol, decision_hz=7.5, latency_s=0.130, stamp="apply")
+    log = _run(s, pol, T=1.0)
+    last_apply = [now for now, to, _ in log if to is not None][-1]
+    assert pol.ring[0]["t"] == last_apply and pol.last["t_apply"] == last_apply

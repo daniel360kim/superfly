@@ -55,6 +55,19 @@ forward ms) and rgb_first_decision.npy (the 640x480 frame of the first
 decision); --save-rgb-every S adds rgb_frames.npz (net-input frames every S s).
 Depth students: nothing changes.
 
+Onboard-latency emulation (2026-10-01; both off by default = unchanged):
+--decision-hz F decides at F Hz instead of 15 (fixed schedule on the 60 Hz loop);
+--infer-latency-ms L runs the network on the observation (state + camera frame)
+taken at the decision tick but lets its output take effect only L ms later
+(ChunkPolicy.observe now / apply at t_obs + L): until then the executor keeps
+flying the chunks it already has, with its lead. --latency-stamp obs (default)
+keeps the chunk's time origin at the observation (a time-stamped executor reads it
+L s in); apply restarts it at the effect time. The VOXL 2 numbers (Jason): DINOv3
+encoder 98-129 ms, flown at 6-7.5 Hz -> e.g. --decision-hz 7.5 --infer-latency-ms 130.
+The network log and chunk_decisions.csv keep one row per APPLIED decision, posed at
+the observation (what the net saw); the csv gains t_obs. The real forward time
+(~40 ms, sim clock) is inside L, so L is the total observation-to-effect delay.
+
 Phases as agile_offboard: CLIMB (position hold) -> YAW (face goal) -> POLICY
 -> LANDING when within --goal-radius horizontally.
 """
@@ -82,7 +95,7 @@ from superfly.common.px4_offboard import (
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 from superfly.policies.chunk import (ChunkPolicy, SmoothRef, ObstacleMemory, ClearanceShield,
-                                     DecisionLog, yaw_toward)
+                                     DecisionLog, DecisionSchedule, yaw_toward)
 
 CONTROL_HZ = 60.0          # a multiple of DECISION_HZ: exactly every 4th tick decides
 DECISION_HZ = 15.0          # sim_episode.DECISION_HZ
@@ -234,6 +247,16 @@ def main():
     ap.add_argument("--mem-cam-pitch", type=float, default=0.0,
                     help="--shield: effective camera pitch [deg, + = down] for the back-"
                          "projection (Isaac with SUPERFLY_CAM_PITCH_DEG=-13: level = 0).")
+    ap.add_argument("--decision-hz", type=float, default=DECISION_HZ,
+                    help=f"Decision rate [Hz] (default {DECISION_HZ:g}, the python sim's). Onboard-latency "
+                         "emulation: e.g. 7.5 (Jason's throttled DINOv3 rate on the VOXL 2).")
+    ap.add_argument("--infer-latency-ms", type=float, default=0.0,
+                    help="Observation-to-effect delay of each decision [ms] (default 0 = the output acts "
+                         "at once): the net sees the frame + state of the decision tick, the executor "
+                         "gets its chunk this much later (e.g. 130, the VOXL 2 encoder).")
+    ap.add_argument("--latency-stamp", choices=["obs", "apply"], default="obs",
+                    help="--infer-latency-ms: the chunk's time origin -- the observation (default; a "
+                         "time-stamped executor) or the moment it takes effect.")
     ap.add_argument("--yaw-lead", type=float, default=0.0,
                     help="Read each chunk's yaw rate on the step containing tau + YAW_LEAD [s] "
                          "(0 = at tau, the old behaviour; the turn test used YAW_LEAD = --lead).")
@@ -297,6 +320,14 @@ def main():
     if policy.modality != "rgb" and rgb_sub is not None:
         raise SystemExit(f"[chunk] --rgb given but {args.checkpoint} has no rgb input "
                          f"(inputs {list(policy.inputs)})")
+    lat_s = max(0.0, float(args.infer_latency_ms)) / 1000.0
+    if args.decision_hz <= 0:
+        raise SystemExit("--decision-hz must be > 0")
+    if args.decision_hz != DECISION_HZ or lat_s > 0:
+        print(f"[chunk] ONBOARD EMULATION: decisions at {args.decision_hz:g} Hz, observation-to-effect "
+              f"latency {lat_s * 1e3:.0f} ms, chunk stamped at the {args.latency_stamp}"
+              + (" -- latency exceeds the decision period: decisions are pipelined"
+                 if lat_s > 1.0 / args.decision_hz else ""), flush=True)
     if policy.rgb is not None:
         print(f"[chunk] RGB student: input {policy.rgb['name']!r} {policy.inputs[policy.rgb['name']]} "
               f"layout {policy.rgb['layout']}, size {policy.rgb['size']}, norm {policy.rgb['norm']}"
@@ -382,6 +413,7 @@ def main():
                       + (",tgt_vx,tgt_vy,tgt_vz,tgt_yr,cmd_ax,cmd_ay,cmd_az" if smooth else "")
                       + (",mem_n,sh_ticks,sh_dv,sh_n,sh_dmin" if shield else "")
                       + (",yaw_vel_yr" if args.yaw_to_vel > 0 else "")
+                      + (",t_obs" if lat_s > 0 else "")
                       + "\n")
     net_log = None
     if sl and not args.no_net_log:
@@ -399,7 +431,8 @@ def main():
                           stuck_progress=args.stuck_progress, stuck_v=args.stuck_v,
                           stuck_hold=args.stuck_hold, stuck_min_dist=args.stuck_min_dist,
                           stuck_disp=args.stuck_disp,
-                          decision_hz=DECISION_HZ, clock=args.clock, modality=policy.modality,
+                          decision_hz=args.decision_hz, infer_latency_ms=args.infer_latency_ms,
+                          latency_stamp=args.latency_stamp, clock=args.clock, modality=policy.modality,
                           rgb_input=({k: v for k, v in policy.rgb.items() if k != "dtype"}
                                      if policy.rgb is not None else None)))
         except Exception as e:      # logging must never stop a flight
@@ -419,13 +452,14 @@ def main():
     last_hb = 0.0
     last_arm = time.time()
     last_dec = -1e9
-    next_dec = -1e9
     policy_t0 = None
     landing_sent = False
     reached_t = None            # --clock time of the goal handoff (--post-goal-hold)
     skip_disarm = False
     lo, hi = float(args.z_min), Z_REF[1]
     n_dec = 0
+    sched = DecisionSchedule(policy, args.decision_hz, lat_s, args.latency_stamp)
+    applied = None          # the observation record applied on this tick (logs)
     t_prev = None
     try:
         while True:
@@ -456,7 +490,7 @@ def main():
                 if abs(math.degrees(err)) < args.yaw_tol_deg and state.offboard:
                     phase = "POLICY"
                     policy_t0 = now
-                    next_dec = now
+                    sched.reset(now)
                     mark_policy_phase("start")
                     policy.reset()
                     if memory is not None:
@@ -470,8 +504,7 @@ def main():
             elif phase == "POLICY":
                 # on a fixed 15 Hz schedule (not "15 Hz since the last one",
                 # which quantizes to every 5th 60 Hz tick = 12 Hz)
-                if now >= next_dec - 0.002 or not policy.ring:   # PX4 time is in ms
-                    next_dec = max(next_dec + 1.0 / DECISION_HZ, now)
+                if sched.due(now):
                     depth = depth_sub.latest() if depth_sub else None
                     rgb, rgb_st, rgb_wall = (rgb_sub.latest_stamped() if rgb_sub is not None
                                              else (None, None, None))
@@ -480,8 +513,9 @@ def main():
                               "(the net sees mid-grey) -- is the sim running with SUPERFLY_POLICY_RGB=1?",
                               flush=True)
                     t_fw = time.perf_counter()
-                    rec = policy.decide(now, pos, R, vel, om, goal, depth, rgb=rgb)
+                    obs = policy.observe(now, pos, R, vel, om, goal, depth, rgb=rgb)
                     fw_ms = (time.perf_counter() - t_fw) * 1e3
+                    sched.observed(now, obs)
                     if in_log is not None:
                         try:
                             in_log.write(f"{now - t0:.4f},{-1.0 if rgb_st is None else rgb_st:.4f},"
@@ -502,8 +536,10 @@ def main():
                             in_log = None
                     if memory is not None:
                         memory.add(now, depth, pos, R)
-                    last_dec = now
                     n_dec += 1
+                applied = sched.apply_due(now)
+                if applied is not None:
+                    last_dec = now
                 v, yr, n_used = policy.command(now)
                 if args.v_cap_xy:
                     sp = float(np.hypot(v[0], v[1]))
@@ -575,15 +611,19 @@ def main():
                            if smooth is not None else "")
                         + (f",{len(memory.pts)},{sh_stat['ticks']},{sh_stat['dv']:.3f},"
                            f"{sh_stat['n']},{min(sh_stat['dmin'], 99.0):.3f}" if shield is not None else "")
-                        + (f",{yv_yr:.3f}" if args.yaw_to_vel > 0 else "") + "\n")
+                        + (f",{yv_yr:.3f}" if args.yaw_to_vel > 0 else "")
+                        + (f",{applied['t'] - t0:.4f}" if lat_s > 0 else "") + "\n")
                     sh_stat.update(ticks=0, dv=0.0, dmin=float("inf"), n=0)
                 if net_log is not None and last_dec == now:
-                    net_log.add(now - t0, pos, vel, R, om, policy.last, v, yr, n_used)
+                    # posed at the observation (what the net saw; == this tick without latency)
+                    net_log.add(applied["t"] - t0, applied["pos"], applied["vel"], applied["R"],
+                                applied["omega"], policy.last, v, yr, n_used)
                 dist = float(np.linalg.norm((goal - pos)[:2]))
                 if verbose:
                     print(f"[POLICY t={now - t0:.1f}] pos={pos.round(2)} |v|={np.linalg.norm(vel):.2f} "
-                          f"cmd={np.round(v, 2)} yr={yr:+.2f} head={policy.heads[policy.head]} "
-                          f"p={np.round(policy.last['probs'], 2)} n_ens={n_used} "
+                          f"cmd={np.round(v, 2)} yr={yr:+.2f} "
+                          f"head={policy.heads[policy.head] if policy.head is not None else '-'} "
+                          f"p={np.round(policy.last['probs'], 2) if 'probs' in policy.last else '-'} n_ens={n_used} "
                           f"switches={policy.switches} dist={dist:.1f} decisions={n_dec}"
                           + (f" mem={len(memory.pts)} shield_ticks={sh_tot['ticks']}"
                              if shield is not None else "")
@@ -634,6 +674,11 @@ def main():
                                     rgb=np.stack(rgb_keep), t=np.asarray(rgb_keep_t))
             except Exception as e:
                 print(f"[chunk] rgb_frames.npz not written: {e}", flush=True)
+        if sched.realized:
+            lr = np.asarray(sched.realized) * 1e3
+            print(f"[chunk] DECISIONS: {n_dec} observed, {len(sched.realized)} applied, observation-to-effect "
+                  f"median {np.median(lr):.0f} ms (min {lr.min():.0f}, max {lr.max():.0f}), "
+                  f"decision rate {args.decision_hz:g} Hz", flush=True)
         if rgb_sub is not None:
             print(f"[chunk] RGB summary: {rgb_sub.frames} complete frames, "
                   f"{rgb_sub.incomplete} read retries, {rgb_sub.written} written by the sim", flush=True)
