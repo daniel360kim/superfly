@@ -76,7 +76,7 @@ from superfly.sim import scene_setup
 
 import sys
 import os
-from superfly.common.transport import DepthPublisher
+from superfly.common.transport import DepthPublisher, RgbPublisher
 from superfly.common.agile_debug_transport import AgileDebugSubscriber
 from superfly.sim.obstacle_field import generate as generate_field
 
@@ -205,6 +205,36 @@ POLICY_DEPTH_PUBLISH = {
 # the same body pose (and matches the horizontal FOV) of the active policy's
 # depth camera, so the RGB video shows the same viewpoint the policy sees.
 RGB_W, RGB_H = 640, 360
+
+# --- The Starling 2 Max nose camera (RGB students, 2026-10-01) ----------------
+# Jason's contract camera (superfly_rgb_nav vehicle/starling_contract.yaml
+# `camera`, configs/vehicles/starling2max.yaml cameras.hires_front), adopted by
+# Daniel 2026-10-01 (RGB_START_PROPOSAL 6): 87 deg HFOV rectilinear, 640x480,
+# square pixels (VFOV 70.86 deg), mounted at FLU (0.071, 0, -0.007) m on the
+# body, pitch 0. The training renders (W2, Blender) use exactly this camera.
+#   SUPERFLY_POLICY_RGB=1   adds the policy RGB camera with this geometry and
+#                           publishes its 640x480 uint8 frames (transport.
+#                           RgbPublisher: shared-memory seqlock, /dev/shm, one
+#                           per instance -- UDP drops 0.9 MB frames); the
+#                           offboard resizes (superfly.policies.rgb_preproc). Its near
+#                           plane is SUPERFLY_RGB_NEAR (default 0.3 m: the lab
+#                           Starling's front props sit ~0.12 m from the lens,
+#                           inside the 70.9 deg VFOV; the Blender renders have
+#                           no airframe). SUPERFLY_CAM_PITCH_DEG applies to it
+#                           like to the depth camera. With --record-rgb-video
+#                           the video is recorded FROM this camera (no extra
+#                           640x360 drone_camera): the video is the policy view.
+#   SUPERFLY_CAM_CONTRACT=starling87   the agile DEPTH policy camera takes the
+#                           same geometry (87 deg, 640x480, the mount offset;
+#                           still bilinear-resized to 224x224 for the depth
+#                           student) -- the paired depth reference at 87 deg.
+#                           Unset = the agile row unchanged (91 deg at (0.10, 0, 0)).
+STARLING_CAM = dict(position=(0.071, 0.0, -0.007), pitch_deg=0.0,
+                    resolution=(640, 480), fov_x_deg=87.0, fov_y_deg=None,
+                    clipping=None)
+RGB_POLICY_NEAR = 0.3
+RGB_POLICY_FAR = 100.0
+RGB_POLICY_HZ = 30.0       # publish at most this often in SIM time (the offboard reads at 15 Hz)
 
 # Sentinels shared with the offboards + harness (see superfly.common.sentinels
 # for what each file means; --auto-stop polls OFFBOARD_DONE_FILE, and
@@ -477,12 +507,27 @@ class PegasusApp:
         self._setup_camera()
         config_multirotor.graphical_sensors = [self._camera]
 
+        # Policy RGB camera (SUPERFLY_POLICY_RGB=1; RGB students): the Starling
+        # nose camera, published to the offboard every frame (STARLING_CAM).
+        self._rgb_policy_camera = None
+        self._rgb_pub = None
+        self._rgb_last_pub = -1e9
+        self._rgb_pub_n = 0
+        if os.environ.get("SUPERFLY_POLICY_RGB", "0") == "1":
+            self._setup_rgb_policy_camera()
+            config_multirotor.graphical_sensors.append(self._rgb_policy_camera)
+            self._rgb_pub = RgbPublisher()
+
         # Dedicated RGB camera for --record-rgb-video only: same body pose and
         # horizontal FOV as the policy's depth camera, but at a watchable
         # resolution. Only created when recording (an extra render product
         # costs real frame time).
         self._rgb_camera = None
-        if self._rgb_video is not None:
+        if self._rgb_video is not None and self._rgb_policy_camera is not None:
+            # the video IS the policy's RGB view (640x480, 87 deg)
+            self._rgb_camera = self._rgb_policy_camera
+            print("[camera] --record-rgb-video records the policy RGB camera")
+        elif self._rgb_video is not None:
             self._rgb_camera = MonocularCamera("drone_camera", config={
                 "depth": False,
                 "position": np.array(self._camera._position),
@@ -542,6 +587,16 @@ class PegasusApp:
         negated to pitch DOWN. The horizontal FOV is forced to match training
         exactly; fov_y_deg None means square pixels (fy = fx)."""
         cam = dict(POLICY_CAMERAS[self.policy])
+        _contract = os.environ.get("SUPERFLY_CAM_CONTRACT", "").strip()
+        if _contract:
+            if _contract != "starling87":
+                raise SystemExit(f"SUPERFLY_CAM_CONTRACT={_contract!r}: only 'starling87' is known")
+            if self.policy != "agile":
+                raise SystemExit("SUPERFLY_CAM_CONTRACT applies to the agile (student) camera only")
+            print(f"[camera] depth camera -> the Starling contract camera {STARLING_CAM} "
+                  f"(SUPERFLY_CAM_CONTRACT={_contract})")
+            cam.update({k: STARLING_CAM[k] for k in ("position", "pitch_deg", "resolution",
+                                                     "fov_x_deg", "fov_y_deg")})
         # SUPERFLY_CAM_PITCH_DEG overrides the row's pitch (degrees, positive =
         # down). Measured 2026-09-16 on airstation03: with pitch_deg 0 the agile
         # depth frame matches the training renderer only at ~13 deg nose-down --
@@ -592,6 +647,68 @@ class PegasusApp:
             [self._camera.fx, 0.0, self._camera.cx],
             [0.0, self._camera.fy, self._camera.cy],
             [0.0, 0.0, 1.0]])
+
+    def _setup_rgb_policy_camera(self):
+        """The RGB students' camera: STARLING_CAM geometry, RGB only, near plane
+        SUPERFLY_RGB_NEAR (default RGB_POLICY_NEAR), pitch override
+        SUPERFLY_CAM_PITCH_DEG as for the depth camera. Same orientation
+        convention as _setup_camera ([0, -pitch, 180] Euler ZYX = forward)."""
+        cam = dict(STARLING_CAM)
+        _ovr = os.environ.get("SUPERFLY_CAM_PITCH_DEG")
+        if _ovr not in (None, ""):
+            cam["pitch_deg"] = float(_ovr)
+        _near = os.environ.get("SUPERFLY_RGB_NEAR", "").strip()
+        near = float(_near) if _near else RGB_POLICY_NEAR
+        w, h = cam["resolution"]
+        self._rgb_policy_camera = MonocularCamera("rgb_policy_cam", config={
+            "depth": False,
+            "position": np.array(cam["position"]),
+            "orientation": np.array([0.0, -cam["pitch_deg"], 180.0]),
+            "resolution": (w, h),
+            "clipping_range": (near, RGB_POLICY_FAR),
+            "frequency": 30,
+            "intrinsics": None,
+        })
+        c = self._rgb_policy_camera
+        c.fov = cam["fov_x_deg"]
+        c.fx = 0.5 * w / math.tan(0.5 * math.radians(cam["fov_x_deg"]))
+        c.fy = c.fx
+        c.cx, c.cy = 0.5 * w, 0.5 * h
+        c._intrinsics = np.array([[c.fx, 0.0, c.cx], [0.0, c.fy, c.cy], [0.0, 0.0, 1.0]])
+        print(f"[camera] policy RGB camera: {w}x{h}, HFOV {cam['fov_x_deg']:g} deg "
+              f"(VFOV {2 * math.degrees(math.atan(h / w * math.tan(math.radians(cam['fov_x_deg'] / 2)))):.2f}), "
+              f"fx {c.fx:.2f}, body FLU {cam['position']}, pitch {cam['pitch_deg']:g} deg, "
+              f"near {near:g} m (SUPERFLY_POLICY_RGB=1)", flush=True)
+
+    def _publish_rgb(self):
+        """SUPERFLY_POLICY_RGB=1: send the policy RGB frame (640x480 uint8, row 0
+        = top) to the offboard, at most RGB_POLICY_HZ in sim time."""
+        if self._rgb_pub is None:
+            return
+        c = self._rgb_policy_camera
+        cam = getattr(c, "_camera", None)
+        if cam is None or not getattr(c, "_camera_full_set", False):
+            return
+        t = self._sim_time()
+        if t - self._rgb_last_pub < 1.0 / RGB_POLICY_HZ - 1e-6:
+            return
+        try:
+            rgb = cam.get_rgb()
+            if rgb is None:
+                return
+            rgb = np.asarray(rgb)
+            if rgb.size == 0 or rgb.ndim != 3:
+                return
+            self._rgb_pub.send(rgb, stamp=t)
+            self._rgb_last_pub = t
+            self._rgb_pub_n += 1
+            if self._rgb_pub_n == 1:
+                print(f"[capture] first policy RGB frame {rgb.shape} {rgb.dtype} at sim t={t:.2f}",
+                      flush=True)
+                if os.environ.get("SUPERFLY_RGB_PROBE"):
+                    np.save(os.environ["SUPERFLY_RGB_PROBE"], rgb[..., :3])
+        except Exception as e:
+            carb.log_warn(f"policy rgb publish failed: {e}")
 
     def _spawn_lighting(self):
         """Sun + ambient dome for USD stages with no authored lights (body
@@ -1287,6 +1404,7 @@ class PegasusApp:
                     except Exception:
                         pass
                 self._publish_depth()
+                self._publish_rgb()
                 if self.policy == "agile":
                     self._dump_agile_overhead_debug()
                 self._record_rgb_video_frame()

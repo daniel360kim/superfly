@@ -43,6 +43,18 @@ beside it -- every head's raw chunk, the gate logits, the decision pose (pos,
 vel, R, heading yaw) and the setpoint sent, ~1.4 kB per decision
 (superfly.policies.chunk.DecisionLog; paths via chunk_paths). Logging only.
 
+--rgb (RGB students, 2026-10-01; required when the ONNX has an `rgb` input,
+refused otherwise): the sim's policy RGB camera (run_px4_sim with
+SUPERFLY_POLICY_RGB=1: 640x480, 87 deg HFOV, the Starling nose-camera mount)
+arrives through shared memory (superfly.common.transport.RgbSubscriber) and is
+fed through superfly.policies.rgb_preproc (exact area resize to the graph's
+input size + ImageNet norm per the sidecar); depth inputs of an RGB graph get
+the blank frame. With SUPERFLY_STATE_LOG set it also writes policy_inputs.csv
+(per decision: RGB frame sim stamp and age, frames received / incomplete,
+forward ms) and rgb_first_decision.npy (the 640x480 frame of the first
+decision); --save-rgb-every S adds rgb_frames.npz (net-input frames every S s).
+Depth students: nothing changes.
+
 Phases as agile_offboard: CLIMB (position hold) -> YAW (face goal) -> POLICY
 -> LANDING when within --goal-radius horizontally.
 """
@@ -118,6 +130,12 @@ def main():
     ap.add_argument("--checkpoint", required=True, help="chunk_v1 student .onnx")
     ap.add_argument("--connect", default="udp:localhost:14550")
     ap.add_argument("--depth", action="store_true")
+    ap.add_argument("--rgb", action="store_true",
+                    help="Subscribe to the sim's policy RGB camera (SUPERFLY_POLICY_RGB=1) and feed "
+                         "the ONNX's rgb input. Required for an RGB student.")
+    ap.add_argument("--save-rgb-every", type=float, default=0.0, metavar="S",
+                    help="--rgb + SUPERFLY_STATE_LOG: keep the network-input RGB every S s of policy "
+                         "time in rgb_frames.npz (0 = off; the first decision's frame is always kept).")
     ap.add_argument("--goal", type=float, nargs=2, required=True, metavar=("X", "Y"))
     ap.add_argument("--climb-alt", type=float, default=2.0)
     ap.add_argument("--arrive-tol", type=float, default=0.3)
@@ -251,6 +269,10 @@ def main():
     goal = np.array([args.goal[0], args.goal[1], args.climb_alt], float)
     from superfly.common.transport import DepthSubscriber
     depth_sub = DepthSubscriber() if args.depth else None
+    rgb_sub = None
+    if args.rgb:
+        from superfly.common.transport import RgbSubscriber
+        rgb_sub = RgbSubscriber()
 
     mav = mavutil.mavlink_connection(args.connect)
     wait_for_heartbeat(mav)
@@ -269,6 +291,17 @@ def main():
                          stuck_v=args.stuck_v, stuck_hold=args.stuck_hold,
                          stuck_min_dist=args.stuck_min_dist, stuck_disp=args.stuck_disp,
                          v_cap=args.v_cap, yaw_lead=args.yaw_lead)
+    if policy.modality == "rgb" and rgb_sub is None:
+        raise SystemExit(f"[chunk] {args.checkpoint} is an RGB student (input {policy.rgb['name']!r}) "
+                         "-- run with --rgb (and the sim with SUPERFLY_POLICY_RGB=1)")
+    if policy.modality != "rgb" and rgb_sub is not None:
+        raise SystemExit(f"[chunk] --rgb given but {args.checkpoint} has no rgb input "
+                         f"(inputs {list(policy.inputs)})")
+    if policy.rgb is not None:
+        print(f"[chunk] RGB student: input {policy.rgb['name']!r} {policy.inputs[policy.rgb['name']]} "
+              f"layout {policy.rgb['layout']}, size {policy.rgb['size']}, norm {policy.rgb['norm']}"
+              f"{'' if policy.rgb['norm_from_sidecar'] else ' (DEFAULT -- the sidecar has no rgb_input.norm)'}"
+              f", area resize (superfly.policies.rgb_preproc); depth inputs get the blank frame", flush=True)
     print(f"[chunk] {Path(args.checkpoint).name}: heads {policy.heads}, "
           f"{policy.steps} x {policy.cdt:g} s, lead {policy.lead:g} s, "
           f"hysteresis {policy.hysteresis:g}, dwell {policy.dwell:g}/{policy.dwell_margin:g}, ensemble {policy.ensemble} "
@@ -366,10 +399,18 @@ def main():
                           stuck_progress=args.stuck_progress, stuck_v=args.stuck_v,
                           stuck_hold=args.stuck_hold, stuck_min_dist=args.stuck_min_dist,
                           stuck_disp=args.stuck_disp,
-                          decision_hz=DECISION_HZ, clock=args.clock))
+                          decision_hz=DECISION_HZ, clock=args.clock, modality=policy.modality,
+                          rgb_input=({k: v for k, v in policy.rgb.items() if k != "dtype"}
+                                     if policy.rgb is not None else None)))
         except Exception as e:      # logging must never stop a flight
             print(f"[chunk] net log off: {type(e).__name__}: {e}", flush=True)
             net_log = None
+
+    in_log = None
+    rgb_keep, rgb_keep_t, rgb_next_keep = [], [], 0.0
+    if sl and rgb_sub is not None:
+        in_log = open(Path(sl).with_name("policy_inputs.csv"), "w")
+        in_log.write("t,rgb_stamp,rgb_age_wall,rgb_frames,rgb_retries,rgb_mean,forward_ms\n")
 
     dt = 1.0 / CONTROL_HZ
     phase = "CLIMB"
@@ -432,7 +473,33 @@ def main():
                 if now >= next_dec - 0.002 or not policy.ring:   # PX4 time is in ms
                     next_dec = max(next_dec + 1.0 / DECISION_HZ, now)
                     depth = depth_sub.latest() if depth_sub else None
-                    rec = policy.decide(now, pos, R, vel, om, goal, depth)
+                    rgb, rgb_st, rgb_wall = (rgb_sub.latest_stamped() if rgb_sub is not None
+                                             else (None, None, None))
+                    if rgb_sub is not None and rgb is None and n_dec == 0:
+                        print("[chunk] WARNING: no RGB frame yet at the first decision "
+                              "(the net sees mid-grey) -- is the sim running with SUPERFLY_POLICY_RGB=1?",
+                              flush=True)
+                    t_fw = time.perf_counter()
+                    rec = policy.decide(now, pos, R, vel, om, goal, depth, rgb=rgb)
+                    fw_ms = (time.perf_counter() - t_fw) * 1e3
+                    if in_log is not None:
+                        try:
+                            in_log.write(f"{now - t0:.4f},{-1.0 if rgb_st is None else rgb_st:.4f},"
+                                         f"{-1.0 if rgb_wall is None else time.time() - rgb_wall:.4f},"
+                                         f"{rgb_sub.frames},{rgb_sub.incomplete},"
+                                         f"{-1.0 if rgb is None else float(rgb.mean()):.2f},{fw_ms:.1f}\n")
+                            if rgb is not None and n_dec == 0:
+                                np.save(Path(sl).with_name("rgb_first_decision.npy"), rgb)
+                            if (rgb is not None and args.save_rgb_every > 0
+                                    and now - policy_t0 >= rgb_next_keep):
+                                from superfly.policies.rgb_preproc import area_resize
+                                rgb_keep.append(np.clip(np.rint(area_resize(
+                                    rgb, tuple(policy.rgb["size"]))), 0, 255).astype(np.uint8))
+                                rgb_keep_t.append(now - t0)
+                                rgb_next_keep = now - policy_t0 + args.save_rgb_every
+                        except Exception as e:      # logging never stops a flight
+                            print(f"[chunk] input log off: {type(e).__name__}: {e}", flush=True)
+                            in_log = None
                     if memory is not None:
                         memory.add(now, depth, pos, R)
                     last_dec = now
@@ -519,7 +586,9 @@ def main():
                           f"p={np.round(policy.last['probs'], 2)} n_ens={n_used} "
                           f"switches={policy.switches} dist={dist:.1f} decisions={n_dec}"
                           + (f" mem={len(memory.pts)} shield_ticks={sh_tot['ticks']}"
-                             if shield is not None else ""),
+                             if shield is not None else "")
+                          + (f" rgb_frames={rgb_sub.frames}/{rgb_sub.written}"
+                             f" fwd_ms={fw_ms:.0f}" if rgb_sub is not None and n_dec else ""),
                           flush=True)
                 if dist < args.goal_radius:
                     phase = "LANDING"
@@ -557,6 +626,18 @@ def main():
             dec_log.close()
         if net_log is not None:
             net_log.close()
+        if in_log is not None:
+            in_log.close()
+        if rgb_keep and sl:
+            try:
+                np.savez_compressed(Path(sl).with_name("rgb_frames.npz"),
+                                    rgb=np.stack(rgb_keep), t=np.asarray(rgb_keep_t))
+            except Exception as e:
+                print(f"[chunk] rgb_frames.npz not written: {e}", flush=True)
+        if rgb_sub is not None:
+            print(f"[chunk] RGB summary: {rgb_sub.frames} complete frames, "
+                  f"{rgb_sub.incomplete} read retries, {rgb_sub.written} written by the sim", flush=True)
+            rgb_sub.close()
         stop.set()
         if not skip_disarm:     # an in-air disarm would drop the vehicle
             mav.mav.command_long_send(mav.target_system, mav.target_component,

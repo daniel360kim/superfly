@@ -1,0 +1,18 @@
+[
+  {
+    "name": "rgb_smoke_open",
+    "why": "RGB path smoke test (W5, 2026-10-01): a clear 15 m line to the goal with posts and a box beside it (visible in the 87 deg camera, never in the way), so even a goal-seeking dummy that ignores obstacles flies the whole policy phase; proves transport + preprocessing + feed + video end to end, scores nothing about avoidance.",
+    "obstacles": "boxes",
+    "seed": 0,
+    "start": [0.0, 0.0, 0.0],
+    "goal": [0.0, 15.0, 2.0],
+    "boxes": [
+      [-2.5, 5.0, 1.5, 0.15, 0.15, 1.5],
+      [2.5, 8.0, 1.5, 0.15, 0.15, 1.5],
+      [-3.0, 11.0, 0.5, 0.5, 0.5, 0.5],
+      [3.5, 13.0, 2.5, 0.1, 1.0, 0.1]
+    ],
+    "climb_alt": 2,
+    "timeout": 60
+  }
+]

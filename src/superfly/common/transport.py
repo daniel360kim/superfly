@@ -32,6 +32,23 @@ Depth is in metres; no-return / non-finite pixels must be set to a large value
 The subscriber returns float32 metres for every codec, so callers are
 codec-agnostic. send() never raises on transport errors -- losing one depth
 frame must never kill the sim loop.
+
+Policy RGB (RGB students, 2026-10-01; RgbPublisher / RgbSubscriber). The
+frame is the camera's own 640x480 uint8 RGB -- what a real nose-camera driver
+hands the policy; the policy process does the resize
+(superfly.policies.rgb_preproc), exactly as onboard. It does NOT go over UDP:
+a 0.9 MB frame is 16 datagrams, the kernel caps the receive buffer at
+net.core.rmem_max = 212992 B (gs2 and airstation03), and with the offboard's
+control loop holding the GIL a receive thread completed 10 of 150 frames at
+30 Hz in a loopback stress test (W5, 2026-10-01). Instead the sim writes the
+newest frame into a shared-memory file, /dev/shm/superfly_rgb_<uid>_<i>
+(superfly.common.instance.rgb_shm_path; i = SUPERFLY_INSTANCE or "x"), under
+a seqlock; the subscriber copies the newest complete frame on demand. Never
+blocks, never tears, never drops the newest frame. Layout (little-endian):
+    0  u32 magic 0x52474231 ("RGB1") | 4 u32 version 1 | 8 u64 seq (odd while writing)
+   16  u32 height | 20 u32 width | 24 f64 stamp (sim time, s) | 32 u64 frames written
+   40  f64 wall time of the write (time.time(), s)
+   64  uint8[height*width*3] RGB, row 0 = top, col 0 = left
 """
 
 import socket
@@ -40,7 +57,11 @@ import sys
 import zlib
 import numpy as np
 
-from superfly.common.instance import depth_port
+import mmap
+import os
+import time
+
+from superfly.common.instance import depth_port, rgb_shm_path
 
 # local UDP port for depth frames: 15001, +10 per SUPERFLY_INSTANCE (parallel
 # campaigns; unset = 15001)
@@ -174,3 +195,131 @@ class DepthSubscriber:
                 continue
             self._last = frame.reshape(h, w)
         return self._last
+
+
+
+_SHM_MAGIC = 0x52474231
+_SHM_HDR = 64
+_SHM_MAX = (640 * 2) * (480 * 2) * 3          # room for up to 1280x960 RGB
+
+
+class RgbPublisher:
+    """Writes the newest uint8 RGB policy frame into the shared-memory seqlock
+    (module docstring). Never raises: a failed write loses one frame."""
+
+    def __init__(self, path=None, max_bytes=_SHM_MAX):
+        self.path = rgb_shm_path() if path is None else str(path)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.ftruncate(fd, _SHM_HDR + int(max_bytes))
+            self._mm = mmap.mmap(fd, _SHM_HDR + int(max_bytes))
+        finally:
+            os.close(fd)
+        self._cap = int(max_bytes)
+        self._mm[0:_SHM_HDR] = bytes(_SHM_HDR)                 # fresh session: seq 0, no frame
+        struct.pack_into("<II", self._mm, 0, _SHM_MAGIC, 1)
+        self._seq = 0
+        self._n = 0
+        self._errors = 0
+
+    def send(self, rgb: np.ndarray, stamp: float = 0.0):
+        """rgb: (H, W, 3|4) uint8, row 0 = top, col 0 = left (alpha dropped).
+        stamp: the frame's sim time [s]."""
+        try:
+            a = np.asarray(rgb)[..., :3]
+            h, w = a.shape[:2]
+            if h * w * 3 > self._cap:
+                raise ValueError(f"frame {h}x{w} exceeds the {self._cap} B buffer")
+            self._seq += 1                                      # odd: writing
+            struct.pack_into("<Q", self._mm, 8, self._seq)
+            struct.pack_into("<IId", self._mm, 16, h, w, float(stamp))
+            dst = np.frombuffer(self._mm, dtype=np.uint8, count=h * w * 3, offset=_SHM_HDR)
+            dst[:] = np.ascontiguousarray(a, dtype=np.uint8).reshape(-1)
+            del dst
+            self._n += 1
+            struct.pack_into("<Qd", self._mm, 32, self._n, time.time())
+            self._seq += 1                                      # even: complete
+            struct.pack_into("<Q", self._mm, 8, self._seq)
+        except Exception as e:
+            self._errors += 1
+            if self._errors < 3 or self._errors % 100 == 0:
+                print(f"[rgb_transport] write failed ({e}); {self._errors} frames lost so far.",
+                      file=sys.stderr, flush=True)
+
+
+class RgbSubscriber:
+    """Reads the newest complete RGB frame (H, W, 3) uint8 from the shared-memory
+    seqlock (module docstring). Opens the file lazily (the sim may start
+    later); latest() never blocks and returns None until a frame exists."""
+
+    def __init__(self, path=None):
+        self.path = rgb_shm_path() if path is None else str(path)
+        self._mm = None
+        self._last = None
+        self._last_seq = -1
+        self._last_stamp = None
+        self._last_wall = None
+        self.frames = 0          # distinct complete frames read
+        self.incomplete = 0      # reads that met a frame being written (retried)
+        self.written = 0         # frames the publisher has written (its counter)
+
+    def _open(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except OSError:
+            return False
+        try:
+            size = os.fstat(fd).st_size
+            if size < _SHM_HDR:
+                return False
+            self._mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
+        finally:
+            os.close(fd)
+        return True
+
+    def _read(self):
+        mm = self._mm
+        for _ in range(4):
+            magic, = struct.unpack_from("<I", mm, 0)
+            s1, = struct.unpack_from("<Q", mm, 8)
+            if magic != _SHM_MAGIC or s1 == 0:
+                return None
+            if s1 & 1:
+                self.incomplete += 1
+                time.sleep(0.0005)
+                continue
+            if s1 == self._last_seq:
+                return "same"
+            h, w, st = struct.unpack_from("<IId", mm, 16)
+            n, wall = struct.unpack_from("<Qd", mm, 32)
+            if h * w * 3 > len(mm) - _SHM_HDR:
+                return None
+            frame = np.frombuffer(mm, dtype=np.uint8, count=h * w * 3, offset=_SHM_HDR).copy()
+            s2, = struct.unpack_from("<Q", mm, 8)
+            if s2 != s1:
+                self.incomplete += 1
+                continue
+            self._last, self._last_seq = frame.reshape(h, w, 3), s1
+            self._last_stamp, self._last_wall, self.written = st, wall, n
+            self.frames += 1
+            return "new"
+        return None
+
+    def latest(self):
+        if self._mm is None and not self._open():
+            return None
+        self._read()
+        return self._last
+
+    def latest_stamped(self):
+        """(frame, publisher sim time [s], publisher wall time of the write [s]) or Nones."""
+        f = self.latest()
+        return f, (self._last_stamp if f is not None else None), (self._last_wall if f is not None else None)
+
+    def close(self):
+        if self._mm is not None:
+            try:
+                self._mm.close()
+            except Exception:
+                pass
+            self._mm = None

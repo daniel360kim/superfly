@@ -17,6 +17,20 @@ Contract (agile_student/INPUTS.md, "Velocity chunk"):
        intent (1,H,15) (auxiliary, never executed)
 Heading frame: gravity aligned, x along yaw = atan2(R[1,0], R[0,0]).
 
+RGB students (2026-10-01, RGB round 1): the graph additionally (or instead)
+has an input whose NAME contains "rgb". Inputs are routed by NAME first --
+"prev" -> prev_chunk, "rgb" -> the RGB tensor, "depth"/"img" -> depth -- and
+only then by rank (the old any-5-D-is-depth fallback, kept for the depth
+students). The RGB tensor is the policy camera's 640x480 uint8 frame through
+superfly.policies.rgb_preproc.rgb_to_net (exact area resize to the input size,
+/255, ImageNet norm here or in the graph), configured by the sidecar:
+    "rgb_input": {"layout": "nchw"|"nhwc", "norm": "imagenet"|"in_graph"|"uint8",
+                  "size": [W, H]}
+each key optional (layout and size default to the graph's static input shape,
+norm to "uint8" for a uint8 input, else "imagenet"). A graph with an rgb input
+gets the blank (all-far) depth on any depth input it also has, so no depth can
+leak into an RGB evaluation.
+
 Executor (per decision, 15 Hz):
   * head = argmax softmax(gate), kept unless another head's probability beats
     it by `hysteresis` (0.15); with `dwell` > 0 (off by default; sim
@@ -611,6 +625,7 @@ class ChunkPolicy:
     side_dwell, side_margin, flip_margin = 0.0, 1.0, 0.0
     stuck = None
     v_cap = None
+    rgb = None                      # depth student (see _rgb_config)
 
     def __init__(self, path, lead: float = 0.5, hysteresis: float = 0.15,
                  ensemble: int = 4, decay: float = 0.5, same_head: bool = True,
@@ -653,6 +668,8 @@ class ChunkPolicy:
         self.sess = ort.InferenceSession(self.path, opts,
                                          providers=["CPUExecutionProvider"])
         self.inputs = {i.name: list(i.shape) for i in self.sess.get_inputs()}
+        self.rgb = self._rgb_config(self.sess)          # None = depth student
+        self.modality = "rgb" if self.rgb is not None else "depth"
         self.out_names = [o.name for o in self.sess.get_outputs()]
         self.reset()
         self.forward_ms = self._time_forward()
@@ -670,13 +687,53 @@ class ChunkPolicy:
         self.last = {}
 
     # --- graph ---------------------------------------------------------------
-    def _feed(self, depth_in, state_in, prev):
+    def _rgb_config(self, sess) -> dict | None:
+        """The RGB input's name / encoding, or None for a depth-only graph."""
+        rin = [i for i in sess.get_inputs() if "rgb" in i.name.lower()]
+        if not rin:
+            return None
+        if len(rin) > 1:
+            raise ValueError(f"{self.path}: more than one rgb input {[i.name for i in rin]}")
+        i = rin[0]
+        cfg = dict(self.sidecar.get("rgb_input") or {})
+        shp = [d if isinstance(d, int) else None for d in i.shape]
+        if len(shp) != 4:
+            raise ValueError(f"{self.path}: rgb input {i.name} has shape {i.shape}, want 4-D")
+        layout = cfg.get("layout") or ("nchw" if shp[1] == 3 else "nhwc" if shp[3] == 3 else None)
+        if layout not in ("nchw", "nhwc"):
+            raise ValueError(f"{self.path}: cannot tell the layout of rgb input {i.shape}; "
+                             f"set sidecar rgb_input.layout")
+        hw = shp[2:4] if layout == "nchw" else shp[1:3]
+        size = cfg.get("size") or ([hw[1], hw[0]] if None not in hw else None)
+        if size is None:
+            from superfly.policies.rgb_preproc import NET_W, NET_H
+            size = [NET_W, NET_H]
+        is_u8 = "uint8" in str(i.type)
+        norm = cfg.get("norm") or ("uint8" if is_u8 else "imagenet")
+        return {"name": i.name, "layout": layout, "size": [int(size[0]), int(size[1])],
+                "norm": norm, "dtype": np.uint8 if is_u8 else np.float32,
+                "norm_from_sidecar": "norm" in cfg}
+
+    def encode_rgb(self, frame):
+        """Camera frame (H, W, 3) uint8 (or None = mid-grey) -> the rgb input."""
+        from superfly.policies.rgb_preproc import rgb_to_net, blank_frame
+        c = self.rgb
+        f = blank_frame() if frame is None else frame
+        x = rgb_to_net(f, norm=c["norm"], layout=c["layout"], out_wh=tuple(c["size"]))
+        return x.astype(c["dtype"], copy=False)
+
+    def _feed(self, depth_in, state_in, prev, rgb_in=None):
         feed = {}
         for name, shape in self.inputs.items():
             if "prev" in name or (len(shape) == 2 and shape[-1] == 4 * self.steps):
                 feed[name] = np.asarray(prev, np.float32)[None]
+            elif "rgb" in name.lower():
+                if rgb_in is None:
+                    raise ValueError(f"graph input {name!r} needs an RGB frame")
+                feed[name] = rgb_in
             elif "depth" in name or "img" in name or len(shape) == 5:
-                feed[name] = depth_in
+                # an RGB graph never sees the depth camera (blank = all far)
+                feed[name] = depth_in if self.rgb is None else encode_depth(None)
             else:
                 feed[name] = state_in
         return feed
@@ -702,7 +759,8 @@ class ChunkPolicy:
 
     def _time_forward(self) -> float:
         feed = self._feed(encode_depth(None), np.zeros((1, 1, 22), np.float32),
-                          np.zeros(4 * self.steps))
+                          np.zeros(4 * self.steps),
+                          self.encode_rgb(None) if self.rgb is not None else None)
         for _ in range(2):
             self.sess.run(None, feed)
         ts = []
@@ -749,14 +807,16 @@ class ChunkPolicy:
             return self.head, "gate"
         return self.head, why
 
-    def decide(self, t, pos, R, vel, omega_body, goal, depth):
-        """One decision at time t (the observation's time). Returns the record."""
+    def decide(self, t, pos, R, vel, omega_body, goal, depth, rgb=None):
+        """One decision at time t (the observation's time). Returns the record.
+        rgb: the policy camera's (H, W, 3) uint8 frame (RGB students only)."""
         yaw = heading_yaw(R)
         Rh = rz(yaw)
         prev = self.prev_input(yaw)
         chunk, gate = self._infer(self._feed(
             encode_depth(depth), encode_state(pos, R, vel, omega_body, goal,
-                                              self.goal_speed), prev))
+                                              self.goal_speed), prev,
+            self.encode_rgb(rgb) if self.rgb is not None else None))
         probs = softmax(gate)
         if self.stuck is not None:
             self.stuck.observe(float(t), float(np.linalg.norm(np.asarray(goal, float)

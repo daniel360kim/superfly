@@ -37,6 +37,14 @@ def depth_port(i=None):
     return DEPTH_PORT_BASE + PORT_STRIDE * (i or 0)
 
 
+def rgb_shm_path(i=None):
+    """Shared-memory file of the sim -> offboard policy RGB frames (RGB students,
+    2026-10-01; superfly.common.transport.RgbPublisher): one per uid and instance,
+    "x" for a legacy (exclusive) campaign."""
+    i = instance() if i is None else i
+    return f"/dev/shm/superfly_rgb_{os.getuid()}_{'x' if i is None else int(i)}"
+
+
 def agile_debug_port(i=None):
     i = instance() if i is None else i
     return AGILE_DEBUG_PORT_BASE + PORT_STRIDE * (i or 0)
