@@ -26,6 +26,7 @@ class DiffAeroObs:
     R_enu:         np.ndarray   # (3,3) FLU-body -> ENU world rotation matrix
     goal_enu:      np.ndarray   # (3,) ENU world
     depth_planar:  np.ndarray | None   # (H,W) metric planar (image-plane) depth raw from sim (PerceptionBuilder handles conversion to DiffAero perception encoding)
+    yaw_rate_enu:  float | None = None  # world-z (ENU, + = CCW) yaw rate [rad/s]; read only by vx_vz_yawrate velocity policies
 
 @dataclass
 class DiffAeroCmd:

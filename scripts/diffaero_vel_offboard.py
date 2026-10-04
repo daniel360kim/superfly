@@ -18,6 +18,10 @@ the policy's world-frame velocity setpoint straight to PX4's velocity loop.
     yaw_hold_speed. Pre-policy YAW phase still faces the goal once.
   * Altitude: planar policies output horizontal velocity only; a light altitude
     PID supplies vz while holding --climb-alt.
+  * vx_vz_yawrate policies (no lateral velocity): the actor's [vx, 0, vz] is
+    rotated by the measured heading, the yaw-rate output replaces the slewed
+    yaw, and both go to PX4 as velocity + yaw-rate setpoints. Their state
+    gets the measured world yaw rate as a 7th entry.
 
 Usage:
     # Against PX4 SITL (after running run_px4_sim.py --policy diffaero):
@@ -49,7 +53,7 @@ from superfly.common.frames import enu_vel_to_ned
 from superfly.common.px4_offboard import (
     HEARTBEAT_HZ,
     DroneState, wait_for_heartbeat, wait_for_position, set_offboard_mode, arm,
-    send_position_target_ned, send_velocity_target_ned,
+    send_position_target_ned, send_velocity_target_ned, send_velocity_yawrate_target_ned,
     send_land_command, send_heartbeat, set_param_float, receive_loop,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
@@ -219,6 +223,9 @@ def main():
     grounded_since = None
     recoveries = 0
     print(f"CLIMB: velocity climb to {args.climb_alt:.1f} m at {args.climb_rate:.1f} m/s ...")
+    if policy.yaw_rate_action:
+        print("Yaw-rate policy: forward/up velocity + yaw rate from actor "
+              "(velocity + yaw-rate setpoints).", flush=True)
     if policy.planar:
         print(
             f"Planar policy: horizontal velocity from actor, altitude PID + "
@@ -236,7 +243,7 @@ def main():
                 last_heartbeat = now
 
             if now >= next_step:
-                pos, vel, R_enu, yaw = state.get()
+                pos, vel, R_enu, w_body, yaw = state.get_full()
                 verbose = (
                     not args.quiet
                     and (elapsed < 5.0 or int(now) != int(now - control_dt))
@@ -302,6 +309,8 @@ def main():
                         R_enu=R_enu,
                         goal_enu=goal_enu,
                         depth_planar=depth_range,
+                        # world-z component of the FLU body rate
+                        yaw_rate_enu=float((R_enu @ w_body)[2]),
                     )
                     cmd = policy.compute(obs)
                     vx_n, vy_e, _ = enu_vel_to_ned(cmd.vel_cmd_enu)
@@ -311,9 +320,16 @@ def main():
                         )
                     else:
                         _, _, vz_d = enu_vel_to_ned(cmd.vel_cmd_enu)
-                    yaw_ned_cmd = policy.slew_yaw_ned_cmd(yaw_ned_cmd, control_dt)
-                    yaw_out = yaw_ned_cmd
-                    send_velocity_target_ned(mav, vx_n, vy_e, vz_d, yaw_out)
+                    if policy.yaw_rate_action:
+                        # ENU yaw rate (+ = CCW) -> NED (+ = CW)
+                        yaw_out = math.atan2(math.sin(math.pi / 2 - yaw),
+                                             math.cos(math.pi / 2 - yaw))  # for the log
+                        send_velocity_yawrate_target_ned(
+                            mav, vx_n, vy_e, vz_d, -cmd.yaw_rate_enu)
+                    else:
+                        yaw_ned_cmd = policy.slew_yaw_ned_cmd(yaw_ned_cmd, control_dt)
+                        yaw_out = yaw_ned_cmd
+                        send_velocity_target_ned(mav, vx_n, vy_e, vz_d, yaw_out)
                     # Grounded-recovery: after an upset (obstacle graze, rough
                     # tracking) PX4's land detector can latch with the drone
                     # parked on the ground, ignoring climb setpoints forever.
@@ -350,7 +366,9 @@ def main():
                             f"  vel_cmd(ENU) = {np.round(cmd.vel_cmd_enu, 2)}  "
                             f"|v|={cmd.vel_norm:.2f}\n"
                             f"  vz_ned       = {vz_d:.2f}\n"
-                            f"  yaw_ned(deg) = {math.degrees(yaw_out):.1f}\n"
+                            f"  yaw_ned(deg) = {math.degrees(yaw_out):.1f}"
+                            + (f"  yaw_rate_cmd(ENU) = {cmd.yaw_rate_enu:.2f} rad/s"
+                               if cmd.yaw_rate_enu is not None else "") + "\n"
                             f"  offboard={state.offboard}  armed={state.armed}\n"
                             "---"
                         )

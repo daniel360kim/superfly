@@ -4,6 +4,23 @@ Condensed record of approaches and their verdicts. Check before re-trying
 anything. Verdicts: `REJECTED` / `ESTABLISHED-NEGATIVE` / `SHIPPED` /
 `SUPERSEDED` / `PENDING`.
 
+## 2026-10-04 — DiffAero vx/vz/yaw-rate policies (`pmv_yawrate`, three speed bands) — PENDING
+
+Daniel: retrain DiffAero with action = forward velocity, up velocity, yaw
+rate (no lateral velocity), as three policies: 0.8–1.5, 0.5–2.0 and 2–5 m/s
+cruise. Sensor noise from PX4 ulogs comes later. Code: fork branch
+`vxvz-yawrate` (dynamics `action_space: vx_vz_yawrate`, 7-dim obs with the
+yaw rate, `env.obs_noise` hooks off by default, exporter `vel_yawrate_cmd`);
+deploy = `DiffAeroVelPolicy` yaw-rate mode + `send_velocity_yawrate_target_ned`.
+Recipes, model and ulog plan: `docs/DIFFAERO_YAWRATE.md`; train with
+`scripts/train_diffaero_yawrate.sh {s|m|f}` on airstation03 (overlay venv
+`scripts/airstation_diffaero_venv.sh`). Verified on gs2 CPU only so far:
+3-update train + export, heading/lag/gradient checks, deploy wrapper forward.
+Found on the way: the vel exporter's ONNX input names were shifted for
+MLP+perception (6 flattened inputs, 5 names), which made torch>=2.9's
+exporter fail with a duplicate `max_action`. Fixed in the fork.
+The first runs are short tests, not deploy candidates.
+
 ## 2026-09-29 — Starling 2 Max student evaluation in Isaac (overnight queue) — PENDING
 
 Held-out evaluation only (never a data source): both `*_student_v1` suites,

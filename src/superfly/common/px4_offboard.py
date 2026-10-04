@@ -324,6 +324,29 @@ def send_velocity_target_ned(mav, vx_n: float, vy_e: float, vz_d: float, yaw: fl
     )
 
 
+def send_velocity_yawrate_target_ned(mav, vx_n: float, vy_e: float, vz_d: float,
+                                     yaw_rate_ned: float):
+    """Velocity + yaw-RATE setpoint (SET_POSITION_TARGET_LOCAL_NED, msg id 84).
+
+    Like send_velocity_target_ned but the yaw field is masked off and the
+    yaw_rate field used [rad/s, NED: + = clockwise seen from above], for
+    policies that command heading through its rate (DiffAero vx_vz_yawrate)."""
+    IGNORE_POS = 1 | 2 | 4
+    IGNORE_ACC = 64 | 128 | 256
+    IGNORE_YAW = 1024
+    type_mask = IGNORE_POS | IGNORE_ACC | IGNORE_YAW
+    mav.mav.set_position_target_local_ned_send(
+        int(time.time() * 1000) & 0xFFFFFFFF,
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        type_mask,
+        0.0, 0.0, 0.0,
+        float(vx_n), float(vy_e), float(vz_d),
+        0.0, 0.0, 0.0,
+        0.0, float(yaw_rate_ned),
+    )
+
+
 def send_land_command(mav):
     """Command PX4 to land at the current XY position via MAV_CMD_NAV_LAND."""
     mav.mav.command_long_send(

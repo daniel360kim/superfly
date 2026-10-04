@@ -7,11 +7,17 @@ per-axis clamped to the deployed cruise limits and passed through the same
 first-order velocity lag used by ``VelocityPointMassModel`` in training
 (``lmbda`` from the checkpoint hydra config).
 
-Supports both full 3-D velocity policies (``planar: false``) and planar
-policies (``planar: true``) that output horizontal ``[vx, vy]`` only; the
-exporter pads ``vz=0`` and the deploy bridge holds altitude externally.
+Supports full 3-D velocity policies (``planar: false``), planar policies
+(``planar: true``) that output horizontal ``[vx, vy]`` only (the exporter pads
+``vz=0`` and the deploy bridge holds altitude externally), and non-holonomic
+``action_space: vx_vz_yawrate`` policies: forward + up velocity and a yaw-rate
+command, no lateral velocity. Those export ``[vx_w, vy_w, vz_w, yaw_rate]``
+(the local ``[vx, 0, vz]`` already rotated by the measured heading); the yaw
+rate gets its own software lag (``lmbda_yaw``) and is sent to PX4 as a yaw-rate
+setpoint instead of the slewed yaw.
 
-Observation layout (``obs_frame=local``): ``[target_vel_local(3), v_local(3)]``.
+Observation layout (``obs_frame=local``): ``[target_vel_local(3), v_local(3)]``,
+plus the measured world yaw rate for vx_vz_yawrate policies.
 Perception is used when the checkpoint was trained with ``env=obstacle_avoidance``.
 """
 
@@ -34,6 +40,7 @@ class DiffAeroVelCmd:
     vel_cmd_enu: np.ndarray  # (3,) world-frame velocity setpoint [m/s]
     vel_norm: float
     yaw_ned: float           # compass heading for PX4 SET_POSITION_TARGET_LOCAL_NED
+    yaw_rate_enu: float | None = None  # vx_vz_yawrate only: yaw-rate setpoint [rad/s, + = CCW]
 
 
 class DiffAeroVelPolicy:
@@ -61,6 +68,8 @@ class DiffAeroVelPolicy:
         net_cfg = cfg.get("network", {})
         self.network_name = str(net_cfg.get("name", "mlp"))
         self.planar = bool(dyn.get("planar", False))
+        self.action_space = str(dyn.get("action_space", "xy" if self.planar else "xyz"))
+        self.yaw_rate_action = self.action_space == "vx_vz_yawrate"
         self.vel_ema_factor = (
             vel_ema_factor
             if vel_ema_factor is not None
@@ -73,6 +82,13 @@ class DiffAeroVelPolicy:
         self._vel_lag_alpha = 1.0 - math.exp(-self.lmbda * self.control_dt)
         self.max_yaw_rate_deg = float(dyn.get("max_yaw_rate", {}).get("default", 60.0))
         self.yaw_hold_speed = float(dyn.get("yaw_hold_speed", 0.3))
+        if self.yaw_rate_action:
+            self.lmbda_yaw = float(dyn["lmbda_yaw"]["default"])
+            self._yaw_rate_lag_alpha = 1.0 - math.exp(-self.lmbda_yaw * self.control_dt)
+            self.reverse_vel_x = float(dyn["reverse_vel_x"])
+            if max_vel_xy is None and max_vel is None:
+                # forward clamp; --max-vel-xy overrides it like the xy clamp
+                max_vel_xy = float(dyn["max_vel"]["x"]["default"])
 
         if max_vel_xy is None:
             max_vel_xy = (
@@ -93,7 +109,17 @@ class DiffAeroVelPolicy:
         self.module = torch.jit.load(str(pt2_path), map_location=self.device)
         self.module.eval()
 
-        if self.planar:
+        if self.yaw_rate_action:
+            r_max = math.radians(self.max_yaw_rate_deg)
+            self.min_action = torch.tensor(
+                [[-self.reverse_vel_x, -self.max_vel_z, -r_max]],
+                dtype=torch.float32, device=self.device,
+            )
+            self.max_action = torch.tensor(
+                [[self.max_vel_xy, self.max_vel_z, r_max]],
+                dtype=torch.float32, device=self.device,
+            )
+        elif self.planar:
             self.min_action = torch.tensor(
                 [[-self.max_vel_xy, -self.max_vel_xy]],
                 dtype=torch.float32, device=self.device,
@@ -114,6 +140,7 @@ class DiffAeroVelPolicy:
         self.max_vel_t = torch.tensor(max_vel, dtype=torch.float32, device=self.device)
         self.vel_ema: torch.Tensor | None = None
         self._vel_setpoint: torch.Tensor | None = None
+        self._yaw_rate_setpoint: float | None = None
         self._hidden: torch.Tensor | None = None
         if self.network_name == "rcnn":
             self._hidden_shape = (
@@ -127,7 +154,8 @@ class DiffAeroVelPolicy:
         )
         self._up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
 
-        mode = "planar horizontal" if self.planar else "full 3-D"
+        mode = ("vx/vz/yaw-rate" if self.yaw_rate_action
+                else "planar horizontal" if self.planar else "full 3-D")
         if self.uses_perception:
             print(f"Checkpoint uses obstacle-avoidance perception ({self.network_name}, {mode}).")
         else:
@@ -138,6 +166,13 @@ class DiffAeroVelPolicy:
             f"z=±{self.max_vel_z:.1f} m/s.",
             flush=True,
         )
+        if self.yaw_rate_action:
+            print(
+                f"Yaw-rate action: vx in [-{self.reverse_vel_x:.1f}, {self.max_vel_xy:.1f}] m/s, "
+                f"yaw rate ±{self.max_yaw_rate_deg:.0f} deg/s, lmbda_yaw={self.lmbda_yaw:.2f} "
+                f"(alpha={self._yaw_rate_lag_alpha:.4f}).",
+                flush=True,
+            )
         if self.planar:
             print(
                 f"Planar yaw bridge: max_yaw_rate={self.max_yaw_rate_deg:.0f} deg/s, "
@@ -148,6 +183,7 @@ class DiffAeroVelPolicy:
     def reset(self) -> None:
         self.vel_ema = None
         self._vel_setpoint = None
+        self._yaw_rate_setpoint = None
         self._hidden = None
 
     @torch.no_grad()
@@ -160,6 +196,12 @@ class DiffAeroVelPolicy:
         target_vel_local = Rz.t() @ target_vel_world
         v_local = Rz.t() @ v_world
         state6 = torch.cat([target_vel_local, v_local]).unsqueeze(0)
+        if self.yaw_rate_action:
+            if obs.yaw_rate_enu is None:
+                raise ValueError("vx_vz_yawrate policy needs DiffAeroObs.yaw_rate_enu")
+            yaw_rate_t = torch.tensor([[float(obs.yaw_rate_enu)]], dtype=torch.float32,
+                                      device=self.device)
+            state6 = torch.cat([state6, yaw_rate_t], dim=-1)  # 7-dim
 
         if self.vel_ema is None:
             self.vel_ema = v_world.clone()
@@ -172,7 +214,12 @@ class DiffAeroVelPolicy:
 
         perception_t = self._build_perception(obs)
         vel_cmd_raw = self._run_actor(state6, perception_t, orientation, Rz).squeeze(0)
-        vel_cmd_raw = self._clamp_vel_cmd(vel_cmd_raw)
+        yaw_rate_enu = None
+        if self.yaw_rate_action:
+            vel_cmd_raw, yaw_rate_raw = self._clamp_vel_yaw_rate_cmd(vel_cmd_raw, Rz)
+            yaw_rate_enu = self._apply_yaw_rate_lag(yaw_rate_raw, float(obs.yaw_rate_enu))
+        else:
+            vel_cmd_raw = self._clamp_vel_cmd(vel_cmd_raw)
         vel_cmd_enu_t = self._apply_velocity_lag(vel_cmd_raw, v_world)
         if self.planar:
             vel_cmd_enu_t[2] = 0.0
@@ -184,6 +231,7 @@ class DiffAeroVelPolicy:
             vel_cmd_enu=vel_cmd_enu,
             vel_norm=vel_norm,
             yaw_ned=yaw_ned,
+            yaw_rate_enu=yaw_rate_enu,
         )
 
     def _build_perception(self, obs: DiffAeroObs) -> torch.Tensor | None:
@@ -247,6 +295,28 @@ class DiffAeroVelPolicy:
         lo = self.min_action.squeeze(0)
         hi = self.max_action.squeeze(0)
         return torch.clamp(vel_cmd, lo, hi)
+
+    def _clamp_vel_yaw_rate_cmd(
+        self, out: torch.Tensor, Rz: torch.Tensor
+    ) -> tuple[torch.Tensor, float]:
+        """Split [vx_w, vy_w, vz_w, yaw_rate]; clamp in the yaw-local frame
+        (lateral forced to 0) and rotate the velocity back to world."""
+        lo = self.min_action.squeeze(0)
+        hi = self.max_action.squeeze(0)
+        v_local = Rz.t() @ out[:3]
+        vx = torch.clamp(v_local[0], lo[0], hi[0])
+        vz = torch.clamp(v_local[2], lo[1], hi[1])
+        v_local = torch.stack([vx, torch.zeros_like(vx), vz])
+        yaw_rate = float(torch.clamp(out[3], lo[2], hi[2]).item())
+        return Rz @ v_local, yaw_rate
+
+    def _apply_yaw_rate_lag(self, yaw_rate_cmd: float, yaw_rate_measured: float) -> float:
+        """First-order yaw-rate lag matching VelocityPointMassModel (lmbda_yaw)."""
+        if self._yaw_rate_setpoint is None:
+            self._yaw_rate_setpoint = yaw_rate_measured
+        self._yaw_rate_setpoint += self._yaw_rate_lag_alpha * (
+            yaw_rate_cmd - self._yaw_rate_setpoint)
+        return self._yaw_rate_setpoint
 
     def _apply_velocity_lag(
         self, vel_cmd_raw: torch.Tensor, v_measured: torch.Tensor
