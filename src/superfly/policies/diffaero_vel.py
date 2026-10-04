@@ -80,6 +80,10 @@ class DiffAeroVelPolicy:
         )
         self.control_dt = 1.0 / float(control_hz)
         self._vel_lag_alpha = 1.0 - math.exp(-self.lmbda * self.control_dt)
+        # plant=px4_fit trains on PX4's own (refitted) response, so setpoints go
+        # out unfiltered; the first-order plant expects the lag applied here.
+        self.plant = str(dyn.get("plant", "first_order"))
+        self.software_lag = self.plant != "px4_fit"
         self.max_yaw_rate_deg = float(dyn.get("max_yaw_rate", {}).get("default", 60.0))
         self.yaw_hold_speed = float(dyn.get("yaw_hold_speed", 0.3))
         if self.yaw_rate_action:
@@ -166,6 +170,8 @@ class DiffAeroVelPolicy:
             f"z=±{self.max_vel_z:.1f} m/s.",
             flush=True,
         )
+        if not self.software_lag:
+            print("plant=px4_fit: setpoints sent without software lag.", flush=True)
         if self.yaw_rate_action:
             print(
                 f"Yaw-rate action: vx in [-{self.reverse_vel_x:.1f}, {self.max_vel_xy:.1f}] m/s, "
@@ -312,6 +318,8 @@ class DiffAeroVelPolicy:
 
     def _apply_yaw_rate_lag(self, yaw_rate_cmd: float, yaw_rate_measured: float) -> float:
         """First-order yaw-rate lag matching VelocityPointMassModel (lmbda_yaw)."""
+        if not self.software_lag:
+            return yaw_rate_cmd
         if self._yaw_rate_setpoint is None:
             self._yaw_rate_setpoint = yaw_rate_measured
         self._yaw_rate_setpoint += self._yaw_rate_lag_alpha * (
@@ -322,6 +330,8 @@ class DiffAeroVelPolicy:
         self, vel_cmd_raw: torch.Tensor, v_measured: torch.Tensor
     ) -> torch.Tensor:
         """First-order lag matching VelocityPointMassModel training dynamics."""
+        if not self.software_lag:
+            return vel_cmd_raw.clone()
         if self._vel_setpoint is None:
             self._vel_setpoint = v_measured.clone()
         self._vel_setpoint = torch.lerp(

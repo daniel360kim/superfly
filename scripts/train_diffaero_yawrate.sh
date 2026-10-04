@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Train one of the three DiffAero vx/vz/yaw-rate policies (dynamics
-# pmv_yawrate: forward + up velocity and yaw rate, no lateral velocity).
+# pmv_yawrate: forward + up velocity and yaw rate, no lateral velocity) on
+# Starling 2 Max parameters: the PX4 velocity loop refitted on the Starling
+# USD (plant=px4_fit), yaw rate <= 1 rad/s, collision radius 0.26 m.
 # Recipes and rationale: docs/DIFFAERO_YAWRATE.md.
 #
 #   band s  cruise 0.8-1.5 m/s  (Starling low-speed; dynamics defaults)
@@ -20,16 +22,14 @@ BAND="${1:-}"; shift || true
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 COMMON=(env=oa algo=sha2c dynamics=pmv_yawrate sensor=camera network=mlp
-        n_updates=2000 save_freq=200 env.oob_terminates=true)
+        n_updates=2000 save_freq=200 env.oob_terminates=true env.r_drone=0.26)
 case "$BAND" in
   s) RECIPE=(env.min_target_vel=0.8 env.max_target_vel=1.5 env.max_time=60) ;;
   m) RECIPE=(env.min_target_vel=0.5 env.max_target_vel=2.0 env.max_time=80
-             dynamics.max_vel.x.default=2.5 dynamics.max_vel.x.min=2.0 dynamics.max_vel.x.max=3.0
-             dynamics.max_yaw_rate.default=75 dynamics.max_yaw_rate.min=60 dynamics.max_yaw_rate.max=90) ;;
+             dynamics.max_vel.x.default=2.5 dynamics.max_vel.x.min=2.0 dynamics.max_vel.x.max=3.0) ;;
   f) RECIPE=(env.min_target_vel=2.0 env.max_target_vel=5.0 env.max_time=40
              dynamics.max_vel.x.default=6.0 dynamics.max_vel.x.min=5.0 dynamics.max_vel.x.max=7.0
-             dynamics.max_vel.z.default=2.0 dynamics.max_vel.z.min=1.5 dynamics.max_vel.z.max=2.5
-             dynamics.max_yaw_rate.default=90 dynamics.max_yaw_rate.min=70 dynamics.max_yaw_rate.max=120) ;;
+             dynamics.max_vel.z.default=2.0 dynamics.max_vel.z.min=1.5 dynamics.max_vel.z.max=2.5) ;;
   *) echo "usage: $0 {s|m|f} [hydra overrides...]"; exit 2 ;;
 esac
 
