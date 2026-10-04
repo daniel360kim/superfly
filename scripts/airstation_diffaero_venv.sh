@@ -28,12 +28,18 @@ echo "$BASE_SITE" > "$SITE/_venv_torch_overlay.pth"
 "$VENV/bin/python" -c 'import torch; assert torch.cuda.is_available(), "no CUDA"; print("torch", torch.__version__)'
 
 # requirements.txt minus what the overlay already has (torch, numpy, onnxruntime,
-# opencv) and what training never imports (open3d: racing env only; wandb,
-# gpustat, moviepy, torch-tb-profiler: optional extras).
+# opencv) and the optional extras (wandb, gpustat, moviepy, torch-tb-profiler).
+# open3d is imported by diffaero.env's package __init__ (racing env), so it is
+# needed even for obstacle_avoidance: the CPU wheel is enough.
 "$VENV/bin/pip" install --no-cache-dir -q \
     tensordict taichi tqdm hydra-core hydra-joblib-launcher hydra_colorlog \
     welford_torch einops line_profiler tensorboard tensorboardX \
-    imageio matplotlib onnx onnxscript
+    imageio matplotlib onnx onnxscript open3d-cpu
+# torchvision (runner.py, networks.py) must match the base torch build
+TV="${TORCHVISION_SPEC:-torchvision==0.26.0}"   # pairs with torch 2.11
+"$VENV/bin/python" -c 'import torchvision' 2>/dev/null || \
+    "$VENV/bin/pip" install --no-cache-dir -q --no-deps "$TV" \
+        --index-url https://download.pytorch.org/whl/cu128
 
 if ! "$VENV/bin/python" -c 'import pytorch3d.transforms' 2>/dev/null; then
     "$VENV/bin/python" - "$SITE" <<'P3D'
@@ -47,5 +53,7 @@ fi
 
 "$VENV/bin/pip" install --no-cache-dir -q --no-deps -e "$REPO/methods/diffaero"
 "$VENV/bin/pip" install --no-cache-dir -q --no-deps -e "$REPO"
-"$VENV/bin/python" -c 'import pytorch3d.transforms, tensordict, hydra, taichi, diffaero; print("diffaero venv OK")'
+# from / : ~/superfly holds a stale untracked diffaero/ clone that a repo-root
+# cwd would shadow the fork with
+(cd / && "$VENV/bin/python" -c 'import pytorch3d.transforms, torchvision, diffaero.algo, diffaero.env; print("diffaero venv OK:", diffaero.__file__)')
 echo "$VENV/bin/python"
