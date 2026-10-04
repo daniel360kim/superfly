@@ -18,6 +18,12 @@ the policy's world-frame velocity setpoint straight to PX4's velocity loop.
     yaw_hold_speed. Pre-policy YAW phase still faces the goal once.
   * Altitude: planar policies output horizontal velocity only; a light altitude
     PID supplies vz while holding --climb-alt.
+  * --clock px4 runs the control loop on PX4's clock (= sim time under SITL
+    lockstep), so a flight does not depend on Isaac's realtime factor;
+    --policy-timeout lands after that many clock seconds of POLICY.
+  * Log: when the runner sets SUPERFLY_STATE_LOG, diffaero_cmds.npz is written
+    next to it -- per POLICY tick the state, the 9x16 depth input, the action in
+    the network's own space and the setpoint sent.
   * vx_vz_yawrate policies (no lateral velocity): the actor's [vx, 0, vz] is
     rotated by the measured heading, the yaw-rate output replaces the slewed
     yaw, and both go to PX4 as velocity + yaw-rate setpoints. Their state
@@ -36,6 +42,7 @@ Usage:
 
 import argparse
 import math
+import os
 import sys
 import time
 import threading
@@ -55,6 +62,7 @@ from superfly.common.px4_offboard import (
     DroneState, wait_for_heartbeat, wait_for_position, set_offboard_mode, arm,
     send_position_target_ned, send_velocity_target_ned, send_velocity_yawrate_target_ned,
     send_land_command, send_heartbeat, set_param_float, receive_loop,
+    make_clock, request_stream_rates,
 )
 from superfly.common.sentinels import mark_policy_phase, mark_offboard_done
 from superfly.policies.diffaero import DiffAeroObs, DA_INTRINSICS
@@ -129,6 +137,11 @@ def main():
                         help="PX4 MPC_XY_VEL_MAX and action XY limit override [m/s]")
     parser.add_argument("--max-vel-z", type=float, default=None,
                         help="PX4 MPC_Z_VEL_MAX_UP/DN and action Z limit override [m/s]")
+    parser.add_argument("--clock", choices=["wall", "px4"], default="wall",
+                        help="Control-loop clock: wall (historical) or px4 (sim time "
+                             "under lockstep SITL; see px4_offboard.Px4Clock)")
+    parser.add_argument("--policy-timeout", type=float, default=None,
+                        help="Land (not reached) after this many --clock seconds of POLICY")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-phase status prints (phase handoffs still print)")
     args = parser.parse_args()
@@ -152,6 +165,13 @@ def main():
     )
     recv_thread.start()
     wait_for_position(state, raise_on_timeout=True)
+    if args.clock == "px4":
+        request_stream_rates(mav, 2 * CONTROL_HZ)   # the clock advances per state message
+    clock = make_clock(args.clock, state)
+    cmd_log = {k: [] for k in ("t", "pos", "vel", "yaw_enu", "yaw_rate_enu", "state",
+                               "action", "vel_cmd_enu", "yaw_rate_cmd_enu", "perception")}
+    sl = os.environ.get("SUPERFLY_STATE_LOG")
+    cmd_log_path = Path(sl).with_name("diffaero_cmds.npz") if sl else None
 
     policy_kwargs = {"intrinsics": DA_INTRINSICS, "checkpoint_path": args.checkpoint}
     if args.max_vel is not None:
@@ -212,9 +232,10 @@ def main():
     control_dt = 1.0 / CONTROL_HZ
     heartbeat_dt = 1.0 / HEARTBEAT_HZ
     last_heartbeat = time.time()
-    start_time = time.time()
-    next_step = time.time()
+    start_time = clock()
+    next_step = clock()
     step_count = 0
+    policy_t0 = None
 
     phase = "CLIMB"
     landing_sent = False
@@ -235,12 +256,13 @@ def main():
 
     try:
         while True:
-            now = time.time()
+            now = clock()
             elapsed = now - start_time
+            wall = time.time()
 
-            if now - last_heartbeat >= heartbeat_dt:
+            if wall - last_heartbeat >= heartbeat_dt:
                 send_heartbeat(mav)
-                last_heartbeat = now
+                last_heartbeat = wall
 
             if now >= next_step:
                 pos, vel, R_enu, w_body, yaw = state.get_full()
@@ -295,6 +317,7 @@ def main():
                     )
                     if abs(math.degrees(yaw_err)) < args.yaw_tol_deg and state.offboard:
                         phase = "POLICY"
+                        policy_t0 = now
                         yaw_ned_cmd = yaw_cur_ned
                         mark_policy_phase("start")
                         print(f"\n>>> HANDOFF to velocity policy, "
@@ -330,6 +353,19 @@ def main():
                         yaw_ned_cmd = policy.slew_yaw_ned_cmd(yaw_ned_cmd, control_dt)
                         yaw_out = yaw_ned_cmd
                         send_velocity_target_ned(mav, vx_n, vy_e, vz_d, yaw_out)
+                    if cmd_log_path is not None:
+                        cmd_log["t"].append(now - policy_t0)
+                        cmd_log["pos"].append(pos)
+                        cmd_log["vel"].append(vel)
+                        cmd_log["yaw_enu"].append(yaw)
+                        cmd_log["yaw_rate_enu"].append(obs.yaw_rate_enu)
+                        cmd_log["state"].append(policy.last_state)
+                        cmd_log["action"].append(policy.last_action)
+                        cmd_log["vel_cmd_enu"].append(cmd.vel_cmd_enu)
+                        cmd_log["yaw_rate_cmd_enu"].append(
+                            np.nan if cmd.yaw_rate_enu is None else cmd.yaw_rate_enu)
+                        if policy.last_perception is not None:
+                            cmd_log["perception"].append(policy.last_perception.astype(np.float16))
                     # Grounded-recovery: after an upset (obstacle graze, rough
                     # tracking) PX4's land detector can latch with the drone
                     # parked on the ground, ignoring climb setpoints forever.
@@ -357,6 +393,12 @@ def main():
                         phase = "LANDING"
                         mark_policy_phase("end")
                         print(f"\n>>> HANDOFF to landing at pos={pos.round(2)} <<<\n")
+                    elif (args.policy_timeout is not None
+                          and now - policy_t0 > args.policy_timeout):
+                        phase = "LANDING"
+                        mark_policy_phase("end")
+                        print(f"\n>>> POLICY TIMEOUT after {now - policy_t0:.1f} s "
+                              f"({args.clock} clock) at {pos.round(2)}; landing <<<\n")
                     if verbose:
                         print(
                             f"[POLICY t={elapsed:.2f}s step={step_count}]\n"
@@ -384,14 +426,22 @@ def main():
 
                 step_count += 1
                 next_step += control_dt
-                if next_step < time.time():
-                    next_step = time.time()
+                if next_step < now:
+                    next_step = now
             else:
                 time.sleep(0.001)
 
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        if cmd_log_path is not None and cmd_log["t"]:
+            try:
+                np.savez_compressed(cmd_log_path, clock=args.clock, control_hz=CONTROL_HZ,
+                                    action_space=policy.action_space,
+                                    **{k: np.asarray(v) for k, v in cmd_log.items() if v})
+                print(f"command log -> {cmd_log_path} ({len(cmd_log['t'])} ticks)", flush=True)
+            except Exception as exc:              # never fail a flight for a log
+                print(f"[cmd-log] cannot write {cmd_log_path}: {exc}", flush=True)
         stop_event.set()
         mav.mav.command_long_send(
             mav.target_system, mav.target_component,

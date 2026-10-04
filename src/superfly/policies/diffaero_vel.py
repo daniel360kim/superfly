@@ -224,8 +224,15 @@ class DiffAeroVelPolicy:
         if self.yaw_rate_action:
             vel_cmd_raw, yaw_rate_raw = self._clamp_vel_yaw_rate_cmd(vel_cmd_raw, Rz)
             yaw_rate_enu = self._apply_yaw_rate_lag(yaw_rate_raw, float(obs.yaw_rate_enu))
+            v_l = Rz.t() @ vel_cmd_raw
+            # what the network chose, in its own action space (for logs / plots)
+            self.last_action = np.array([float(v_l[0]), float(v_l[2]), yaw_rate_raw])
         else:
             vel_cmd_raw = self._clamp_vel_cmd(vel_cmd_raw)
+            self.last_action = (Rz.t() @ vel_cmd_raw).cpu().numpy()
+        self.last_state = state6.squeeze(0).cpu().numpy()
+        self.last_perception = (None if perception_t is None
+                                else perception_t.squeeze(0).cpu().numpy())
         vel_cmd_enu_t = self._apply_velocity_lag(vel_cmd_raw, v_world)
         if self.planar:
             vel_cmd_enu_t[2] = 0.0

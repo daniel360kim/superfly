@@ -34,7 +34,8 @@ echo "$BASE_SITE" > "$SITE/_venv_torch_overlay.pth"
 "$VENV/bin/pip" install --no-cache-dir -q \
     tensordict taichi tqdm hydra-core hydra-joblib-launcher hydra_colorlog \
     welford_torch einops line_profiler tensorboard tensorboardX \
-    imageio matplotlib onnx onnxscript open3d-cpu
+    imageio matplotlib onnx onnxscript open3d-cpu \
+    pymavlink scipy pyyaml   # the Isaac harness runs diffaero_vel_offboard.py in this venv
 # torchvision (runner.py, networks.py) must match the base torch build
 TV="${TORCHVISION_SPEC:-torchvision==0.26.0}"   # pairs with torch 2.11
 "$VENV/bin/python" -c 'import torchvision' 2>/dev/null || \

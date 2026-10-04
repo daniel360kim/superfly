@@ -295,6 +295,26 @@ def method_registry():
             ckpt_kind="hydra_dir",
             speed_args=lambda a: ["--max-vel", str(a.max_speed)],
         ),
+        # DiffAero vx/vz/yaw-rate policies (dynamics pmv_yawrate: forward + up
+        # velocity and yaw rate, no lateral velocity; Starling 2 Max PX4-fitted
+        # plant; docs/DIFFAERO_YAWRATE.md), one per cruise band -- run each with
+        # --max-speed at its band's top (s 1.5, m 2.0, f 5.0 m/s). The offboard
+        # sends velocity + yaw-rate setpoints. DIFFAERO_VEL_EXTRA_ARGS appends
+        # offboard args (e.g. "--clock px4 --policy-timeout 120").
+        **{
+            f"diffaero_vel_yawrate_{band}": dict(
+                policy="diffaero",
+                offboard="diffaero_vel_offboard.py",
+                control_hz=30.0,
+                goal_argc=2,
+                python=METHODS_DIR / "diffaero" / ".venv" / "bin" / "python",
+                checkpoint=CHECKPOINTS_DIR / "DiffAero" / f"vel_yawrate_{band}_starling_v1",
+                ckpt_kind="hydra_dir",
+                speed_args=lambda a: ["--max-vel", str(a.max_speed)]
+                + shlex.split(os.environ.get("DIFFAERO_VEL_EXTRA_ARGS", "")),
+            )
+            for band in ("s", "m", "f")
+        },
         "agile": dict(
             policy="agile",
             offboard="agile_offboard.py",
