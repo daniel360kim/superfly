@@ -20,7 +20,7 @@ BAND="${1:-}"; shift || true
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 COMMON=(env=oa algo=sha2c dynamics=pmv_yawrate sensor=camera network=mlp
-        n_updates=2000 save_freq=200)
+        n_updates=2000 save_freq=200 env.oob_terminates=true)
 case "$BAND" in
   s) RECIPE=(env.min_target_vel=0.8 env.max_target_vel=1.5 env.max_time=60) ;;
   m) RECIPE=(env.min_target_vel=0.5 env.max_target_vel=2.0 env.max_time=80
