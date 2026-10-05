@@ -1,0 +1,11 @@
+{
+  "schema": "superfly-run-meta-v1",
+  "method": "diffaero",
+  "artifact": "checkpoints/exported_actor.pt2",
+  "produced_by": "scripts/train_diffaero.py --config env=oa algo=sha2c dynamics=pmv_yawrate sensor=camera network=mlp n_updates=2000 save_freq=200 env.oob_terminates=true env.r_drone=0.26 env.min_target_vel=2.0 env.max_target_vel=5.0 env.max_time=40 dynamics.max_vel.x.default=6.0 dynamics.max_vel.x.min=5.0 dynamics.max_vel.x.max=7.0 dynamics.max_vel.z.default=2.0 dynamics.max_vel.z.min=1.5 dynamics.max_vel.z.max=2.5 env.loss_weights.pointmass.heading=0",
+  "submodule_sha": "c228fa7327b9dd8755b171f5573eeabe44f21bd1",
+  "host": "airstation03",
+  "date": "2026-10-05T00:36:52+00:00",
+  "renamed_from": "vel_yawrate_f_starling1_noheading",
+  "renamed_date": "2026-10-04"
+}
