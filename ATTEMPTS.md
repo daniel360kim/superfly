@@ -21,6 +21,23 @@ MLP+perception (6 flattened inputs, 5 names), which made torch>=2.9's
 exporter fail with a duplicate `max_action`. Fixed in the fork.
 The first runs are short tests, not deploy candidates.
 
+**2026-10-05 update: Starling training + Isaac benchmark.** Daniel asked for
+Starling parameters. `plant: px4_fit` = PX4's velocity loop as refitted on the
+Starling USD in Isaac (wt/v8-chunk fit_px4_plant.py: 0.13 s delay, gain 0.9,
+4/s, 0.05 s accel lag), yaw <= 1 rad/s, r_drone 0.26, oob_terminates, heading
+loss off (it goal-locks the nose; 0.25 cut s-band success 0.51 -> 0.31).
+Training-env success s/m/f 0.51/0.56/0.84 (planar v1 recipe: 0.92) ->
+`checkpoints/DiffAero/vel_yawrate_{s,m,f}_starling_v1`. Isaac tier C on the
+lab Starling USD, `--clock px4`, one trial each (53 flown): **s 39, m 38, f 34**.
+Fields s 29/30, m 30/30, f 25/30 (f cruises 2.4 m/s although commanded 5).
+Walls 1/30 (an 8 m wall wider than the view: m/f hover until timeout, s grazes);
+over/under 26/39 (lintels/overhang). The two USD stages never hand over on the
+diffaero path: the vehicle moves at spawn and PX4 refuses to arm (construction),
+no position at RTF 0.19 (english_college), also one at a time -- open harness
+bug, not a policy result. The DiffAero vel offboard had been running on PX4's
+GCS defaults (1 Hz position) on the wall clock; `--clock px4` also requests 60 Hz.
+Deliverable: anyanything/deliverables/2026-10-04/diffaero_yawrate/.
+
 ## 2026-09-29 — Starling 2 Max student evaluation in Isaac (overnight queue) — PENDING
 
 Held-out evaluation only (never a data source): both `*_student_v1` suites,
