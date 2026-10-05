@@ -6,6 +6,8 @@ run (training command, metrics, former name) is in its `run_meta.json`.
 
 Naming: `thrust_*` policies command attitude/thrust, `vel_*` command PX4
 velocity setpoints, `vel_planar_*` are velocity with vz fixed to 0.
+`vel_yawrate_*` command forward velocity, vertical velocity and yaw rate (no
+sideways velocity, so the camera always faces the direction of travel).
 `starling` = trained for the Starling 2 Max at 0.8–1.5 m/s. A `.tflite` /
 `.onnx` next to a `.pth` is a verified export of that same policy.
 
@@ -28,6 +30,9 @@ velocity setpoints, `vel_planar_*` are velocity with vz fixed to 0.
 | `vel_depth` | Velocity commands with depth input. → `diffaero_vel` |
 | `vel_planar_starling_v1` | Horizontal-only velocity, 0.8–1.5 m/s. Benchmarked 6/6. → `diffaero_vel_planar` |
 | `vel_planar_starling_v2` | Retrain of v1 that flew worse. **Do not deploy** — kept for reference. |
+| `vel_yawrate_s_starling_v1` | Forward/vertical velocity + yaw rate, Starling PX4-fitted dynamics, 0.8–1.5 m/s. Isaac tier C 39/53. → `diffaero_vel_yawrate_s` |
+| `vel_yawrate_m_starling_v1` | Same, 0.5–2.0 m/s. Isaac tier C 38/53. → `diffaero_vel_yawrate_m` |
+| `vel_yawrate_f_starling_v1` | Same, 2–5 m/s (cruises ~2.4 m/s in practice). Isaac tier C 34/53. → `diffaero_vel_yawrate_f` |
 
 ## AgileAutonomy
 
