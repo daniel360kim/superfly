@@ -1,0 +1,13 @@
+- env=oa
+- algo=sha2c
+- dynamics=pmv_yawrate
+- sensor=camera
+- network=mlp
+- n_updates=2000
+- save_freq=200
+- env.oob_terminates=true
+- env.r_drone=0.26
+- env.min_target_vel=0.8
+- env.max_target_vel=1.5
+- env.max_time=60
+- env.loss_weights.pointmass.heading=0
